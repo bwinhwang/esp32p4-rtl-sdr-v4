@@ -1,4 +1,5 @@
-# esp32p4-rtl-sdr-v4
+# This is EOL and the project has moved to [LakeShark](https://github.com/SAMS0N1TE/LakeShark)
+With many more features and support for other dev boards!
 
 An ESP32-P4 port of [kvhnuke/esp32-rtl-sdr](https://github.com/kvhnuke/esp32-rtl-sdr) with full ADS-B decoding and a live terminal UI. Receives 1090 MHz Mode-S/ADS-B transmissions from aircraft using an RTL-SDR dongle (tested with RTL-SDR V4 / R828D tuner) connected via USB to an Waveshare ESP32-P4 Nano.
 
