@@ -15,7 +15,6 @@
 #define HOST_LIB_TASK_PRIORITY  2
 #define CLASS_TASK_PRIORITY     3
 #define APP_QUIT_PIN            CONFIG_APP_QUIT_PIN
-#define USB_VBUS_EN_GPIO        46
 
 #ifdef CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK
 #define ENABLE_ENUM_FILTER_CALLBACK
@@ -97,22 +96,13 @@ void app_main(void)
         audio_play(1 /* AUDIO_EVT_BOOT */);
     }
 
-    /* ── 2. VBUS power for RTL-SDR ── */
-    ESP_LOGI(TAG, "Enabling USB VBUS on GPIO %d", USB_VBUS_EN_GPIO);
-    gpio_config_t vbus_cfg = {
-        .pin_bit_mask  = (1ULL << USB_VBUS_EN_GPIO),
-        .mode          = GPIO_MODE_OUTPUT,
-        .pull_up_en    = GPIO_PULLUP_DISABLE,
-        .pull_down_en  = GPIO_PULLDOWN_DISABLE,
-        .intr_type     = GPIO_INTR_DISABLE,
-    };
-    ESP_ERROR_CHECK(gpio_config(&vbus_cfg));
-    ESP_ERROR_CHECK(gpio_set_level(USB_VBUS_EN_GPIO, 1));
-
-    /* Give the dongle time to charge caps before enumeration */
+    /* WIFI6-DEV-KIT's Host-port VBUS is switched by an always-on load
+     * switch (hardwired EN), unlike the Nano board which needed a GPIO
+     * to enable VBUS -- nothing to drive here. Still give the dongle a
+     * moment to settle before enumeration. */
     vTaskDelay(pdMS_TO_TICKS(500));
 
-    /* ── 3. Quit button ── */
+    /* ── 2. Quit button ── */
     const gpio_config_t input_pin = {
         .pin_bit_mask = BIT64(APP_QUIT_PIN),
         .mode         = GPIO_MODE_INPUT,
@@ -123,7 +113,7 @@ void app_main(void)
     ESP_ERROR_CHECK(gpio_install_isr_service(ESP_INTR_FLAG_LEVEL1));
     ESP_ERROR_CHECK(gpio_isr_handler_add(APP_QUIT_PIN, gpio_cb, NULL));
 
-    /* ── 4. USB host ── */
+    /* ── 3. USB host ── */
     app_event_queue = xQueueCreate(10, sizeof(app_event_queue_t));
     app_event_queue_t evt_queue;
 
@@ -145,7 +135,7 @@ void app_main(void)
     assert(task_created == pdTRUE);
     vTaskDelay(10);
 
-    /* ── 5. Event loop ── */
+    /* ── 4. Event loop ── */
     while (1) {
         if (xQueueReceive(app_event_queue, &evt_queue, portMAX_DELAY)) {
             if (APP_EVENT == evt_queue.event_group) {

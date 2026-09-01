@@ -32,7 +32,7 @@
 #define LOG_LINES             7
 #define TUI_REFRESH_MS        150
 
-/* ── audio pins (Waveshare ESP32-P4-NANO + ES8311) ───────────────────────── */
+/* ── audio pins (Waveshare ESP32-P4-WIFI6-DEV-KIT + ES8311) ──────────────── */
 #define I2C_SCL_PIN     8
 #define I2C_SDA_PIN     7
 #define I2S_MCLK_PIN    13
