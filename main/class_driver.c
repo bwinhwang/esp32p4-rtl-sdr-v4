@@ -1115,7 +1115,6 @@ void adsb_rx_task(void *arg)
     uint8_t *buffer = malloc(DEFAULT_BUF_LENGTH);
     if (!buffer) { tui_log(4, "OOM rx buffer"); vTaskDelete(NULL); return; }
 
-    int  n_read      = 0;
     bool full_buffer = false;
     mode_s_init(&state);
 
@@ -1132,6 +1131,9 @@ void adsb_rx_task(void *arg)
 
     printf(CLS);
     tui_draw();
+
+    bool stream_started = (rtlsdr_stream_start(rtldev) == 0);
+    if (!stream_started) tui_log(4, "STREAM   start failed, retrying");
 
     while (true) {
         /* ── non-blocking keyread ── */
@@ -1163,24 +1165,28 @@ void adsb_rx_task(void *arg)
             }
         }
 
-        full_buffer = true;
-        for (int i = 0; i < DEFAULT_BUF_LENGTH; i += MAX_PACKET_SIZE) {
-            int r = rtlsdr_read_sync(rtldev, &buffer[i],
-                                     MAX_PACKET_SIZE, &n_read);
-            if (r < 0) {
-                tui_log(4, "READ ERR  r=%d", r);
-                full_buffer = false;
-                vTaskDelay(pdMS_TO_TICKS(10));
-                break;
+        if (!stream_started) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            stream_started = (rtlsdr_stream_start(rtldev) == 0);
+        } else {
+            /* Drain the pump task's IQ ring straight into the demod buffer.
+             * The USB side runs decoupled in stream_pump_task -- this loop
+             * never blocks on a USB transfer, only on the ring having data. */
+            int got = 0, stall_ticks = 0;
+            while (got < DEFAULT_BUF_LENGTH) {
+                int r = rtlsdr_stream_read(&buffer[got], DEFAULT_BUF_LENGTH - got);
+                if (r > 0) { got += r; stall_ticks = 0; continue; }
+                if (++stall_ticks > 200) break;   /* ~200ms with no data */
+                vTaskDelay(1);
             }
-            if ((uint32_t)n_read < MAX_PACKET_SIZE) {
-                tui_log(3, "SHORT READ  got=%d", n_read);
-                full_buffer = false;
-                break;
+
+            full_buffer = (got >= DEFAULT_BUF_LENGTH);
+            if (full_buffer) {
+                demodulate(buffer, DEFAULT_BUF_LENGTH);
+            } else if (got > 0) {
+                tui_log(3, "SHORT READ  got=%d", got);
             }
         }
-
-        if (full_buffer) demodulate(buffer, DEFAULT_BUF_LENGTH);
 
         int64_t now = esp_timer_get_time();
         if (now - s_last_draw > (TUI_REFRESH_MS * 1000LL)) {
@@ -1197,6 +1203,36 @@ void adsb_rx_task(void *arg)
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * USB RECOVERY TASK
+ *
+ * esp_libusb's bulk/stream pipeline calls adsb_request_recover() when the
+ * endpoint is wedged beyond its own halt/flush/clear + teardown escalation.
+ * Runs on its own task (rather than doing the reset inline in the pump/bulk
+ * caller) so it never resets the interface out from under the code that's
+ * still mid-transfer on it.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static TaskHandle_t s_recover_task_hdl = NULL;
+
+static void usb_recover_task(void *arg)
+{
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        tui_log(4, "USB      pipe wedged, resetting RTL interface");
+        if (rtldev && rtlsdr_reset_interface(rtldev) == 0) {
+            tui_log(2, "USB      interface reset OK");
+        } else {
+            tui_log(4, "USB      interface reset FAILED - replug dongle");
+        }
+    }
+}
+
+void adsb_request_recover(void)
+{
+    if (s_recover_task_hdl) xTaskNotifyGive(s_recover_task_hdl);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * RTLSDR SETUP TASK
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -1211,6 +1247,10 @@ static void rtlsdr_setup_task(void *arg)
     rtlsdr_set_sample_rate(rtldev, 2000000);
     rtlsdr_set_tuner_gain_mode(rtldev, 0);
     rtlsdr_reset_buffer(rtldev);
+
+    if (!s_recover_task_hdl)
+        xTaskCreatePinnedToCore(usb_recover_task, "usb_recover", 4096, NULL,
+                                4, &s_recover_task_hdl, 0);
 
     /* dongle found — audio already init'd in app_main, just play the sound */
     audio_play(AUDIO_EVT_NEW_CONTACT);

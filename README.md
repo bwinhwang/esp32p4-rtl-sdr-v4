@@ -51,6 +51,35 @@ issues with my ESP32-P4 USB host controller with tons of transfer
 failures. Reduced to 16384 bytes per transfer, with two transfers assembled into
 a 32KB demodulation buffer.
 
+### USB streaming pipeline (ported from LakeShark)
+
+`esp_libusb`'s bulk transfer used to be one buffer submitted and awaited at a
+time. Ported over from the [LakeShark](https://github.com/SAMS0N1TE/LakeShark)
+fork:
+
+- **Multi-slot pipelined `esp_libusb_bulk_transfer`** — 4 transfers stay
+  pre-submitted round-robin so the endpoint never goes idle between a
+  completion and the next submit; escalating recovery (endpoint
+  halt/flush/clear → full teardown+reinit → request a full RTL interface
+  reset) replaces the old "clear and hope" STALL handling.
+- **Decoupled streaming capture** (`rtlsdr_stream_start/read/stop`) — a
+  dedicated `rtl_pump` task (core1) keeps 8×16KB transfers continuously
+  posted against the bulk endpoint and copies completions straight into a
+  128KB RAM ring buffer; `adsb_rx_task` just drains the ring, so demod-buffer
+  assembly is no longer coupled to USB completion latency. This is what
+  `adsb_rx_task` now uses instead of the old per-chunk `rtlsdr_read_sync` loop.
+- **`rtlsdr_reset_interface()`** — releases and re-claims interface 0 to clear
+  a wedged pipe; triggered automatically when the pipelined recovery above
+  runs out of options, via a dedicated `usb_recover_task`.
+
+LakeShark sizes its ring at 256KB in PSRAM (`MALLOC_CAP_SPIRAM`, 16 transfer
+slots) because it shares the heap with LVGL/P25/FM. This board has PSRAM pads
+on the schematic (`VDD_PSRAM_0`/`VDD_PSRAM_1`) but **`CONFIG_SPIRAM` is not
+enabled** in this project's sdkconfig, so the ring here is plain `malloc()`'d
+internal RAM, scaled down to 128KB / 8 slots accordingly. Enabling PSRAM and
+growing those numbers back up is a reasonable follow-up if throughput ever
+needs it.
+
 ### Added
 *TUI is a rough Draft and will be expanded
 - **ADS-B decoder** using the mode-s library, decoding DF17 extended squitter messages

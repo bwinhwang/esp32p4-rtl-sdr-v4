@@ -309,6 +309,23 @@ extern "C"
 
     RTLSDR_API int rtlsdr_read_sync(rtlsdr_dev_t *dev, void *buf, int len, int *n_read);
 
+    /* Decoupled streaming: a self-resubmitting transfer pool fills a RAM IQ
+     * ring (USB pump runs in its own task), drained by rtlsdr_stream_read(). */
+    RTLSDR_API int      rtlsdr_stream_start(rtlsdr_dev_t *dev);
+    RTLSDR_API void     rtlsdr_stream_stop(void);
+    RTLSDR_API int      rtlsdr_stream_read(void *buf, int max);
+    RTLSDR_API void     rtlsdr_stream_reset(void);
+    RTLSDR_API uint32_t rtlsdr_stream_avail(void);
+
+    /*!
+     * Reset the claimed USB interface after the bulk pipe wedges (repeated
+     * STALL/timeout). Re-claims interface 0 and clears the RTL2832 buffer.
+     *
+     * \param dev the device handle given by rtlsdr_open()
+     * \return 0 on success, -1 on failure (interface could not be re-claimed)
+     */
+    RTLSDR_API int rtlsdr_reset_interface(rtlsdr_dev_t *dev);
+
     typedef void (*rtlsdr_read_async_cb_t)(unsigned char *buf, uint32_t len, void *ctx);
 
     /*!

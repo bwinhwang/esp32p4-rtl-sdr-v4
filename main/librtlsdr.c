@@ -23,6 +23,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #ifndef _WIN32
 #include <unistd.h>
 #define min(a, b) (((a) < (b)) ? (a) : (b))
@@ -1542,6 +1544,38 @@ int rtlsdr_read_sync(rtlsdr_dev_t *dev, void *buf, int len, int *n_read)
         return -1;
 
     return esp_libusb_bulk_transfer(dev->driver_obj, 0x81, buf, len, n_read, BULK_TIMEOUT);
+}
+
+/* Streaming API: post a self-resubmitting transfer pool feeding a RAM IQ ring
+ * (decoupled from the demod), drained by rtlsdr_stream_read(). */
+int rtlsdr_stream_start(rtlsdr_dev_t *dev)
+{
+    if (!dev) return -1;
+    return esp_libusb_stream_start(dev->driver_obj, 0x81);
+}
+void rtlsdr_stream_stop(void)               { esp_libusb_stream_stop(); }
+int  rtlsdr_stream_read(void *buf, int max) { return esp_libusb_stream_read((unsigned char *)buf, max); }
+void rtlsdr_stream_reset(void)              { esp_libusb_stream_reset(); }
+uint32_t rtlsdr_stream_avail(void)          { return esp_libusb_stream_avail(); }
+
+int rtlsdr_reset_interface(rtlsdr_dev_t *dev)
+{
+    if (!dev || !dev->driver_obj) return -1;
+    class_driver_t *d = dev->driver_obj;
+    if (!d->dev_hdl) return -1;
+
+    esp_libusb_stream_stop();
+    esp_libusb_bulk_teardown();
+
+    usb_host_interface_release(d->client_hdl, d->dev_hdl, 0);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    esp_err_t r = usb_host_interface_claim(d->client_hdl, d->dev_hdl, 0, 0);
+    if (r != ESP_OK) {
+        ESP_LOGE(TAG_ADSB, "interface re-claim failed: 0x%x", (int)r);
+        return -1;
+    }
+    rtlsdr_reset_buffer(dev);
+    return 0;
 }
 
 int rtlsdr_cancel_async(rtlsdr_dev_t *dev)
