@@ -344,6 +344,13 @@ void mode_s_decode(mode_s_t *self, struct mode_s_msg *mm, unsigned char *msg)
 {
     uint32_t crc2; // Computed CRC, used to verify the message CRC.
 
+    /* Only the fields carried by this particular message type get assigned
+     * below. Callers test them for non-zero to decide what's present, so a
+     * reused stack mm must start clean -- otherwise altitude/velocity/heading
+     * pick up whatever the task stack last held (0x20202020 from tui_draw()'s
+     * space-filled radar panel, in practice) and read as valid data. */
+    memset(mm, 0, sizeof(*mm));
+
     // Work on our local copy
     memcpy(mm->msg, msg, MODE_S_LONG_MSG_BYTES);
     msg = mm->msg;
