@@ -446,7 +446,8 @@ static int r82xx_set_mux(struct r82xx_priv *priv, uint32_t freq)
     return rc;
 }
 
-static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
+static int r82xx_set_pll_ref(struct r82xx_priv *priv, uint32_t freq,
+                             uint32_t pll_ref, int quiet)
 {
     int rc, i;
     unsigned sleep_time = 10000;
@@ -454,7 +455,7 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
     uint32_t vco_fra; /* VCO contribution by SDM (kHz) */
     uint32_t vco_min = 1770000;
     uint32_t vco_max = vco_min * 2;
-    uint32_t freq_khz, pll_ref, pll_ref_khz;
+    uint32_t freq_khz, pll_ref_khz;
     uint16_t n_sdm = 2;
     uint16_t sdm = 0;
     uint8_t mix_div = 2;
@@ -467,15 +468,12 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 
     /* Frequency in kHz */
     freq_khz = (freq + 500) / 1000;
-    
-    /* Enable /2 reference divider for 28.8 MHz Blog V4 sticks */
-    if (priv->cfg->xtal > 24000000) {
-        refdiv2 = 0x10;
-        pll_ref = priv->cfg->xtal / 2;
-    } else {
-        refdiv2 = 0x00;
-        pll_ref = priv->cfg->xtal;
-    }
+
+    /* R16[4] is part of the xtal cap/drive field (see r82xx_xtal_capacitor[],
+     * written with mask 0x1b), NOT a /2 reference divider. Setting it while
+     * halving pll_ref asks for a VCO at 2x the intended frequency, which is
+     * outside the 1770-3540 MHz range -> the PLL never locks at any freq. */
+    refdiv2 = 0x00;
     pll_ref_khz = (pll_ref + 500) / 1000;
 
     rc = r82xx_write_reg_mask(priv, 0x10, refdiv2, 0x10);
@@ -596,8 +594,18 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 
     if (!(data[2] & 0x40))
     {
-        fprintf(stderr, "[R82XX] Freq: %lu\n", freq);
-        fprintf(stderr, "[R82XX] PLL not locked!\n");
+        if (!quiet)
+        {
+            fprintf(stderr, "[R82XX] Freq: %lu\n", freq);
+            fprintf(stderr, "[R82XX] PLL not locked!\n");
+            fprintf(stderr, "[R82XX]   ref=%lu mix_div=%u div_num=%u vco_ft=%u/%u\n",
+                    (unsigned long)pll_ref, (unsigned)mix_div, (unsigned)div_num,
+                    (unsigned)vco_fine_tune, (unsigned)vco_power_ref);
+            fprintf(stderr, "[R82XX]   nint=%u sdm=%u vco=%lu kHz  r00..02=%02x %02x %02x\n",
+                    (unsigned)nint, (unsigned)sdm,
+                    (unsigned long)(vco_freq / 1000),
+                    data[0], data[1], data[2]);
+        }
         priv->has_lock = 0;
         return 0;
     }
@@ -606,6 +614,34 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 
     /* set pll autotune = 8kHz */
     rc = r82xx_write_reg_mask(priv, 0x1a, 0x08, 0x08);
+
+    return rc;
+}
+
+/* The R828D's reference is board-dependent and not discoverable over I2C:
+ * RTL-SDR Blog V4 feeds the tuner the RTL2832U's 28.8 MHz clock, while stock
+ * DVB-T sticks give it a private 16 MHz crystal. Guessing wrong puts the VCO
+ * roughly half/double the intended frequency -- outside 1770-3540 MHz -- so
+ * nothing locks at any frequency and the failure looks identical to dead
+ * hardware. Probe the other reference once and keep whichever actually locks. */
+static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
+{
+    int can_retry = (priv->cfg->rafael_chip == CHIP_R828D);
+    int rc = r82xx_set_pll_ref(priv, freq, priv->cfg->xtal, can_retry);
+
+    if (rc >= 0 && !priv->has_lock && can_retry)
+    {
+        uint32_t was = priv->cfg->xtal;
+        uint32_t alt = (was == R828D_XTAL_FREQ) ? 28800000 : R828D_XTAL_FREQ;
+
+        rc = r82xx_set_pll_ref(priv, freq, alt, 0);
+        if (rc >= 0 && priv->has_lock)
+        {
+            fprintf(stderr, "[R82XX] tuner reference %lu -> %lu Hz (locked)\n",
+                    (unsigned long)was, (unsigned long)alt);
+            priv->cfg->xtal = alt;
+        }
+    }
 
     return rc;
 }

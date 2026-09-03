@@ -160,6 +160,22 @@ extern "C"
     RTLSDR_API enum rtlsdr_tuner rtlsdr_get_tuner_type(rtlsdr_dev_t *dev);
 
     /*!
+     * Get whether the tuner's PLL is actually locked.
+     *
+     * \param dev the device handle given by rtlsdr_open()
+     * \return 1 locked, 0 not locked, -1 if this tuner reports no lock state
+     */
+    RTLSDR_API int rtlsdr_get_tuner_pll_locked(rtlsdr_dev_t *dev);
+
+    /*!
+     * Get the reference crystal frequency the tuner is currently running on.
+     *
+     * \param dev the device handle given by rtlsdr_open()
+     * \return reference frequency in Hz, 0 on error
+     */
+    RTLSDR_API uint32_t rtlsdr_get_tuner_xtal(rtlsdr_dev_t *dev);
+
+    /*!
      * Get a list of gains supported by the tuner.
      *
      * NOTE: The gains argument must be preallocated by the caller. If NULL is

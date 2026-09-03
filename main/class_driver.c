@@ -1122,7 +1122,23 @@ void adsb_rx_task(void *arg)
     s_rate_ts  = s_start_us;
 
     tui_log(1, "INIT     adsb_rx running on CPU1");
-    tui_log(1, "INIT     R828D locked  1090.000 MHz  2 MSPS");
+
+    {
+        enum rtlsdr_tuner tt = rtlsdr_get_tuner_type(rtldev);
+        int      lock = rtlsdr_get_tuner_pll_locked(rtldev);
+        uint32_t fc   = rtlsdr_get_center_freq(rtldev);
+        uint32_t sr   = rtlsdr_get_sample_rate(rtldev);
+        uint32_t ref  = rtlsdr_get_tuner_xtal(rtldev);
+
+        tui_log(lock == 1 ? 1 : 4,
+                "INIT     %s %s  %lu.%03lu MHz  %lu.%03lu MSPS  ref %lu.%03lu MHz",
+                tt == RTLSDR_TUNER_R828D ? "R828D"
+                    : tt == RTLSDR_TUNER_R820T ? "R820T" : "tuner",
+                lock == 1 ? "locked" : lock == 0 ? "PLL UNLOCKED" : "lock unknown",
+                (unsigned long)(fc / 1000000), (unsigned long)(fc % 1000000 / 1000),
+                (unsigned long)(sr / 1000000), (unsigned long)(sr % 1000000 / 1000),
+                (unsigned long)(ref / 1000000), (unsigned long)(ref % 1000000 / 1000));
+    }
 
     uint8_t *buffer = malloc(DEFAULT_BUF_LENGTH);
     if (!buffer) { tui_log(4, "OOM rx buffer"); vTaskDelete(NULL); return; }

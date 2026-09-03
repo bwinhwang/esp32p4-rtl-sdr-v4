@@ -965,6 +965,42 @@ enum rtlsdr_tuner rtlsdr_get_tuner_type(rtlsdr_dev_t *dev)
     return dev->tuner_type;
 }
 
+/* An R82xx can fail to lock its PLL while every I2C write still reports
+ * success, so "we tuned it" is not the same as "it is receiving". Returns
+ * 1 locked, 0 not locked, -1 if the tuner reports no lock state. */
+int rtlsdr_get_tuner_pll_locked(rtlsdr_dev_t *dev)
+{
+    if (!dev)
+        return -1;
+
+    switch (dev->tuner_type)
+    {
+    case RTLSDR_TUNER_R820T:
+    case RTLSDR_TUNER_R828D:
+        return dev->r82xx_p.has_lock ? 1 : 0;
+    default:
+        return -1;
+    }
+}
+
+uint32_t rtlsdr_get_tuner_xtal(rtlsdr_dev_t *dev)
+{
+    if (!dev)
+        return 0;
+
+    /* r82xx_set_pll() can switch this at runtime when the probed reference
+     * turns out to be wrong, so report the live config, not the probe-time
+     * guess in tun_xtal. */
+    switch (dev->tuner_type)
+    {
+    case RTLSDR_TUNER_R820T:
+    case RTLSDR_TUNER_R828D:
+        return dev->r82xx_c.xtal;
+    default:
+        return dev->tun_xtal;
+    }
+}
+
 int rtlsdr_get_tuner_gains(rtlsdr_dev_t *dev, int *gains)
 {
     /* all gain values are expressed in tenths of a dB */
@@ -1382,6 +1418,15 @@ int rtlsdr_open(rtlsdr_dev_t **out_dev, uint8_t index, usb_host_client_handle_t 
     rtlsdr_init_baseband(dev);
     dev->dev_lost = 0;
 
+    /* The R828D's reference crystal can't be probed, only inferred from the
+     * dongle model (see r82xx_set_pll) -- so log what stick this actually is. */
+    {
+        char mfr[256] = {0}, prod[256] = {0}, ser[256] = {0};
+        rtlsdr_get_usb_strings(dev, mfr, prod, ser);
+        fprintf(stderr, "USB dongle: manufact=\"%s\" product=\"%s\" serial=\"%s\"\n",
+                mfr, prod, ser);
+    }
+
     /* Probe tuners */
     rtlsdr_set_i2c_repeater(dev, 1);
     
@@ -1454,8 +1499,11 @@ found:
     switch (dev->tuner_type)
     {
     case RTLSDR_TUNER_R828D:
-       // dev->tun_xtal = R828D_XTAL_FREQ;
-	   dev->tun_xtal = dev->rtl_xtal;
+        /* Stock R828D sticks clock the tuner from a private 16 MHz crystal;
+         * only RTL-SDR Blog V4 feeds it the RTL2832U's 28.8 MHz. The wrong
+         * one puts the VCO outside 1770-3540 MHz so nothing ever locks --
+         * r82xx_set_pll() probes the other value if this guess is wrong. */
+        dev->tun_xtal = R828D_XTAL_FREQ;
         /* fall-through */
     case RTLSDR_TUNER_R820T:
         /* disable Zero-IF mode */
