@@ -20,6 +20,13 @@ typedef struct
     int fix_errors; // Single bit error correction if true
     int aggressive; // Aggressive detection algorithm
     int check_crc;  // Only display messages with good CRC
+
+    // Demodulator statistics. Kept here because check_crc gates the callback on
+    // a passing CRC -- a failed frame never reaches the caller, so there is no
+    // other place from which a signal-quality figure can be derived.
+    unsigned long stat_goodcrc; // CRC passed, error-corrected frames included
+    unsigned long stat_badcrc;  // preamble looked real, CRC never passed
+    unsigned long stat_fixed;   // subset of stat_goodcrc rescued by fix_errors
 } mode_s_t;
 
 // The struct we use to store information about a decoded message

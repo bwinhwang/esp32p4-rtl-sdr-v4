@@ -21,6 +21,10 @@ void mode_s_init(mode_s_t *self)
     self->check_crc = 1;
     self->aggressive = 0;
 
+    self->stat_goodcrc = 0;
+    self->stat_badcrc = 0;
+    self->stat_fixed = 0;
+
     // Allocate the ICAO address cache. We use two uint32_t for every entry
     // because it's a addr / timestamp pair for every entry
     memset(&self->icao_cache, 0, sizeof(self->icao_cache));
@@ -825,6 +829,16 @@ void mode_s_detect(mode_s_t *self, uint16_t *mag, uint32_t maglen, mode_s_callba
                 good_message = 1;
                 if (use_correction)
                     mm.phase_corrected = 1;
+                self->stat_goodcrc++;
+                if (mm.errorbit != -1)
+                    self->stat_fixed++;
+            }
+            else if (use_correction)
+            {
+                // A failed candidate is always retried once with phase
+                // correction, so only the retry's failure is final -- counting
+                // the first pass as well would double every bad frame.
+                self->stat_badcrc++;
             }
 
             // Pass data to the next layer

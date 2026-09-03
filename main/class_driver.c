@@ -140,12 +140,11 @@ static int         s_msg_rate    = 0;
 static int         s_msg_bucket  = 0;
 static int64_t     s_rate_ts     = 0;
 static int64_t     s_start_us    = 0;
-static int         s_good        = 0;
-static int         s_crc_err     = 0;
 static int64_t     s_last_draw   = 0;
 static bool        s_dirty       = false;
 static float       s_decode_smooth = 0.0f;
 static float       s_crc_smooth    = 0.0f;
+static float       s_fix_smooth    = 0.0f;
 
 /* audio */
 static i2s_chan_handle_t  s_i2s_tx  = NULL;
@@ -788,12 +787,20 @@ static void tui_draw(void)
 
     s_sweep_angle = (s_sweep_angle + 4) % 360;
 
-    int   ac    = active_count();
-    int   total = s_good + s_crc_err;
-    float dp    = total > 0 ? (s_good    * 100.0f / total) : 0.0f;
-    float cp    = total > 0 ? (s_crc_err * 100.0f / total) : 0.0f;
+    int ac = active_count();
+
+    /* Demodulator-side counters, not callback-side: on_msg only ever sees
+     * frames whose CRC already passed, so anything derived there reads 100%
+     * by construction. FIX is the share of good frames that needed single-bit
+     * correction -- it climbs before ERR does as the signal degrades. */
+    unsigned long good  = state.stat_goodcrc;
+    unsigned long total = good + state.stat_badcrc;
+    float dp = total > 0 ? (good * 100.0f / total) : 0.0f;
+    float cp = total > 0 ? (state.stat_badcrc * 100.0f / total) : 0.0f;
+    float fp = good  > 0 ? (state.stat_fixed  * 100.0f / good)  : 0.0f;
     s_decode_smooth += (dp - s_decode_smooth) * 0.12f;
     s_crc_smooth    += (cp - s_crc_smooth)    * 0.12f;
+    s_fix_smooth    += (fp - s_fix_smooth)    * 0.12f;
 
     char uptime[12];
     fmt_uptime(uptime, sizeof(uptime));
@@ -826,9 +833,9 @@ static void tui_draw(void)
         char scratch[256];
         int n = snprintf(scratch, sizeof(scratch),
             "  UP %-9s  ACFT %-3d  MSG/S %-5d  TOTAL %-8d"
-            "  DEC %5.1f%%  ERR %5.1f%%  VOL %s",
+            "  DEC %5.1f%%  ERR %5.1f%%  FIX %5.1f%%  VOL %s",
             uptime, ac, s_msg_rate, s_msg_count,
-            s_decode_smooth, s_crc_smooth, vol_str);
+            s_decode_smooth, s_crc_smooth, s_fix_smooth, vol_str);
         if (n > TERM_W) n = TERM_W;
         printf(PH_DIM "  UP " RESET PH_HI "%-9s" RESET
                PH_DIM "  ACFT " RESET PH_HI BOLD "%-3d" RESET
@@ -836,9 +843,10 @@ static void tui_draw(void)
                PH_DIM "  TOTAL " RESET PH_MID "%-8d" RESET
                PH_DIM "  DEC " RESET PH_HI "%5.1f%%" RESET
                PH_DIM "  ERR " RESET AC_AMBER "%5.1f%%" RESET
+               PH_DIM "  FIX " RESET PH_MID "%5.1f%%" RESET
                PH_DIM "  VOL " RESET "%s%s" RESET,
                uptime, ac, s_msg_rate, s_msg_count,
-               s_decode_smooth, s_crc_smooth,
+               s_decode_smooth, s_crc_smooth, s_fix_smooth,
                s_muted ? AC_RED : PH_HI, vol_str);
         sp(TERM_W - n);
     }
@@ -1053,12 +1061,9 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
                     ((uint32_t)mm->aa2 <<  8) |
                      (uint32_t)mm->aa3;
 
-    if (!mm->crcok) {
-        s_crc_err++;
-        tui_log(4, "CRC ERR  %06lX  df=%d", (unsigned long)icao, mm->msgtype);
-        return;
-    }
-    s_good++;
+    /* Unreachable while check_crc is set, but the ICAO of a bad-CRC frame is
+     * itself garbage -- it must never reach find_or_create(). */
+    if (!mm->crcok) return;
 
     aircraft_t *a = find_or_create(icao);
     if (!a) return;
