@@ -1317,6 +1317,15 @@ CONFIG_APP_QUIT_PIN=0
 # end of Example Configuration
 
 #
+# ADS-B Receiver
+#
+# default:
+CONFIG_ADSB_RX_LAT="29.879221"
+# default:
+CONFIG_ADSB_RX_LON="121.649690"
+# end of ADS-B Receiver
+
+#
 # Compiler options
 #
 # default:

@@ -533,6 +533,11 @@ void mode_s_decode(mode_s_t *self, struct mode_s_msg *mm, unsigned char *msg)
                     // We don't want negative values but a 0-360 scale.
                     if (mm->heading < 0)
                         mm->heading += 360;
+                    /* dump1090 leaves this clear here and just reads heading
+                     * unconditionally at display time; callers that gate on
+                     * the flag (ours does) would otherwise never see a
+                     * heading, since sub 1/2 is the common airborne case. */
+                    mm->heading_is_valid = 1;
                 }
                 else
                 {

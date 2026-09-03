@@ -9,6 +9,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <math.h>
+#include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -407,6 +408,17 @@ static int cpr_nl(double lat)
     return 1;
 }
 
+/* The CPR latitude/longitude indices j and m are routinely negative, and C's
+ * fmod() keeps the sign of the dividend -- dump1090 uses its own modulo that
+ * wraps into [0,b) for exactly this reason. With fmod() a j of -55 yields a
+ * latitude ~360 degrees off (and cpr_nl() then rejects the pair, or worse,
+ * doesn't). */
+static double cpr_mod(double a, double b)
+{
+    double r = fmod(a, b);
+    return r < 0.0 ? r + b : r;
+}
+
 static bool cpr_decode(aircraft_t *a)
 {
     if (!a->cpr_even.valid || !a->cpr_odd.valid) return false;
@@ -423,8 +435,8 @@ static bool cpr_decode(aircraft_t *a)
     double dlat1 = 360.0 / 59.0;
     double j     = floor(59.0 * rlat0 - 60.0 * rlat1 + 0.5);
 
-    double lat0 = dlat0 * (fmod(j, 60.0) + rlat0);
-    double lat1 = dlat1 * (fmod(j, 59.0) + rlat1);
+    double lat0 = dlat0 * (cpr_mod(j, 60.0) + rlat0);
+    double lat1 = dlat1 * (cpr_mod(j, 59.0) + rlat1);
     if (lat0 >= 270.0) lat0 -= 360.0;
     if (lat1 >= 270.0) lat1 -= 360.0;
 
@@ -441,7 +453,7 @@ static bool cpr_decode(aircraft_t *a)
 
     double m   = floor(rlon0 * (cpr_nl(lat) - 1) -
                        rlon1 *  cpr_nl(lat)       + 0.5);
-    double lon = dlon * (fmod(m, (nl > 0 ? nl : 1)) + rlon);
+    double lon = dlon * (cpr_mod(m, (nl > 0 ? nl : 1)) + rlon);
     if (lon >= 180.0) lon -= 360.0;
 
     a->lat = (float)lat;
@@ -588,6 +600,11 @@ static void fmt_uptime(char *buf, size_t len)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 #define RADAR_RANGE_KM  400.0f
+
+/* Terminal cells are roughly this much taller than wide; rings, sweep and blip
+ * placement all have to use the same figure or a blip lands off the ring that
+ * marks its own range. */
+#define RADAR_ASPECT    2.2f
 #define RADAR_CX        (RADAR_COLS / 2)
 #define RADAR_CY        (RADAR_ROWS / 2)
 
@@ -610,7 +627,7 @@ static void latlon_to_xy(float clat, float clon,
     float dx_km =  dlon * 111.0f;
     float dy_km = -dlat * 111.0f;
     float rx = (float)RADAR_CX * 0.90f;
-    float ry = (float)RADAR_CY * 0.90f;
+    float ry = rx / RADAR_ASPECT;
     *ox = RADAR_CX + (int)(dx_km / RADAR_RANGE_KM * rx);
     *oy = RADAR_CY + (int)(dy_km / RADAR_RANGE_KM * ry);
 }
@@ -626,7 +643,7 @@ static void render_radar(char panel[RADAR_ROWS][RADAR_COLS + 1])
     for (int r = 0; r < RADAR_ROWS; r++) {
         for (int c = 0; c < RADAR_COLS; c++) {
             float dx = (float)(c - RADAR_CX);
-            float dy = (float)(r - RADAR_CY) * 2.2f; /* aspect ratio fix */
+            float dy = (float)(r - RADAR_CY) * RADAR_ASPECT;
             float d  = sqrtf(dx*dx + dy*dy);
             float r1 = (float)RADAR_CX * 0.30f;
             float r2 = (float)RADAR_CX * 0.60f;
@@ -656,7 +673,7 @@ static void render_radar(char panel[RADAR_ROWS][RADAR_COLS + 1])
     for (int r = 0; r < RADAR_ROWS; r++) {
         for (int c = 0; c < RADAR_COLS; c++) {
             float dx = (float)(c - RADAR_CX);
-            float dy = (float)(r - RADAR_CY) * 2.2f;
+            float dy = (float)(r - RADAR_CY) * RADAR_ASPECT;
             float d  = sqrtf(dx*dx + dy*dy);
             if (d > sweep_limit || d < 1.0f) continue;
             float angle = atan2f(dy, dx);
@@ -670,15 +687,11 @@ static void render_radar(char panel[RADAR_ROWS][RADAR_COLS + 1])
         }
     }
 
-    /* aircraft blips */
-    float clat = 53.3498f, clon = -6.2603f;
-    int pc = 0; float sl = 0, sn = 0;
-    for (int i = 0; i < MAX_TRACKED; i++) {
-        if (s_aircraft[i].active && s_aircraft[i].pos_valid) {
-            sl += s_aircraft[i].lat; sn += s_aircraft[i].lon; pc++;
-        }
-    }
-    if (pc > 0) { clat = sl / pc; clon = sn / pc; }
+    /* Aircraft blips, plotted relative to the antenna (menuconfig -> ADS-B
+     * Receiver). Kconfig has no float type, so the position arrives as
+     * strings. */
+    float clat = strtof(CONFIG_ADSB_RX_LAT, NULL);
+    float clon = strtof(CONFIG_ADSB_RX_LON, NULL);
 
     for (int i = 0; i < MAX_TRACKED; i++) {
         if (!s_aircraft[i].active || !s_aircraft[i].pos_valid) continue;
@@ -763,7 +776,7 @@ static void render_waterfall(char panel[RADAR_ROWS][RADAR_COLS + 1])
 static void tui_draw(void)
 {
     int64_t now = esp_timer_get_time();
-    if (!s_dirty && (now - s_last_draw) < (TUI_REFRESH_MS * 1000LL)) return;
+    if ((now - s_last_draw) < (TUI_REFRESH_MS * 1000LL)) return;
     s_last_draw = now;
     s_dirty     = false;
 
@@ -1043,13 +1056,12 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
     if (!mm->crcok) {
         s_crc_err++;
         tui_log(4, "CRC ERR  %06lX  df=%d", (unsigned long)icao, mm->msgtype);
-        tui_draw();
         return;
     }
     s_good++;
 
     aircraft_t *a = find_or_create(icao);
-    if (!a) { tui_draw(); return; }
+    if (!a) return;
 
     a->last_seen_us = esp_timer_get_time();
     a->msg_count++;
@@ -1069,8 +1081,14 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
         a->ew_velocity = mm->ew_dir ? -mm->ew_velocity : mm->ew_velocity;
     if (mm->ns_velocity)
         a->ns_velocity = mm->ns_dir ? -mm->ns_velocity : mm->ns_velocity;
-    if (mm->vert_rate)
-        a->vert_rate = mm->vert_rate_sign ? -mm->vert_rate : mm->vert_rate;
+    /* mm->vert_rate is the raw 9-bit field as dump1090 leaves it: 0 means "no
+     * information", otherwise it's 64 ft/min steps biased by one. The table's
+     * climb/descent thresholds are in ft/min, so convert here or every
+     * aircraft reads as level. */
+    if (mm->vert_rate) {
+        int fpm = (mm->vert_rate - 1) * 64;
+        a->vert_rate = mm->vert_rate_sign ? -fpm : fpm;
+    }
 
     /* CPR position */
     if (mm->msgtype == 17 && mm->metype >= 9 && mm->metype <= 18
@@ -1095,8 +1113,6 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
             tui_log(0, "VEL      %06lX  %d kt  hdg=%d  vs=%d",
                     (unsigned long)icao, a->velocity, a->heading, a->vert_rate);
     }
-
-    tui_draw();
 }
 
 /* forward declaration satisfied above — no duplicate needed */
