@@ -22,7 +22,6 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #ifndef _WIN32
@@ -1342,7 +1341,7 @@ static rtlsdr_dongle_t *find_known_device(uint16_t vid, uint16_t pid)
 void esp_action_get_dev_desc(rtlsdr_dev_t *dev)
 {
     assert(dev->driver_obj->dev_hdl != NULL);
-    ESP_LOGI(TAG_ADSB, "Getting config descriptor");
+    tui_log(1, "USB      getting config descriptor");
     const usb_config_desc_t *config_desc;
     ESP_ERROR_CHECK(usb_host_get_active_config_descriptor(dev->driver_obj->dev_hdl, &config_desc));
     usb_print_config_descriptor(config_desc, NULL);
@@ -1405,7 +1404,7 @@ int rtlsdr_open(rtlsdr_dev_t **out_dev, uint8_t index, usb_host_client_handle_t 
     // }
 
     reg = rtlsdr_i2c_read_reg(dev, R820T_I2C_ADDR, R82XX_CHECK_ADDR);
-    ESP_LOGI(TAG_ADSB, "rtl device number %d", reg);
+    tui_log(1, "USB      rtl device number %d", reg);
     fprintf(stderr, "rtlsdr_i2c_read_reg R82XX_CHECK_ADDR setting done\n");
     if (reg == R82XX_CHECK_VAL)
     {
@@ -1571,7 +1570,7 @@ int rtlsdr_reset_interface(rtlsdr_dev_t *dev)
     vTaskDelay(pdMS_TO_TICKS(20));
     esp_err_t r = usb_host_interface_claim(d->client_hdl, d->dev_hdl, 0, 0);
     if (r != ESP_OK) {
-        ESP_LOGE(TAG_ADSB, "interface re-claim failed: 0x%x", (int)r);
+        tui_log(4, "USB      interface re-claim failed: 0x%x", (int)r);
         return -1;
     }
     rtlsdr_reset_buffer(dev);

@@ -34,7 +34,12 @@ typedef struct
     SemaphoreHandle_t done_sem;  // ADD THIS
 } class_adsb_dev;
 
-static const char *TAG_ADSB = "ADSB";
+/* Defined in class_driver.c. The TUI repaints via cursor addressing with no
+ * per-frame clear, so any raw ESP_LOG/printf output that lands on stdout
+ * while it's running corrupts the layout -- route USB/RTL diagnostics here
+ * instead so they land in the on-screen event log. */
+void tui_log(uint8_t color, const char *fmt, ...);
+
 void init_adsb_dev();
 void transfer_read_cb(usb_transfer_t *transfer);
 int esp_libusb_bulk_transfer(class_driver_t *driver_obj, unsigned char endpoint, unsigned char *data, int length, int *transferred, unsigned int timeout);

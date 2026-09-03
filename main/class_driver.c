@@ -453,7 +453,14 @@ static bool cpr_decode(aircraft_t *a)
  * LOG / AIRCRAFT HELPERS
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-static void tui_log(uint8_t color, const char *fmt, ...)
+/* Before the TUI's first frame there's no box on screen to protect, but
+ * there's also no tui_draw() call yet to ever surface a queued s_log[]
+ * entry -- so anything logged during device setup (USB enumeration, tuner
+ * bring-up) needs to also go out raw, or a setup-time hang/error becomes
+ * completely silent instead of just ugly. */
+static bool s_tui_active = false;
+
+void tui_log(uint8_t color, const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
@@ -463,6 +470,11 @@ static void tui_log(uint8_t color, const char *fmt, ...)
     s_log[s_log_head % LOG_LINES].color = color;
     s_log_head++;
     s_dirty = true;
+
+    if (!s_tui_active) {
+        printf("%s\n", s_log[(s_log_head - 1) % LOG_LINES].text);
+        fflush(stdout);
+    }
 }
 
 static aircraft_t *find_or_create(uint32_t icao)
@@ -1130,6 +1142,7 @@ void adsb_rx_task(void *arg)
     uart_driver_install(UART_NUM_0, 256, 0, 0, NULL, 0);
 
     printf(CLS);
+    s_tui_active = true;
     tui_draw();
 
     bool stream_started = (rtlsdr_stream_start(rtldev) == 0);
