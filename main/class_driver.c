@@ -18,6 +18,7 @@
 #include "driver/i2s_std.h"
 #include "driver/i2c.h"
 #include "driver/uart.h"
+#include "driver/uart_vfs.h"
 #include "driver/gpio.h"
 #include "es8311.h"
 #include "rtl-sdr.h"
@@ -1100,16 +1101,38 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
 
 /* forward declaration satisfied above — no duplicate needed */
 
+/* Sized for the one caller's fixed DEFAULT_BUF_LENGTH chunk. Static rather than
+ * malloc'd because this sits on the 4 MB/s IQ hot path, and safe only because
+ * adsb_rx_task is the sole caller -- a second demodulating task needs its own. */
+static uint16_t s_mag[DEFAULT_BUF_LENGTH / 2];
+
 void demodulate(uint8_t *source, int length)
 {
     if (!source || length <= 0) return;
+    if (length > DEFAULT_BUF_LENGTH) length = DEFAULT_BUF_LENGTH;
     int mag_len = length / 2;
-    uint16_t *mag = malloc(mag_len * sizeof(uint16_t));
-    if (!mag) { tui_log(4, "OOM  magnitude buffer"); return; }
-    mode_s_compute_magnitude_vector(source, mag, length);
-    waterfall_push(mag, mag_len);       /* feed real IQ energy into wfall  */
-    mode_s_detect(&state, mag, mag_len, on_msg);
-    free(mag);
+    mode_s_compute_magnitude_vector(source, s_mag, length);
+    waterfall_push(s_mag, mag_len);     /* feed real IQ energy into wfall  */
+    mode_s_detect(&state, s_mag, mag_len, on_msg);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * TUI TASK
+ *
+ * tui_draw() blocks in printf until the entire frame has clocked out of the
+ * console UART -- a full 154-column frame is ~20 KB of UTF-8 box drawing and
+ * ANSI colour. Drawing it from adsb_rx_task meant the IQ ring overflowed for
+ * the whole duration of every frame, which at the old hardcoded 115200 baud
+ * was over a second. It reads the aircraft table without a lock: a torn frame
+ * is cosmetic, a starved demod loop is not.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static void tui_task(void *arg)
+{
+    for (;;) {
+        tui_draw();     /* self-rate-limits to TUI_REFRESH_MS */
+        vTaskDelay(pdMS_TO_TICKS(TUI_REFRESH_MS / 3));
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1146,23 +1169,34 @@ void adsb_rx_task(void *arg)
     bool full_buffer = false;
     mode_s_init(&state);
 
-    /* configure UART0 for non-blocking key reads */
+    /* configure UART0 for non-blocking key reads. The baud MUST stay at the
+     * console's configured rate -- this is the same UART stdout goes out on,
+     * so hardcoding a slower one both garbles the monitor and throttles
+     * tui_draw() to a crawl (a full 154-col frame is ~20 KB of UTF-8+ANSI). */
     uart_config_t uart_cfg = {
-        .baud_rate  = 115200,
+        .baud_rate  = CONFIG_ESP_CONSOLE_UART_BAUDRATE,
         .data_bits  = UART_DATA_8_BITS,
         .parity     = UART_PARITY_DISABLE,
         .stop_bits  = UART_STOP_BITS_1,
         .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
     };
     uart_param_config(UART_NUM_0, &uart_cfg);
-    uart_driver_install(UART_NUM_0, 256, 0, 0, NULL, 0);
+    /* Console stdout otherwise goes through uart_vfs's default tx_func, which
+     * busy-spins on the TX FIFO one byte at a time -- it never yields, so a
+     * slow/heavy tui_draw() can starve IDLE1 long enough to trip the task
+     * watchdog. Routing stdout through this driver's buffered+interrupt TX
+     * makes printf() a semaphore-blocked (yielding) call instead. */
+    uart_driver_install(UART_NUM_0, 256, 4096, 0, NULL, 0);
+    uart_vfs_dev_use_driver(UART_NUM_0);
 
     printf(CLS);
     s_tui_active = true;
-    tui_draw();
+    xTaskCreatePinnedToCore(tui_task, "tui", 6144, NULL, 2, NULL, 0);
 
     bool stream_started = (rtlsdr_stream_start(rtldev) == 0);
     if (!stream_started) tui_log(4, "STREAM   start failed, retrying");
+
+    int64_t last_yield = esp_timer_get_time();
 
     while (true) {
         /* ── non-blocking keyread ── */
@@ -1205,7 +1239,7 @@ void adsb_rx_task(void *arg)
             while (got < DEFAULT_BUF_LENGTH) {
                 int r = rtlsdr_stream_read(&buffer[got], DEFAULT_BUF_LENGTH - got);
                 if (r > 0) { got += r; stall_ticks = 0; continue; }
-                if (++stall_ticks > 200) break;   /* ~200ms with no data */
+                if (++stall_ticks > 200) break;   /* ~2s with no data */
                 vTaskDelay(1);
             }
 
@@ -1217,13 +1251,15 @@ void adsb_rx_task(void *arg)
             }
         }
 
+        /* While the ring has data this loop never blocks, so IDLE1 -- and with
+         * it the task watchdog and deleted-task cleanup -- only runs if core1
+         * is handed back deliberately. One tick per half second is ~2% of the
+         * IQ budget; taskYIELD() would not do, IDLE is lower priority. */
         int64_t now = esp_timer_get_time();
-        if (now - s_last_draw > (TUI_REFRESH_MS * 1000LL)) {
-            s_dirty = true;
-            tui_draw();
+        if (now - last_yield >= 500000LL) {
+            last_yield = now;
+            vTaskDelay(1);
         }
-
-        vTaskDelay(pdMS_TO_TICKS(1));
     }
 
     free(buffer);

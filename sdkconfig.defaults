@@ -2,3 +2,14 @@
 # Espressif IoT Development Framework (ESP-IDF) Project Minimal Configuration
 #
 CONFIG_USB_HOST_HUBS_SUPPORTED=y
+
+# Default 115200 makes a single TUI redraw (~15-30KB) take 1-3s of blocking
+# UART time, which is what starves IDLE1 into a task-watchdog trip. Raise the
+# monitor baud rate to match (idf.py monitor -b 921600).
+# NOTE: ESP_CONSOLE_UART_BAUDRATE's prompt is only visible/settable when the
+# console-select choice is UART_CUSTOM, not UART_DEFAULT -- setting the baud
+# alone silently no-ops back to 115200 on reconfigure.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=n
+CONFIG_ESP_CONSOLE_UART_CUSTOM=y
+CONFIG_ESP_CONSOLE_UART_CUSTOM_NUM_0=y
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=921600
