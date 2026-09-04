@@ -13,3 +13,16 @@ CONFIG_ESP_CONSOLE_UART_DEFAULT=n
 CONFIG_ESP_CONSOLE_UART_CUSTOM=y
 CONFIG_ESP_CONSOLE_UART_CUSTOM_NUM_0=y
 CONFIG_ESP_CONSOLE_UART_BAUDRATE=921600
+
+# IDF defaults to -Og. The demod path is a per-sample inner loop (magnitude
+# LUT + preamble scan, 2M samples/s), which is exactly the shape -Og costs the
+# most on. Assertions are a separate knob and stay on.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# Backs the TUI's CPU0/CPU1 gauges. Selects USE_TRACE_FACILITY and
+# USE_STATS_FORMATTING_FUNCTIONS on its own; the counter is esp_timer, so
+# enabling it costs a 64->32-bit read per context switch and ~1KB of .bss.
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+# Adds TaskStatus_t.xCoreID, which the TASKS panel needs to attribute each
+# task to a core.
+CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID=y
