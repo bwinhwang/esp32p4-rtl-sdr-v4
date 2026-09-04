@@ -1,4 +1,4 @@
-idf_component_register(SRCS "demod1090.c" "mode-s.c" "usb_host_lib_main.c" "demod1090.c" "mode-s.c" "class_driver.c" "esp_libusb.c" "tuner_r82xx.c" "tuner_fc2580.c" "tuner_fc0013.c" "tuner_fc0012.c" "tuner_e4k.c" "librtlsdr.c" 
+idf_component_register(SRCS "usb_host_lib_main.c" "class_driver.c" "esp_libusb.c" "librtlsdr.c" "mode-s.c" "tuner_r82xx.c" "tuner_fc2580.c" "tuner_fc0013.c" "tuner_fc0012.c" "tuner_e4k.c"
                     INCLUDE_DIRS "."
                     PRIV_REQUIRES usb esp_driver_gpio esp_timer esp_driver_i2s driver es8311 esp_driver_uart
                     )
