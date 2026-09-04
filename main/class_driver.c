@@ -1410,7 +1410,8 @@ static void tui_draw(void)
            PH_DIM "  ctrl+] EXIT  " PH_GRID "|" RESET
            PH_DIM "  [M]UTE  " PH_GRID "|" RESET
            PH_DIM "  [+/-] VOL  " PH_GRID "|" RESET
-           PH_DIM "  [R] RADAR/WFALL/TASKS" EL "\n" RESET);
+           PH_DIM "  [R] RADAR/WFALL/TASKS  " PH_GRID "|" RESET
+           PH_DIM "  [T] TEST PLANE" EL "\n" RESET);
 
     fb_flush();
     probe_frame(now, (uint32_t)(esp_timer_get_time() - now));
@@ -1496,7 +1497,59 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
     }
 }
 
-/* forward declaration satisfied above — no duplicate needed */
+/* ── synthetic contacts ('t' key) ─────────────────────────────────────────
+ * Drives the table, the radar and the log with no antenna and no dongle, so
+ * display and (later) feed work can be tested indoors. Called only from
+ * adsb_rx_task's key handler, which is the same task on_msg() runs in -- so
+ * it touches s_aircraft[] under exactly the same rules the real path does. */
+static void inject_fake_aircraft(void)
+{
+    /* One entry per plane_classify() bucket, so four presses put one of each
+     * on screen. 0xAE1234 is inside the US military block *and* carries a
+     * military prefix; 0x780ABC deliberately never gets a callsign. */
+    static const struct { uint32_t icao; const char *callsign; } FAKE[] = {
+        { 0x4CA1FA, "RYR1234" },
+        { 0xAE1234, "RCH567"  },
+        { 0xA12345, "N172SP"  },
+        { 0x780ABC, ""        },
+    };
+    static int seq = 0;
+
+    const int n   = seq % (int)(sizeof(FAKE) / sizeof(FAKE[0]));
+    const int rev = seq / (int)(sizeof(FAKE) / sizeof(FAKE[0]));
+
+    aircraft_t *a = find_or_create(FAKE[n].icao);
+    if (!a) return;
+
+    a->last_seen_us = esp_timer_get_time();
+    a->msg_count++;
+    if (FAKE[n].callsign[0]) {
+        strncpy(a->callsign, FAKE[n].callsign, 8);
+        a->callsign[8] = '\0';
+    }
+    a->category = plane_classify(a->icao, a->callsign);
+
+    /* Placed around the configured antenna, not a fixed lat/lon, so the blips
+     * land inside RADAR_RANGE_KM whatever CONFIG_ADSB_RX_* is set to. */
+    float clat = strtof(CONFIG_ADSB_RX_LAT, NULL);
+    float clon = strtof(CONFIG_ADSB_RX_LON, NULL);
+    float ang  = (float)(n * 90 + rev * 17) * (float)M_PI / 180.0f;
+    float km   = 60.0f + (float)((rev * 37) % 240);
+    a->lat = clat + km * cosf(ang) / 111.0f;
+    a->lon = clon + km * sinf(ang) / (111.0f * cosf(clat * (float)M_PI / 180.0f));
+    a->pos_valid = true;
+
+    a->altitude  = 3000 + ((seq * 2500) % 36000);
+    a->velocity  = 180  + ((seq *   37) % 320);
+    a->heading   =        ((seq *   53) % 360);
+    a->vert_rate = -1600 + ((seq *  448) % 3200);
+
+    tui_log(3, "FAKE     %06lX  %s  %s", (unsigned long)a->icao,
+            a->callsign[0] ? a->callsign : "--------",
+            plane_cat_label(a->category));
+
+    seq++;
+}
 
 /* Sized for the one caller's fixed DEFAULT_BUF_LENGTH chunk. Static rather than
  * malloc'd because this sits on the 4 MB/s IQ hot path, and safe only because
@@ -1621,6 +1674,9 @@ void adsb_rx_task(void *arg)
                     s_volume -= 10;
                     if (s_volume < 0) s_volume = 0;
                     s_dirty = true;
+                    break;
+                case 't': case 'T':
+                    inject_fake_aircraft();
                     break;
                 default: break;
             }
