@@ -14,7 +14,11 @@
 typedef struct
 {
     // Internal state
-    uint32_t icao_cache[sizeof(uint32_t) * MODE_S_ICAO_CACHE_LEN * 2]; // Recently seen ICAO addresses cache
+    // Recently seen ICAO addresses cache: an (addr, timestamp) pair per slot,
+    // indexed [h*2] / [h*2+1] with h < MODE_S_ICAO_CACHE_LEN. dump1090 sizes
+    // it as a malloc() byte count, so the sizeof() belonged there, not in an
+    // array bound -- keeping it made the array 4x the addressable range.
+    uint32_t icao_cache[MODE_S_ICAO_CACHE_LEN * 2];
 
     // Configuration
     int fix_errors; // Single bit error correction if true

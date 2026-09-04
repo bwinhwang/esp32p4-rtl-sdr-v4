@@ -8,7 +8,10 @@
 
 #define MODE_S_ICAO_CACHE_TTL 60 // Time to live of cached addresses.
 
-static uint16_t maglut[129 * 129 * 2];
+/* 129x129 entries of (i,q) -> magnitude. dump1090 sizes this as a malloc()
+ * byte count (129*129*sizeof(uint16_t)); as an array bound that trailing 2 is
+ * an element count and doubles it, leaving the upper half untouched. */
+static uint16_t maglut[129 * 129];
 static int maglut_initialized = 0;
 
 // =============================== Initialization ===========================
