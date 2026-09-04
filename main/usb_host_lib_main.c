@@ -14,6 +14,7 @@
 #include "net_eth.h"
 #include "feed_avr.h"
 #include "feed_beast.h"
+#include "feed_json.h"
 
 #define HOST_LIB_TASK_PRIORITY  2
 #define CLASS_TASK_PRIORITY     3
@@ -104,6 +105,7 @@ void app_main(void)
     net_eth_start();
     feed_avr_start();
     feed_beast_start();
+    feed_json_start();
 
     /* WIFI6-DEV-KIT's Host-port VBUS is switched by an always-on load
      * switch (hardwired EN), unlike the Nano board which needed a GPIO

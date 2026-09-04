@@ -31,6 +31,7 @@
 #include "net_eth.h"
 #include "feed_avr.h"
 #include "feed_beast.h"
+#include "feed_json.h"
 #include "plane_cat.h"
 
 /* ── build config ────────────────────────────────────────────────────────── */
@@ -570,6 +571,55 @@ static int active_count(void)
             n++;
         }
     }
+    return n;
+}
+
+/* ── JSON snapshot export (feed_json.c) ──────────────────────────────────────
+ * Periodic full-table export, not one line per decode -- feed_json.c pushes
+ * this same buffer to every client on a timer, so there is no per-client
+ * queue and a slow client just misses ticks instead of needing backpressure
+ * handling. Staleness window matches active_count()'s, but read-only: this
+ * runs from feed_json's own task (core0), a second reader of s_aircraft[]
+ * alongside tui_task, so it must never be the one to flip `active` off. */
+static size_t json_append(char *buf, size_t bufsize, size_t n, const char *fmt, ...)
+{
+    if (n >= bufsize) return n;
+    va_list ap;
+    va_start(ap, fmt);
+    int w = vsnprintf(buf + n, bufsize - n, fmt, ap);
+    va_end(ap);
+    return (w > 0) ? n + (size_t)w : n;
+}
+
+size_t aircraft_export_ndjson(char *buf, size_t bufsize)
+{
+    int64_t now = esp_timer_get_time();
+    size_t  n   = json_append(buf, bufsize, 0,
+                    "{\"now\":%.3f,\"messages\":%d,\"aircraft\":[",
+                    now / 1e6, s_msg_count);
+
+    bool first = true;
+    for (int i = 0; i < MAX_TRACKED; i++) {
+        aircraft_t *a = &s_aircraft[i];
+        if (!a->active || now - a->last_seen_us > 60000000LL) continue;
+
+        char latbuf[16] = "null", lonbuf[16] = "null";
+        if (a->pos_valid) {
+            snprintf(latbuf, sizeof(latbuf), "%.5f", a->lat);
+            snprintf(lonbuf, sizeof(lonbuf), "%.5f", a->lon);
+        }
+
+        n = json_append(buf, bufsize, n,
+                "%s{\"hex\":\"%06lx\",\"flight\":\"%s\",\"alt_baro\":%d,"
+                "\"gs\":%d,\"track\":%d,\"vert_rate\":%d,\"lat\":%s,\"lon\":%s,"
+                "\"category\":\"%s\",\"messages\":%d,\"seen\":%.1f}",
+                first ? "" : ",", (unsigned long)a->icao, a->callsign,
+                a->altitude, a->velocity, a->heading, a->vert_rate,
+                latbuf, lonbuf, plane_cat_label(a->category), a->msg_count,
+                (double)(now - a->last_seen_us) / 1e6);
+        first = false;
+    }
+    n = json_append(buf, bufsize, n, "]}\n");
     return n;
 }
 
