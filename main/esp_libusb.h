@@ -1,3 +1,5 @@
+#pragma once
+
 #include "usb/usb_host.h"
 #include "freertos/semphr.h"
 

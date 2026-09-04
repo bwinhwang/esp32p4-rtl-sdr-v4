@@ -37,3 +37,10 @@ CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_PARTITION_TABLE_OFFSET=0x10000
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# lwIP's tcpip task is prio 18 and defaults to no affinity, which puts it above
+# adsb_rx_task (prio 5) and free to land on core1 -- every packet would then
+# preempt the demod loop mid-buffer and drop IQ. Core0 is where the headroom is.
+# esp_eth's emac_rx (prio 15) has the same problem and is handled in code
+# instead: ETH_MAC_FLAG_PIN_TO_CORE in net_eth.c pins it to the installing core.
+CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y

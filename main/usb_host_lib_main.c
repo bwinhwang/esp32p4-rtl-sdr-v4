@@ -11,6 +11,7 @@
 #include "esp_intr_alloc.h"
 #include "usb/usb_host.h"
 #include "driver/gpio.h"
+#include "net_eth.h"
 
 #define HOST_LIB_TASK_PRIORITY  2
 #define CLASS_TASK_PRIORITY     3
@@ -95,6 +96,10 @@ void app_main(void)
     if (audio_init() == ESP_OK) {
         audio_play(1 /* AUDIO_EVT_BOOT */);
     }
+
+    /* ── 1.5. Ethernet ── non-fatal: the receiver is fully usable with no
+     * cable in, and autoneg + DHCP finish long after this returns. */
+    net_eth_start();
 
     /* WIFI6-DEV-KIT's Host-port VBUS is switched by an always-on load
      * switch (hardwired EN), unlike the Nano board which needed a GPIO

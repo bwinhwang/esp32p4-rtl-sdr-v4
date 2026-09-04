@@ -28,6 +28,7 @@
 #include "rtl-sdr.h"
 #include "mode-s.h"
 #include "esp_task_wdt.h"
+#include "net_eth.h"
 
 /* ── build config ────────────────────────────────────────────────────────── */
 #define CLIENT_NUM_EVENT_MSG  5
@@ -1139,12 +1140,23 @@ static void tui_draw(void)
     /* header — single full-width row */
     row_begin();
     {
+        char ip[16];
+        net_eth_state_t est = net_eth_state();
+        net_eth_ip_str(ip, sizeof(ip));
+        const char *net = est == NET_ETH_READY  ? ip
+                        : est == NET_ETH_LINK   ? "dhcp..."
+                        : est == NET_ETH_NOLINK ? "no link"
+                                                : "off";
         int n = (int)strlen("  ATC TERMINAL  //  ESP32-P4 ADS-B RECEIVER"
-                            "  //  1090.000 MHz  //  2 MSPS");
+                            "  //  1090.000 MHz  //  2 MSPS  //  ETH ")
+              + (int)strlen(net);
         fb_printf(PH_HI BOLD "  ATC TERMINAL" RESET
                PH_GRID "  //  " RESET PH_SCAN "ESP32-P4 ADS-B RECEIVER" RESET
                PH_GRID "  //  " RESET PH_HI "1090.000 MHz" RESET
-               PH_GRID "  //  " RESET PH_MID "2 MSPS" RESET);
+               PH_GRID "  //  " RESET PH_MID "2 MSPS" RESET
+               PH_GRID "  //  " RESET PH_DIM "ETH " RESET "%s%s" RESET,
+               est == NET_ETH_READY ? PH_HI : est == NET_ETH_LINK ? PH_MID : PH_DIM,
+               net);
         sp(TERM_W - n);
     }
     row_end();

@@ -6,3 +6,6 @@ dependencies:
   # espressif/es8311 is deprecated upstream and declares idf <6.0;
   # esp_codec_dev is the maintained replacement and uses the new I2C driver.
   espressif/esp_codec_dev: ^1.6
+  # IDF v6.0 moved the vendor Ethernet PHY drivers out of esp_eth and into
+  # esp-eth-drivers; only esp_eth_phy_new_generic() is still in-tree.
+  espressif/ip101: ^1.1
