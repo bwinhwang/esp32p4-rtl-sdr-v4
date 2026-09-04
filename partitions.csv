@@ -1,0 +1,8 @@
+# 16 MB flash, partition table at 0x10000 (see sdkconfig.defaults) rather than
+# the stock 0x8000: that left the bootloader only 24K, of which it already used
+# 96%. Single app, no OTA.
+# Name,     Type, SubType, Offset,   Size,     Flags
+nvs,        data, nvs,     0x11000,  0x6000,
+phy_init,   data, phy,     0x17000,  0x1000,
+factory,    app,  factory, 0x20000,  0x400000,
+storage,    data, spiffs,  0x420000, 0xBE0000,

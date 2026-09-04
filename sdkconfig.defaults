@@ -26,3 +26,14 @@ CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
 # Adds TaskStatus_t.xCoreID, which the TASKS panel needs to attribute each
 # task to a core.
 CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID=y
+
+# The board carries 16 MB (esptool "Detected flash size: 16MB") but the project
+# was configured for 2 MB, so 7/8 of it was unreachable and the single-app
+# layout capped the app at 1 MB -- too small once lwIP/esp_eth land.
+# The bootloader had 0x440 bytes (4%) of its 24K slot left at 0x8000, so the
+# table moves to 0x10000 and gives it 56K. Anything that grows the bootloader
+# (secure boot, flash encryption, a louder bootloader log) needed that room.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_OFFSET=0x10000
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
