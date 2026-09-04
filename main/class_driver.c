@@ -12,9 +12,11 @@
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include "usb/usb_host.h"
 #include "driver/i2s_std.h"
 #include "driver/i2c.h"
@@ -32,7 +34,11 @@
 #define DEFAULT_BUF_LENGTH    (MAX_PACKET_SIZE * 2)
 #define MAX_TRACKED           16
 #define LOG_LINES             7
-#define TUI_REFRESH_MS        150
+/* A full repaint is ~13 KB, and pushing bytes at the console UART costs ~7 us
+ * of CPU each, so this constant sets core0 load directly: at 150 ms it was
+ * 90 KB/s, which is 98% of the 921600-baud line rate and 63% of the core.
+ * Raise it before blaming anything else for core0 being busy. */
+#define TUI_REFRESH_MS        500
 
 /* ── audio pins (Waveshare ESP32-P4-WIFI6-DEV-KIT + ES8311) ──────────────── */
 #define I2C_SCL_PIN     8
@@ -334,7 +340,9 @@ esp_err_t audio_init(void)
     gpio_set_level(PA_EN_PIN, 1);
 
     s_audio_q = xQueueCreate(8, sizeof(audio_evt_t));
-    xTaskCreatePinnedToCore(audio_task, "audio", 4096, NULL, 6, NULL, 1);
+    /* core0, not core1: at prio 6 this sits above adsb_rx_task's 5, so on core1
+     * every tone would preempt the demod loop mid-buffer. core0 has the room. */
+    xTaskCreatePinnedToCore(audio_task, "audio", 4096, NULL, 6, NULL, 0);
     ESP_LOGI(TAG, "Audio OK  vol=%d", s_volume);
     return ESP_OK;
 }
@@ -543,6 +551,122 @@ static int active_count(void)
 #define LEFT_W       (TERM_W - RADAR_COLS - 2)
 #define EL           "\033[K"
 
+/* ── frame buffer ─────────────────────────────────────────────────────────
+ *
+ * A frame is ~20 KB, and both costs sitting on top of the bytes are per-call,
+ * not per-byte: stdio's stream lock (taken ~4000x per frame, bottoming out in
+ * a cross-core spinlock core1's demod loop contends for), and uart_vfs's
+ * write(), which loops PER CHARACTER to do the \n -> \r\n translation and
+ * calls uart_write_bytes(&c, 1) for each -- a mutex take/give and a ringbuf
+ * send per byte, ~20000 per frame.
+ *
+ * So the frame is assembled here with memcpy and handed to uart_write_bytes()
+ * in whole runs, CRLF expanded by hand: stdio and the VFS are both out of the
+ * path. This is why neither -O2 nor setvbuf ever moved the number -- the cost
+ * was inside prebuilt libc and IDF, and it was never the write count.
+ * printf() elsewhere (ESP_LOG, boot) still goes the normal way.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+#define CONSOLE_UART  ((uart_port_t)CONFIG_ESP_CONSOLE_UART_NUM)
+
+static char s_fb[4096];
+static int  s_fb_len;
+
+/* Frame-cost probe. Reasoning about where the frame time goes has been wrong
+ * three times running, so these numbers get measured and shown instead:
+ * per-second totals of frames, bytes, time assembling and time writing. */
+static uint32_t s_pf_bytes, s_pf_out_us;                        /* this frame */
+static uint32_t s_pr_fps, s_pr_bytes, s_pr_out_ms, s_pr_asm_ms; /* last second*/
+
+static void fb_flush(void)
+{
+    if (s_fb_len <= 0) return;
+
+    int64_t     t0  = esp_timer_get_time();
+    const char *p   = s_fb;
+    int         rem = s_fb_len;
+    s_pf_bytes += (uint32_t)s_fb_len;
+    s_fb_len = 0;
+
+    while (rem > 0) {
+        const char *nl  = memchr(p, '\n', (size_t)rem);
+        int         run = nl ? (int)(nl - p) : rem;
+        if (run > 0) uart_write_bytes(CONSOLE_UART, p, (size_t)run);
+        if (!nl) break;
+        uart_write_bytes(CONSOLE_UART, "\r\n", 2);
+        p    = nl + 1;
+        rem -= run + 1;
+    }
+    s_pf_out_us += (uint32_t)(esp_timer_get_time() - t0);
+}
+
+static void probe_frame(int64_t now, uint32_t frame_us)
+{
+    static int64_t  win;
+    static uint32_t n, bytes, out_us, tot_us;
+
+    n++;
+    bytes  += s_pf_bytes;
+    out_us += s_pf_out_us;
+    tot_us += frame_us;
+
+    if (!win) { win = now; return; }
+    if (now - win < 1000000LL) return;
+
+    s_pr_fps    = n;
+    s_pr_bytes  = bytes / n;
+    s_pr_out_ms = out_us / 1000;
+    s_pr_asm_ms = (tot_us - out_us) / 1000;
+    win = now;
+    n = bytes = out_us = tot_us = 0;
+}
+
+/* Flushing mid-frame when full keeps the buffer small without ever
+ * truncating a row -- the flush count was never what cost anything. */
+static void fb_room(int need)
+{
+    if (s_fb_len + need > (int)sizeof(s_fb)) fb_flush();
+}
+
+static void fb_puts(const char *s)
+{
+    int n = (int)strlen(s);
+    fb_room(n);
+    if (n > (int)sizeof(s_fb)) n = (int)sizeof(s_fb);
+    memcpy(s_fb + s_fb_len, s, (size_t)n);
+    s_fb_len += n;
+}
+
+static void fb_putc(char c)
+{
+    fb_room(1);
+    s_fb[s_fb_len++] = c;
+}
+
+static void fb_rep(char c, int n)
+{
+    while (n > 0) {
+        fb_room(1);
+        int chunk = (int)sizeof(s_fb) - s_fb_len;
+        if (chunk > n) chunk = n;
+        memset(s_fb + s_fb_len, c, (size_t)chunk);
+        s_fb_len += chunk;
+        n        -= chunk;
+    }
+}
+
+__attribute__((format(printf, 1, 2)))
+static void fb_printf(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    fb_room(256);
+    int room = (int)sizeof(s_fb) - s_fb_len;
+    int n = vsnprintf(s_fb + s_fb_len, (size_t)room, fmt, ap);
+    va_end(ap);
+    if (n > 0) s_fb_len += (n < room ? n : room - 1);
+}
+
 /* ── draw helpers ─────────────────────────────────────────────────────────*/
 
 static void print_bar(const char *color, float value, float max, int width)
@@ -550,42 +674,42 @@ static void print_bar(const char *color, float value, float max, int width)
     int filled = (max > 0.0f) ? (int)(value * width / max) : 0;
     if (filled > width) filled = width;
     if (filled < 0)     filled = 0;
-    printf("%s", color);
+    fb_puts(color);
     for (int i = 0; i < width; i++)
-        printf("%s", i < filled ? BLK : BBLK);
-    printf(RESET);
+        fb_puts(i < filled ? BLK : BBLK);
+    fb_puts(RESET);
 }
 
 static void hline(int w)
 {
-    printf(PH_GRID);
-    for (int i = 0; i < w; i++) printf(HL);
-    printf(RESET);
+    fb_puts(PH_GRID);
+    for (int i = 0; i < w; i++) fb_puts(HL);
+    fb_puts(RESET);
 }
 
 /* Every content row is:  │  <LEFT_W chars>  │  <RADAR_COLS chars>  │  \n
  * row_begin/end wrap the outer borders only.
  * The inner │ is printed manually between the two panels.               */
-static void row_begin(void) { printf(PH_GRID VL RESET); }
-static void row_end(void)   { printf(PH_GRID VL EL "\n" RESET); }
+static void row_begin(void) { fb_puts(PH_GRID VL RESET); }
+static void row_end(void)   { fb_puts(PH_GRID VL EL "\n" RESET); }
 
 static void sep_full(void)
 {
     /* ├────────────────────────────────────────────────┤ */
-    printf(PH_GRID TR_); hline(TERM_W); printf(TL_ EL "\n" RESET);
+    fb_puts(PH_GRID TR_); hline(TERM_W); fb_puts(TL_ EL "\n" RESET);
 }
 
 static void sep_split(void)
 {
     /* ├─── left ───┼─── right ───┤ */
-    printf(PH_GRID TR_);
+    fb_puts(PH_GRID TR_);
     hline(LEFT_W);
-    printf(CROSS);
+    fb_puts(CROSS);
     hline(RADAR_COLS);
-    printf(TL_ EL "\n" RESET);
+    fb_puts(TL_ EL "\n" RESET);
 }
 
-static void sp(int n) { for (int i = 0; i < n; i++) putchar(' '); }
+static void sp(int n) { fb_rep(' ', n); }
 
 static void fmt_uptime(char *buf, size_t len)
 {
@@ -717,6 +841,18 @@ static uint32_t s_wf_peak = 256;  /* running peak for auto-scale */
 void waterfall_push(const uint16_t *mag, int mag_len)
 {
     if (!mag || mag_len <= 0) return;
+
+    /* demodulate() runs ~122x/s but the panel only repaints every
+     * TUI_REFRESH_MS, so all but one push per frame went straight back out
+     * unseen -- and the RADAR_ROWS visible rows spanned 0.16s, which is not a
+     * history. One row per repaint costs ~1/60th as much and makes the panel
+     * span RADAR_ROWS frames of real time. Kept running even when the
+     * waterfall is not the visible panel so switching to it shows data. */
+    static int64_t last_push;
+    int64_t now = esp_timer_get_time();
+    if (now - last_push < TUI_REFRESH_MS * 1000LL) return;
+    last_push = now;
+
     int bin_size = mag_len / WF_BINS;
     if (bin_size < 1) bin_size = 1;
     int row = s_wf_row % RADAR_ROWS;
@@ -769,6 +905,160 @@ static void render_waterfall(char panel[RADAR_ROWS][RADAR_COLS + 1])
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * CPU LOAD / HEAP
+ *
+ * Per-core busy percentage, from how much of each interval that core's IDLE
+ * task got. IDF's FreeRTOS has no per-task run-time getter, so the whole task
+ * list has to be walked, and uxTaskGetSystemState() holds a cross-core
+ * spinlock for the walk -- hence 1 Hz rather than once per frame.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+#define CPU_STAT_MAX_TASKS  32
+
+typedef struct {
+    TaskHandle_t hdl;
+    char         name[12];
+    int8_t       core;          /* -1 = no affinity */
+    uint32_t     last_rt;
+    int          pct;           /* share of ONE core, not of both */
+    uint32_t     stack_hwm;
+} task_stat_t;
+
+static int         s_cpu_busy[2] = { -1, -1 };  /* -1 until first interval */
+static uint32_t    s_heap_free, s_heap_min, s_heap_big;
+static task_stat_t s_tstat[CPU_STAT_MAX_TASKS];
+static int         s_tstat_n;
+
+static void stats_sample(int64_t now)
+{
+    static TaskStatus_t st[CPU_STAT_MAX_TASKS];
+    static TaskHandle_t idle_hdl[2];
+    static uint32_t     last_idle[2];
+    static int64_t      last_us;
+
+    if (last_us && (now - last_us) < 1000000LL) return;
+
+    if (!idle_hdl[0]) {
+        idle_hdl[0] = xTaskGetIdleTaskHandleForCore(0);
+        idle_hdl[1] = xTaskGetIdleTaskHandleForCore(1);
+    }
+
+    uint32_t    total;
+    UBaseType_t n = uxTaskGetSystemState(st, CPU_STAT_MAX_TASKS, &total);
+    if (n == 0) return;     /* array too small -- raise CPU_STAT_MAX_TASKS */
+
+    int64_t span = now - last_us;
+
+    uint32_t idle[2] = { 0, 0 };
+    for (UBaseType_t i = 0; i < n; i++)
+        for (int c = 0; c < 2; c++)
+            if (st[i].xHandle == idle_hdl[c])
+                idle[c] = st[i].ulRunTimeCounter;
+
+    if (last_us && span > 0) {
+        for (int c = 0; c < 2; c++) {
+            /* The counter is esp_timer microseconds truncated to 32 bits, so
+             * elapsed wall time is exactly one core's budget and the unsigned
+             * delta stays correct across the ~71 min wrap. */
+            int64_t busy = span - (int64_t)(idle[c] - last_idle[c]);
+            if (busy < 0)    busy = 0;
+            if (busy > span) busy = span;
+            s_cpu_busy[c] = (int)(busy * 100 / span);
+        }
+    }
+    last_idle[0] = idle[0];
+    last_idle[1] = idle[1];
+
+    /* Per-task deltas. Matching on the handle rather than the slot index --
+     * uxTaskGetSystemState() gives no stable ordering, and tasks come and go
+     * (rtlsdr_setup_task is transient). An unmatched handle just reads 0% for
+     * one interval. */
+    task_stat_t prev[CPU_STAT_MAX_TASKS];
+    int         prev_n = s_tstat_n;
+    memcpy(prev, s_tstat, sizeof(prev));
+
+    for (UBaseType_t i = 0; i < n; i++) {
+        task_stat_t *t = &s_tstat[i];
+        t->hdl = st[i].xHandle;
+        snprintf(t->name, sizeof(t->name), "%s",
+                 st[i].pcTaskName ? st[i].pcTaskName : "?");
+#if ( configTASKLIST_INCLUDE_COREID == 1 )
+        t->core = (st[i].xCoreID == tskNO_AFFINITY) ? -1 : (int8_t)st[i].xCoreID;
+#else
+        t->core = -1;
+#endif
+        t->stack_hwm = st[i].usStackHighWaterMark;
+        t->pct       = 0;
+        for (int p = 0; p < prev_n; p++) {
+            if (prev[p].hdl != t->hdl) continue;
+            if (last_us && span > 0) {
+                uint32_t d = st[i].ulRunTimeCounter - prev[p].last_rt;
+                t->pct = (int)((int64_t)d * 100 / span);
+                if (t->pct > 100) t->pct = 100;
+            }
+            break;
+        }
+        t->last_rt = st[i].ulRunTimeCounter;
+    }
+    s_tstat_n = (int)n;
+
+    /* insertion sort, busiest first -- n is ~16 */
+    for (int i = 1; i < s_tstat_n; i++) {
+        task_stat_t k = s_tstat[i];
+        int j = i - 1;
+        while (j >= 0 && s_tstat[j].pct < k.pct) { s_tstat[j + 1] = s_tstat[j]; j--; }
+        s_tstat[j + 1] = k;
+    }
+
+    last_us = now;
+
+    s_heap_free = (uint32_t)esp_get_free_heap_size();
+    s_heap_min  = (uint32_t)esp_get_minimum_free_heap_size();
+    s_heap_big  = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
+}
+
+/* Right-hand panel, mode 2: who is actually eating each core.
+ * STACK is the unused-stack high-water margin, in bytes (ESP-IDF's
+ * usStackHighWaterMark is bytes, unlike upstream FreeRTOS's words). */
+static void render_tasks(char panel[RADAR_ROWS][RADAR_COLS + 1])
+{
+    for (int r = 0; r < RADAR_ROWS; r++) {
+        memset(panel[r], ' ', RADAR_COLS);
+        panel[r][RADAR_COLS] = '\0';
+    }
+    snprintf(panel[0], RADAR_COLS + 1, " %-11s %4s %4s %8s", "TASK", "CPU", "CORE", "STACK");
+
+    /* last 3 rows belong to the frame probe below */
+    for (int r = 1; r < RADAR_ROWS - 3 && r - 1 < s_tstat_n; r++) {
+        task_stat_t *t = &s_tstat[r - 1];
+        char core[4];
+        if (t->core < 0) snprintf(core, sizeof(core), "-");
+        else             snprintf(core, sizeof(core), "%d", t->core);
+        snprintf(panel[r], RADAR_COLS + 1, " %-11s %3d%% %4s %8lu",
+                 t->name, t->pct, core, (unsigned long)t->stack_hwm);
+    }
+
+    /* Declared here rather than included: esp_libusb.h carries its own,
+     * unrelated struct class_driver_t that clashes with this file's. */
+    extern uint64_t esp_libusb_stream_dropped(void);
+
+    snprintf(panel[RADAR_ROWS - 3], RADAR_COLS + 1, " FRAME %5luB  %2lu/s",
+             (unsigned long)s_pr_bytes, (unsigned long)s_pr_fps);
+    snprintf(panel[RADAR_ROWS - 2], RADAR_COLS + 1, " asm %3lums/s   out %3lums/s",
+             (unsigned long)s_pr_asm_ms, (unsigned long)s_pr_out_ms);
+    snprintf(panel[RADAR_ROWS - 1], RADAR_COLS + 1, " USB drop %llu",
+             (unsigned long long)esp_libusb_stream_dropped());
+
+    /* snprintf NUL-terminates early; repaint the tail as spaces so the panel
+     * stays a fixed-width block (the TUI never clears, it overwrites). */
+    for (int r = 0; r < RADAR_ROWS; r++) {
+        int len = (int)strlen(panel[r]);
+        for (int c = len; c < RADAR_COLS; c++) panel[r][c] = ' ';
+        panel[r][RADAR_COLS] = '\0';
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * TUI DRAW
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -777,6 +1067,14 @@ static void tui_draw(void)
     int64_t now = esp_timer_get_time();
     if ((now - s_last_draw) < (TUI_REFRESH_MS * 1000LL)) return;
     s_last_draw = now;
+
+    /* The frame goes straight to the UART, so anything another task left in
+     * stdout's buffer has to get out first or it lands mid-frame. */
+    fflush(stdout);
+
+    s_pf_bytes = s_pf_out_us = 0;
+
+    stats_sample(now);
     s_dirty     = false;
 
     if (now - s_rate_ts >= 1000000LL) {
@@ -805,17 +1103,17 @@ static void tui_draw(void)
     char uptime[12];
     fmt_uptime(uptime, sizeof(uptime));
 
-    printf("\033[H");
+    fb_printf("\033[H");
 
     /* ┌─────────────────────────────────────────────────┐ */
-    printf(PH_GRID TL); hline(TERM_W); printf(TR EL "\n" RESET);
+    fb_printf(PH_GRID TL); hline(TERM_W); fb_printf(TR EL "\n" RESET);
 
     /* header — single full-width row */
     row_begin();
     {
         int n = (int)strlen("  ATC TERMINAL  //  ESP32-P4 ADS-B RECEIVER"
                             "  //  1090.000 MHz  //  2 MSPS");
-        printf(PH_HI BOLD "  ATC TERMINAL" RESET
+        fb_printf(PH_HI BOLD "  ATC TERMINAL" RESET
                PH_GRID "  //  " RESET PH_SCAN "ESP32-P4 ADS-B RECEIVER" RESET
                PH_GRID "  //  " RESET PH_HI "1090.000 MHz" RESET
                PH_GRID "  //  " RESET PH_MID "2 MSPS" RESET);
@@ -829,25 +1127,43 @@ static void tui_draw(void)
     {
         char vol_str[8];
         snprintf(vol_str, sizeof(vol_str), "%3d%%", s_muted ? 0 : s_volume);
+        char cpu0[12], cpu1[12];   /* %3d of an int can still be 11 chars */
+        if (s_cpu_busy[0] < 0) { strcpy(cpu0, " --"); strcpy(cpu1, " --"); }
+        else {
+            snprintf(cpu0, sizeof(cpu0), "%3d", s_cpu_busy[0]);
+            snprintf(cpu1, sizeof(cpu1), "%3d", s_cpu_busy[1]);
+        }
         /* compute visible width by snprintf to scratch buffer */
         char scratch[256];
         int n = snprintf(scratch, sizeof(scratch),
             "  UP %-9s  ACFT %-3d  MSG/S %-5d  TOTAL %-8d"
-            "  DEC %5.1f%%  ERR %5.1f%%  FIX %5.1f%%  VOL %s",
+            "  DEC %5.1f%%  ERR %5.1f%%  FIX %5.1f%%  VOL %s"
+            "  CPU0 %s%%  CPU1 %s%%  HEAP %3luK/%3luK",
             uptime, ac, s_msg_rate, s_msg_count,
-            s_decode_smooth, s_crc_smooth, s_fix_smooth, vol_str);
+            s_decode_smooth, s_crc_smooth, s_fix_smooth, vol_str,
+            cpu0, cpu1,
+            (unsigned long)(s_heap_free / 1024), (unsigned long)(s_heap_min / 1024));
         if (n > TERM_W) n = TERM_W;
-        printf(PH_DIM "  UP " RESET PH_HI "%-9s" RESET
+        fb_printf(PH_DIM "  UP " RESET PH_HI "%-9s" RESET
                PH_DIM "  ACFT " RESET PH_HI BOLD "%-3d" RESET
                PH_DIM "  MSG/S " RESET PH_SCAN "%-5d" RESET
                PH_DIM "  TOTAL " RESET PH_MID "%-8d" RESET
                PH_DIM "  DEC " RESET PH_HI "%5.1f%%" RESET
                PH_DIM "  ERR " RESET AC_AMBER "%5.1f%%" RESET
                PH_DIM "  FIX " RESET PH_MID "%5.1f%%" RESET
-               PH_DIM "  VOL " RESET "%s%s" RESET,
+               PH_DIM "  VOL " RESET "%s%s" RESET
+               PH_DIM "  CPU0 " RESET "%s%s%%" RESET
+               PH_DIM "  CPU1 " RESET "%s%s%%" RESET
+               PH_DIM "  HEAP " RESET PH_MID "%3luK" RESET
+               PH_DIM "/" RESET "%s%3luK" RESET,
                uptime, ac, s_msg_rate, s_msg_count,
                s_decode_smooth, s_crc_smooth, s_fix_smooth,
-               s_muted ? AC_RED : PH_HI, vol_str);
+               s_muted ? AC_RED : PH_HI, vol_str,
+               s_cpu_busy[0] > 80 ? AC_AMBER : PH_HI, cpu0,
+               s_cpu_busy[1] > 80 ? AC_AMBER : PH_HI, cpu1,
+               (unsigned long)(s_heap_free / 1024),
+               s_heap_big < 32768 ? AC_AMBER : PH_DIM,
+               (unsigned long)(s_heap_min / 1024));
         sp(TERM_W - n);
     }
     row_end();
@@ -859,11 +1175,11 @@ static void tui_draw(void)
         int bar_w = (TERM_W - 18) / 2;
         if (bar_w < 10) bar_w = 10;
         int n = 10 + bar_w + 7 + bar_w + 1;
-        printf(PH_DIM "  DECODE [" RESET);
+        fb_printf(PH_DIM "  DECODE [" RESET);
         print_bar(PH_HI, s_decode_smooth, 100.0f, bar_w);
-        printf(PH_DIM "] ERR [" RESET);
+        fb_printf(PH_DIM "] ERR [" RESET);
         print_bar(AC_AMBER, s_crc_smooth, 100.0f, bar_w);
-        printf(PH_DIM "]" RESET);
+        fb_printf(PH_DIM "]" RESET);
         sp(TERM_W - n);
     }
     row_end();
@@ -879,23 +1195,23 @@ static void tui_draw(void)
         int n = snprintf(hdr, sizeof(hdr),
             "  %-8s  %-9s  %8s  %7s  %-5s  %9s  %9s  %5s  %4s ",
             "ICAO","CALLSIGN","ALT ft","SPD kt","HDG","LAT","LON","V/S","MSGS");
-        printf(PH_DIM "%s" RESET, hdr);
+        fb_printf(PH_DIM "%s" RESET, hdr);
         sp(LEFT_W - n);
         /* inner border */
-        printf(PH_GRID VL RESET);
+        fb_printf(PH_GRID VL RESET);
         /* right: panel title */
-        const char *title = s_panel_mode == 0 ? " RADAR  [R]" : " WFALL  [R]";
-        printf(PH_DIM " %-*s" RESET, RADAR_COLS - 1, title);
+        const char *title = s_panel_mode == 0 ? " RADAR  [R]"
+                          : s_panel_mode == 1 ? " WFALL  [R]" : " TASKS  [R]";
+        fb_printf(PH_DIM " %-*s" RESET, RADAR_COLS - 1, title);
     }
     row_end();
     sep_split();
 
     /* render panel */
     char panel[RADAR_ROWS][RADAR_COLS + 1];
-    if (s_panel_mode == 0)
-        render_radar(panel);
-    else
-        render_waterfall(panel);
+    if (s_panel_mode == 0)      render_radar(panel);
+    else if (s_panel_mode == 1) render_waterfall(panel);
+    else                        render_tasks(panel);
 
     /* aircraft rows + panel */
     int ac_idx = 0;
@@ -934,7 +1250,7 @@ static void tui_draw(void)
             int vis = 2+8+2+9+2+8+2+7+2+(int)strlen(dirs[didx])+1+3
                       +2+9+2+9+2+(int)strlen(vs_plain)+2+4+1;
 
-            printf("  " AC_CYAN "%-8lX" RESET
+            fb_printf("  " AC_CYAN "%-8lX" RESET
                    "  " PH_HI   "%-9s" RESET
                    "  " "%s%8d" RESET
                    "  " PH_MID  "%7d" RESET
@@ -952,26 +1268,29 @@ static void tui_draw(void)
                    a->msg_count);
             sp(LEFT_W - vis);
         } else {
-            printf(PH_DIM "  ---" RESET);
+            fb_printf(PH_DIM "  ---" RESET);
             sp(LEFT_W - 5);
         }
 
         /* inner border + panel line */
-        printf(PH_GRID VL RESET);
+        fb_printf(PH_GRID VL RESET);
         if (row < RADAR_ROWS) {
             if (s_panel_mode == 0) {
                 /* radar: colour each char individually */
                 for (int c = 0; c < RADAR_COLS; c++) {
                     char ch = panel[row][c];
-                    if      (ch == '*')                                        printf(PH_HI BOLD "%c" RESET, ch);
-                    else if (ch == '/')                                        printf(PH_SCAN "%c" RESET, ch);
-                    else if (ch == ',')                                        printf(PH_DIM "%c" RESET, ch);
-                    else if (ch=='N'||ch=='S'||ch=='E'||ch=='W'||ch=='+'||ch=='|') printf(PH_MID "%c" RESET, ch);
-                    else if (ch == ':')                                        printf(PH_GRID "%c" RESET, ch);
-                    else if (ch == '-' || ch == '.')                           printf(PH_DIM "%c" RESET, ch);
-                    else if (ch != ' ')                                        printf(PH_MID "%c" RESET, ch);
-                    else putchar(' ');
+                    if      (ch == '*')                                        fb_printf(PH_HI BOLD "%c" RESET, ch);
+                    else if (ch == '/')                                        fb_printf(PH_SCAN "%c" RESET, ch);
+                    else if (ch == ',')                                        fb_printf(PH_DIM "%c" RESET, ch);
+                    else if (ch=='N'||ch=='S'||ch=='E'||ch=='W'||ch=='+'||ch=='|') fb_printf(PH_MID "%c" RESET, ch);
+                    else if (ch == ':')                                        fb_printf(PH_GRID "%c" RESET, ch);
+                    else if (ch == '-' || ch == '.')                           fb_printf(PH_DIM "%c" RESET, ch);
+                    else if (ch != ' ')                                        fb_printf(PH_MID "%c" RESET, ch);
+                    else fb_putc(' ');
                 }
+            } else if (s_panel_mode == 2) {
+                /* tasks: plain fixed-width text, one write for the whole row */
+                fb_printf("%s%s" RESET, row == 0 ? PH_DIM : PH_MID, panel[row]);
             } else {
                 /* waterfall: heat-map colour gradient green→amber→white */
                 int src = ((s_wf_row - 1 - row) % RADAR_ROWS + RADAR_ROWS) % RADAR_ROWS;
@@ -995,7 +1314,7 @@ static void tui_draw(void)
                     /* use block char for filled look */
                     char ch = panel[row][c];
                     if (ch == ' ' || ch == '.') ch = ' ';
-                    printf("\033[38;2;%d;%d;%dm%c" RESET, rr, gg, bb, ch);
+                    fb_printf("\033[38;2;%d;%d;%dm%c" RESET, rr, gg, bb, ch);
                 }
             }
         } else {
@@ -1008,38 +1327,39 @@ static void tui_draw(void)
 
     /* event log */
     row_begin();
-    printf(PH_DIM "  EVENT LOG"); sp(LEFT_W - 11);
-    printf(PH_GRID VL RESET); sp(RADAR_COLS);
+    fb_printf(PH_DIM "  EVENT LOG"); sp(LEFT_W - 11);
+    fb_printf(PH_GRID VL RESET); sp(RADAR_COLS);
     row_end();
 
     static const char *log_cols[] = { PH_DIM, PH_HI, AC_AMBER, AC_CYAN, AC_RED };
     for (int i = LOG_SHOW - 1; i >= 0; i--) {
         int idx = (s_log_head - 1 - i + LOG_LINES * 2) % LOG_LINES;
         row_begin();
-        printf("  ");
+        fb_printf("  ");
         if (s_log[idx].text[0]) {
             int tlen = (int)strnlen(s_log[idx].text, sizeof(s_log[0].text));
-            printf("%s%s" RESET, log_cols[s_log[idx].color], s_log[idx].text);
+            fb_printf("%s%s" RESET, log_cols[s_log[idx].color], s_log[idx].text);
             sp(LEFT_W - 2 - tlen);
         } else {
-            printf(PH_DIM "~" RESET); sp(LEFT_W - 3);
+            fb_printf(PH_DIM "~" RESET); sp(LEFT_W - 3);
         }
         /* right side of log rows: blank panel column */
-        printf(PH_GRID VL RESET); sp(RADAR_COLS);
+        fb_printf(PH_GRID VL RESET); sp(RADAR_COLS);
         row_end();
     }
 
     /* └─────────────────────────────────────────────────┘ */
-    printf(PH_GRID BL); hline(LEFT_W); printf(T_UP); hline(RADAR_COLS);
-    printf(BR EL "\n" RESET);
-    printf(PH_DIM "  R828D  " PH_GRID "|" RESET
+    fb_printf(PH_GRID BL); hline(LEFT_W); fb_printf(T_UP); hline(RADAR_COLS);
+    fb_printf(BR EL "\n" RESET);
+    fb_printf(PH_DIM "  R828D  " PH_GRID "|" RESET
            PH_DIM "  RAFAEL MICRO  " PH_GRID "|" RESET
            PH_DIM "  ctrl+] EXIT  " PH_GRID "|" RESET
            PH_DIM "  [M]UTE  " PH_GRID "|" RESET
            PH_DIM "  [+/-] VOL  " PH_GRID "|" RESET
-           PH_DIM "  [R] RADAR/WFALL" EL "\n" RESET);
+           PH_DIM "  [R] RADAR/WFALL/TASKS" EL "\n" RESET);
 
-    fflush(stdout);
+    fb_flush();
+    probe_frame(now, (uint32_t)(esp_timer_get_time() - now));
 }
 
 
@@ -1225,9 +1545,10 @@ void adsb_rx_task(void *arg)
         if (uart_read_bytes(UART_NUM_0, &key, 1, 0) > 0) {
             switch (key) {
                 case 'r': case 'R':
-                    s_panel_mode = (s_panel_mode + 1) % 2;
+                    s_panel_mode = (s_panel_mode + 1) % 3;
                     tui_log(3, "PANEL    switched to %s",
-                            s_panel_mode == 0 ? "RADAR" : "WATERFALL");
+                            s_panel_mode == 0 ? "RADAR"
+                          : s_panel_mode == 1 ? "WATERFALL" : "TASKS");
                     s_dirty = true;
                     break;
                 case 'm': case 'M':
@@ -1341,7 +1662,9 @@ static void rtlsdr_setup_task(void *arg)
     /* dongle found — audio already init'd in app_main, just play the sound */
     audio_play(AUDIO_EVT_NEW_CONTACT);
 
-    xTaskCreatePinnedToCore(adsb_rx_task, "adsb_rx", 16384, NULL, 5, NULL, 1);
+    /* 16K was inherited guesswork; measured peak use is ~1.9K (the TASKS panel's
+     * STACK column is the free margin, watch it if this file grows). */
+    xTaskCreatePinnedToCore(adsb_rx_task, "adsb_rx", 4096, NULL, 5, NULL, 1);
     vTaskDelete(NULL);
 }
 
