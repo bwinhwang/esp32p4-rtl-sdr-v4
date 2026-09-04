@@ -30,6 +30,7 @@
 #include "esp_task_wdt.h"
 #include "net_eth.h"
 #include "feed_avr.h"
+#include "feed_beast.h"
 #include "plane_cat.h"
 
 /* ── build config ────────────────────────────────────────────────────────── */
@@ -1084,9 +1085,9 @@ static void render_tasks(char panel[RADAR_ROWS][RADAR_COLS + 1])
              (unsigned long)s_pr_asm_ms, (unsigned long)s_pr_out_ms);
     snprintf(panel[RADAR_ROWS - 2], RADAR_COLS + 1, " USB drop %llu",
              (unsigned long long)esp_libusb_stream_dropped());
-    snprintf(panel[RADAR_ROWS - 1], RADAR_COLS + 1, " FEED %dc %lu tx %lu drop",
+    snprintf(panel[RADAR_ROWS - 1], RADAR_COLS + 1, " FEED avr%dc:%lu  bst%dc:%lu",
              feed_avr_clients(), (unsigned long)feed_avr_sent(),
-             (unsigned long)feed_avr_dropped());
+             feed_beast_clients(), (unsigned long)feed_beast_sent());
 
     /* snprintf NUL-terminates early; repaint the tail as spaces so the panel
      * stays a fixed-width block (the TUI never clears, it overwrites). */
@@ -1452,6 +1453,7 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
     /* Ahead of find_or_create(): the table caps at MAX_TRACKED, and a full
      * table must not quietly stop the feed. */
     feed_avr_push(mm->msg, mm->msgbits);
+    feed_beast_push(mm->msg, mm->msgbits, mm->timestamp_12mhz, mm->signal_level);
 
     aircraft_t *a = find_or_create(icao);
     if (!a) return;
@@ -1576,7 +1578,14 @@ void demodulate(uint8_t *source, int length)
     int mag_len = length / 2;
     mode_s_compute_magnitude_vector(source, s_mag, length);
     waterfall_push(s_mag, mag_len);     /* feed real IQ energy into wfall  */
-    mode_s_detect(&state, s_mag, mag_len, on_msg);
+
+    /* mag_len samples at the fixed 2 MSPS rate span mag_len/2 us; the clock
+     * read here lands at the *last* sample, so back it up by that span to get
+     * sample 0's timestamp -- mode_s_detect() adds each message's own sample
+     * offset on top. Receiver-local monotonic clock, not GPS/PPS-disciplined:
+     * fine for Beast-format feeder compatibility, not for real MLAT. */
+    uint64_t base_ts_us = (uint64_t)esp_timer_get_time() - (uint64_t)(mag_len / 2);
+    mode_s_detect(&state, s_mag, mag_len, base_ts_us, on_msg);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════

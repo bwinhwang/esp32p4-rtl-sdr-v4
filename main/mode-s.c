@@ -650,7 +650,7 @@ void apply_phase_correction(uint16_t *mag)
 // Detect a Mode S messages inside the magnitude buffer pointed by 'mag' and of
 // size 'maglen' bytes. Every detected Mode S message is convert it into a
 // stream of bits and passed to the function to display it.
-void mode_s_detect(mode_s_t *self, uint16_t *mag, uint32_t maglen, mode_s_callback_t cb)
+void mode_s_detect(mode_s_t *self, uint16_t *mag, uint32_t maglen, uint64_t base_ts_us, mode_s_callback_t cb)
 {
     unsigned char bits[MODE_S_LONG_MSG_BITS];
     unsigned char msg[MODE_S_LONG_MSG_BITS / 2];
@@ -684,6 +684,7 @@ void mode_s_detect(mode_s_t *self, uint16_t *mag, uint32_t maglen, mode_s_callba
     {
         int low, high, delta, i, errors;
         int good_message = 0;
+        uint32_t msg_start = j; // sample offset of the preamble's first impulse
 
         if (use_correction)
             goto good_preamble; // We already checked it.
@@ -824,6 +825,12 @@ void mode_s_detect(mode_s_t *self, uint16_t *mag, uint32_t maglen, mode_s_callba
 
             // Decode the received message
             mode_s_decode(self, &mm, msg);
+
+            // 2 MSPS => 6 ticks/sample at the 12 MHz Beast clock; delta is
+            // still the average bit-slicing magnitude from the noise filter
+            // above, cheap to repurpose as a coarse relative signal level.
+            mm.timestamp_12mhz = base_ts_us * 12ULL + (uint64_t)msg_start * 6ULL;
+            mm.signal_level    = delta > 0xFF00 ? 255 : (delta >> 8);
 
             // Skip this message if we are sure it's fine.
             if (mm.crcok)

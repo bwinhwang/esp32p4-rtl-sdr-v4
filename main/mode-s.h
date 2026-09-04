@@ -77,12 +77,26 @@ struct mode_s_msg
 
     // Fields used by multiple message types.
     int altitude, unit;
+
+    // Beast-format fields, filled in mode_s_detect() at detection time --
+    // dump1090's original struct carried neither. timestamp_12mhz is a
+    // receiver-local monotonic 12 MHz tick count derived from the caller's
+    // buffer timestamp plus this message's sample offset; it is NOT GPS/PPS
+    // disciplined, so it is fine for Beast-format feeder compatibility but
+    // not for real cross-receiver MLAT. signal_level is 0-255, scaled from
+    // the average bit-slicing delta already computed for the noise filter --
+    // relative only, not a calibrated dBm figure.
+    uint64_t timestamp_12mhz;
+    int      signal_level;
 };
 
 typedef void (*mode_s_callback_t)(mode_s_t *self, struct mode_s_msg *mm);
 
 void mode_s_init(mode_s_t *self);
 void mode_s_compute_magnitude_vector(unsigned char *data, uint16_t *mag, uint32_t size);
-void mode_s_detect(mode_s_t *self, uint16_t *mag, uint32_t maglen, mode_s_callback_t);
+// base_ts_us is esp_timer_get_time()-scale microseconds at mag[0]; every
+// detected message's timestamp_12mhz is derived from it plus that message's
+// sample offset (2 MSPS => 6 ticks/sample at 12MHz).
+void mode_s_detect(mode_s_t *self, uint16_t *mag, uint32_t maglen, uint64_t base_ts_us, mode_s_callback_t);
 void mode_s_decode(mode_s_t *self, struct mode_s_msg *mm, unsigned char *msg);
 void runme();
