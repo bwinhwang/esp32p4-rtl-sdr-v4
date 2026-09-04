@@ -29,6 +29,7 @@
 #include "mode-s.h"
 #include "esp_task_wdt.h"
 #include "net_eth.h"
+#include "feed_avr.h"
 #include "plane_cat.h"
 
 /* ── build config ────────────────────────────────────────────────────────── */
@@ -1063,8 +1064,8 @@ static void render_tasks(char panel[RADAR_ROWS][RADAR_COLS + 1])
     }
     snprintf(panel[0], RADAR_COLS + 1, " %-11s %4s %4s %8s", "TASK", "CPU", "CORE", "STACK");
 
-    /* last 3 rows belong to the frame probe below */
-    for (int r = 1; r < RADAR_ROWS - 3 && r - 1 < s_tstat_n; r++) {
+    /* last 4 rows belong to the probes below */
+    for (int r = 1; r < RADAR_ROWS - 4 && r - 1 < s_tstat_n; r++) {
         task_stat_t *t = &s_tstat[r - 1];
         char core[4];
         if (t->core < 0) snprintf(core, sizeof(core), "-");
@@ -1077,12 +1078,15 @@ static void render_tasks(char panel[RADAR_ROWS][RADAR_COLS + 1])
      * unrelated struct class_driver_t that clashes with this file's. */
     extern uint64_t esp_libusb_stream_dropped(void);
 
-    snprintf(panel[RADAR_ROWS - 3], RADAR_COLS + 1, " FRAME %5luB  %2lu/s",
+    snprintf(panel[RADAR_ROWS - 4], RADAR_COLS + 1, " FRAME %5luB  %2lu/s",
              (unsigned long)s_pr_bytes, (unsigned long)s_pr_fps);
-    snprintf(panel[RADAR_ROWS - 2], RADAR_COLS + 1, " asm %3lums/s   out %3lums/s",
+    snprintf(panel[RADAR_ROWS - 3], RADAR_COLS + 1, " asm %3lums/s   out %3lums/s",
              (unsigned long)s_pr_asm_ms, (unsigned long)s_pr_out_ms);
-    snprintf(panel[RADAR_ROWS - 1], RADAR_COLS + 1, " USB drop %llu",
+    snprintf(panel[RADAR_ROWS - 2], RADAR_COLS + 1, " USB drop %llu",
              (unsigned long long)esp_libusb_stream_dropped());
+    snprintf(panel[RADAR_ROWS - 1], RADAR_COLS + 1, " FEED %dc %lu tx %lu drop",
+             feed_avr_clients(), (unsigned long)feed_avr_sent(),
+             (unsigned long)feed_avr_dropped());
 
     /* snprintf NUL-terminates early; repaint the tail as spaces so the panel
      * stays a fixed-width block (the TUI never clears, it overwrites). */
@@ -1153,16 +1157,21 @@ static void tui_draw(void)
                         : est == NET_ETH_LINK   ? "dhcp..."
                         : est == NET_ETH_NOLINK ? "no link"
                                                 : "off";
+        char feed[8];
+        int  nc = feed_avr_clients();
+        snprintf(feed, sizeof(feed), "%d", nc);
         int n = (int)strlen("  ATC TERMINAL  //  ESP32-P4 ADS-B RECEIVER"
-                            "  //  1090.000 MHz  //  2 MSPS  //  ETH ")
-              + (int)strlen(net);
+                            "  //  1090.000 MHz  //  2 MSPS  //  ETH "
+                            "  //  FEED ")
+              + (int)strlen(net) + (int)strlen(feed);
         fb_printf(PH_HI BOLD "  ATC TERMINAL" RESET
                PH_GRID "  //  " RESET PH_SCAN "ESP32-P4 ADS-B RECEIVER" RESET
                PH_GRID "  //  " RESET PH_HI "1090.000 MHz" RESET
                PH_GRID "  //  " RESET PH_MID "2 MSPS" RESET
-               PH_GRID "  //  " RESET PH_DIM "ETH " RESET "%s%s" RESET,
+               PH_GRID "  //  " RESET PH_DIM "ETH " RESET "%s%s" RESET
+               PH_GRID "  //  " RESET PH_DIM "FEED " RESET "%s%s" RESET,
                est == NET_ETH_READY ? PH_HI : est == NET_ETH_LINK ? PH_MID : PH_DIM,
-               net);
+               net, nc ? PH_HI : PH_DIM, feed);
         sp(TERM_W - n);
     }
     row_end();
@@ -1439,6 +1448,10 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
     /* Unreachable while check_crc is set, but the ICAO of a bad-CRC frame is
      * itself garbage -- it must never reach find_or_create(). */
     if (!mm->crcok) return;
+
+    /* Ahead of find_or_create(): the table caps at MAX_TRACKED, and a full
+     * table must not quietly stop the feed. */
+    feed_avr_push(mm->msg, mm->msgbits);
 
     aircraft_t *a = find_or_create(icao);
     if (!a) return;

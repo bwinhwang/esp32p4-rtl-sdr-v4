@@ -12,6 +12,7 @@
 #include "usb/usb_host.h"
 #include "driver/gpio.h"
 #include "net_eth.h"
+#include "feed_avr.h"
 
 #define HOST_LIB_TASK_PRIORITY  2
 #define CLASS_TASK_PRIORITY     3
@@ -100,6 +101,7 @@ void app_main(void)
     /* ── 1.5. Ethernet ── non-fatal: the receiver is fully usable with no
      * cable in, and autoneg + DHCP finish long after this returns. */
     net_eth_start();
+    feed_avr_start();
 
     /* WIFI6-DEV-KIT's Host-port VBUS is switched by an always-on load
      * switch (hardwired EN), unlike the Nano board which needed a GPIO
