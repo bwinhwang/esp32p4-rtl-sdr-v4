@@ -12,8 +12,13 @@
 #include "esp_eth_phy_ip101.h"
 #include "esp_event.h"
 #include "esp_netif.h"
+#include "mdns.h"
 #include "esp_libusb.h"   /* tui_log() */
 #include "net_eth.h"
+
+/* Lets readsb's net-connector (and anything else on the LAN) address the
+ * board as "esp32p4-adsb.local" instead of a DHCP lease that can move. */
+#define MDNS_HOSTNAME  "esp32p4-adsb"
 
 /* The only pin ETH_ESP32_EMAC_DEFAULT_CONFIG() does not already cover: the
  * PHY's active-low reset (U2 pin 32). Its P4 defaults -- MDC 31 / MDIO 52,
@@ -89,6 +94,16 @@ esp_err_t net_eth_start(void)
     /* Creates the sys_evt task (prio 20, no affinity). It is above
      * adsb_rx_task, but it only ever runs on a link/DHCP transition. */
     ESP_RETURN_ON_ERROR(esp_event_loop_create_default(), TAG, "event loop failed");
+
+    /* Non-fatal like the rest of this function: mDNS is a convenience for
+     * naming the board, not a requirement for the AVR feed to work. */
+    esp_err_t mdns_err = mdns_init();
+    if (mdns_err == ESP_OK) {
+        mdns_hostname_set(MDNS_HOSTNAME);
+        mdns_instance_name_set("ESP32-P4 ADS-B Receiver");
+    } else {
+        ESP_LOGW(TAG, "mdns_init failed: %s", esp_err_to_name(mdns_err));
+    }
 
     esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_ETH();
     esp_netif_t       *netif     = esp_netif_new(&netif_cfg);
