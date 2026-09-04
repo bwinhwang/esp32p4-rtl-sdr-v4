@@ -31,7 +31,13 @@ typedef struct
     bool is_success;
     int bytes_transferred;
     usb_transfer_t *transfer;
-    SemaphoreHandle_t done_sem;  // ADD THIS
+    SemaphoreHandle_t done_sem;
+    // transfer/response_buf/is_success/bytes_transferred are a single shared
+    // slot, so a control transfer is not re-entrant. usb_recover_task's
+    // rtlsdr_reset_interface() can land on top of a tuner register access from
+    // rtlsdr_setup_task or a TUI-driven retune -- both would then read each
+    // other's reply.
+    SemaphoreHandle_t ctrl_mux;
 } class_adsb_dev;
 
 /* Defined in class_driver.c. The TUI repaints via cursor addressing with no

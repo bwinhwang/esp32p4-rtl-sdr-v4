@@ -17,6 +17,7 @@ void init_adsb_dev()
     adsbdev->is_adsb = true;
     adsbdev->response_buf = calloc(256, sizeof(uint8_t));
     adsbdev->done_sem = xSemaphoreCreateBinary();
+    adsbdev->ctrl_mux = xSemaphoreCreateMutex();
 
     esp_err_t r = usb_host_transfer_alloc(256, 0, &adsbdev->transfer);
     if (r != ESP_OK) {
@@ -430,10 +431,8 @@ int esp_libusb_stream_slots(void)
     return n;
 }
 
-int esp_libusb_control_transfer(class_driver_t *driver_obj, uint8_t bm_req_type, uint8_t b_request, uint16_t wValue, uint16_t wIndex, unsigned char *data, uint16_t wLength, unsigned int timeout)
+static int ctrl_transfer_locked(class_driver_t *driver_obj, uint8_t bm_req_type, uint8_t b_request, uint16_t wValue, uint16_t wIndex, unsigned char *data, uint16_t wLength, unsigned int timeout)
 {
-    if (!adsbdev || !adsbdev->transfer) return -1;
-
     size_t sizePacket = sizeof(usb_setup_packet_t) + wLength;
 
     USB_SETUP_PACKET_INIT_CONTROL((usb_setup_packet_t *)adsbdev->transfer->data_buffer,
@@ -478,6 +477,22 @@ int esp_libusb_control_transfer(class_driver_t *driver_obj, uint8_t bm_req_type,
     }
 
     return adsbdev->bytes_transferred;
+}
+
+int esp_libusb_control_transfer(class_driver_t *driver_obj, uint8_t bm_req_type, uint8_t b_request, uint16_t wValue, uint16_t wIndex, unsigned char *data, uint16_t wLength, unsigned int timeout)
+{
+    if (!adsbdev || !adsbdev->transfer || !adsbdev->ctrl_mux) return -1;
+
+    /* Held across submit *and* the done_sem wait: the shared slot is only free
+     * once the reply has been copied out. */
+    if (xSemaphoreTake(adsbdev->ctrl_mux, pdMS_TO_TICKS(timeout + 1000)) != pdTRUE) {
+        tui_log(4, "USB      ctrl xfer busy");
+        return -1;
+    }
+    int r = ctrl_transfer_locked(driver_obj, bm_req_type, b_request,
+                                 wValue, wIndex, data, wLength, timeout);
+    xSemaphoreGive(adsbdev->ctrl_mux);
+    return r;
 }
 
 void esp_libusb_get_string_descriptor_ascii(const usb_str_desc_t *str_desc, char *str)
