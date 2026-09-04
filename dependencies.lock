@@ -1,14 +1,14 @@
 dependencies:
-  espressif/es8311:
-    component_hash: eacbe7cb7f6993eb0f439121a56663cdfbf95925e7ddf5d2ed5aa640bed476fd
+  espressif/esp_codec_dev:
+    component_hash: 4779f31a3ba3f9b38aee1afe6ccb9ba8f6108dc3a6e77d39d7d714e9a215371b
     dependencies:
     - name: idf
       require: private
-      version: '>=4.4'
+      version: '>=4.0'
     source:
       registry_url: https://components.espressif.com/
       type: service
-    version: 1.0.0
+    version: 1.6.2
   espressif/usb:
     component_hash: 6c2cff118141dbbca181d0d27d71801fdddfc78f7ac03ae43f6e5a8cbd89cb99
     dependencies:
@@ -31,9 +31,9 @@ dependencies:
       type: idf
     version: 6.0.0
 direct_dependencies:
-- espressif/es8311
+- espressif/esp_codec_dev
 - espressif/usb
 - idf
-manifest_hash: 9e286cae2825f34d25da72dbba8499270c3d3b27dda504b4efe315adb2e6003b
+manifest_hash: 57395d209adcd1e7aa70b718127c08ba64240a1350c6d068a30652fccb3cb0e0
 target: esp32p4
 version: 3.0.0

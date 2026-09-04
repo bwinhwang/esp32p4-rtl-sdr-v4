@@ -19,11 +19,12 @@
 #include "esp_heap_caps.h"
 #include "usb/usb_host.h"
 #include "driver/i2s_std.h"
-#include "driver/i2c.h"
+#include "driver/i2c_master.h"
 #include "driver/uart.h"
 #include "driver/uart_vfs.h"
-#include "driver/gpio.h"
-#include "es8311.h"
+#include "esp_codec_dev.h"
+#include "esp_codec_dev_defaults.h"
+#include "es8311_codec.h"
 #include "rtl-sdr.h"
 #include "mode-s.h"
 #include "esp_task_wdt.h"
@@ -283,41 +284,28 @@ void audio_play(audio_evt_t evt)
 
 esp_err_t audio_init(void)
 {
-    const i2c_config_t i2c_cfg = {
-        .sda_io_num    = I2C_SDA_PIN,
-        .scl_io_num    = I2C_SCL_PIN,
-        .mode          = I2C_MODE_MASTER,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = 100000,
+    const i2c_master_bus_config_t bus_cfg = {
+        .i2c_port          = I2C_NUM_0,
+        .sda_io_num        = I2C_SDA_PIN,
+        .scl_io_num        = I2C_SCL_PIN,
+        .clk_source        = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
     };
-    i2c_param_config(I2C_NUM_0, &i2c_cfg);
-    i2c_driver_install(I2C_NUM_0, I2C_MODE_MASTER, 0, 0, 0);
-
-    es8311_handle_t es = es8311_create(I2C_NUM_0, 0x18);
-    if (!es) {
-        ESP_LOGW(TAG, "ES8311 not found — audio disabled");
+    i2c_master_bus_handle_t i2c_bus;
+    if (i2c_new_master_bus(&bus_cfg, &i2c_bus) != ESP_OK) {
+        ESP_LOGW(TAG, "I2C bus init failed — audio disabled");
         return ESP_FAIL;
     }
 
-    const es8311_clock_config_t clk = {
-        .mclk_inverted      = false,
-        .sclk_inverted      = false,
-        .mclk_from_mclk_pin = true,
-        .mclk_frequency     = AUDIO_RATE_HZ * MCLK_MULTIPLE,
-        .sample_frequency   = AUDIO_RATE_HZ,
-    };
-    es8311_init(es, &clk, ES8311_RESOLUTION_16, ES8311_RESOLUTION_16);
-    es8311_sample_frequency_config(es, AUDIO_RATE_HZ * MCLK_MULTIPLE,
-                                   AUDIO_RATE_HZ);
-    es8311_voice_volume_set(es, s_volume, NULL);
-    es8311_microphone_config(es, false);
-
+    /* Channel gets its pin map here but is deliberately left disabled:
+     * esp_codec_dev_open() below reconfigures the clock for mclk_multiple and
+     * does the enable itself. Enabling twice fails. */
     i2s_chan_config_t chan_cfg =
         I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     chan_cfg.auto_clear = true;
-    i2s_chan_handle_t rx_tmp;
-    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &s_i2s_tx, &rx_tmp));
+    i2s_chan_handle_t tx, rx_tmp;
+    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx, &rx_tmp));
 
     i2s_std_config_t std_cfg = {
         .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_RATE_HZ),
@@ -331,13 +319,53 @@ esp_err_t audio_init(void)
         },
     };
     std_cfg.clk_cfg.mclk_multiple = MCLK_MULTIPLE;
-    ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_i2s_tx, &std_cfg));
-    ESP_ERROR_CHECK(i2s_channel_enable(s_i2s_tx));
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx, &std_cfg));
 
-    gpio_config_t pa = { .pin_bit_mask = (1ULL << PA_EN_PIN),
-                         .mode = GPIO_MODE_OUTPUT };
-    gpio_config(&pa);
-    gpio_set_level(PA_EN_PIN, 1);
+    audio_codec_i2c_cfg_t i2c_cfg = {
+        .port           = I2C_NUM_0,
+        .addr           = ES8311_CODEC_DEFAULT_ADDR,  /* 8-bit form, halved by the driver */
+        .bus_handle     = i2c_bus,
+        .clock_speed_hz = 100000,
+    };
+    audio_codec_i2s_cfg_t i2s_cfg = { .port = I2S_NUM_0, .tx_handle = tx };
+    const audio_codec_ctrl_if_t *ctrl_if = audio_codec_new_i2c_ctrl(&i2c_cfg);
+    const audio_codec_data_if_t *data_if = audio_codec_new_i2s_data(&i2s_cfg);
+    if (!ctrl_if || !data_if) {
+        ESP_LOGW(TAG, "Codec interfaces unavailable — audio disabled");
+        return ESP_FAIL;
+    }
+
+    es8311_codec_cfg_t es_cfg = {
+        .ctrl_if    = ctrl_if,
+        .gpio_if    = audio_codec_new_gpio(),
+        .codec_mode = ESP_CODEC_DEV_WORK_MODE_DAC,
+        .pa_pin     = PA_EN_PIN,      /* PA now follows codec open/close */
+        .use_mclk   = true,
+        .mclk_div   = MCLK_MULTIPLE,  /* default is 256; the I2S side runs 384 */
+    };
+    const audio_codec_if_t *codec_if = es8311_codec_new(&es_cfg);
+    esp_codec_dev_cfg_t dev_cfg = {
+        .dev_type = ESP_CODEC_DEV_TYPE_OUT,
+        .codec_if = codec_if,
+        .data_if  = data_if,
+    };
+    esp_codec_dev_handle_t codec = codec_if ? esp_codec_dev_new(&dev_cfg) : NULL;
+    esp_codec_dev_sample_info_t fs = {
+        .bits_per_sample = 16,
+        .channel         = 2,
+        .sample_rate     = AUDIO_RATE_HZ,
+        .mclk_multiple   = MCLK_MULTIPLE,
+    };
+    if (!codec || esp_codec_dev_open(codec, &fs) != ESP_CODEC_DEV_OK) {
+        ESP_LOGW(TAG, "ES8311 not found — audio disabled");
+        return ESP_FAIL;
+    }
+    esp_codec_dev_set_out_vol(codec, s_volume);
+
+    /* Tones keep going out through the channel directly rather than
+     * esp_codec_dev_write(): that path waits 1 s on a full DMA queue, and a
+     * beep is worth dropping, not worth blocking for. */
+    s_i2s_tx = tx;
 
     s_audio_q = xQueueCreate(8, sizeof(audio_evt_t));
     /* core0, not core1: at prio 6 this sits above adsb_rx_task's 5, so on core1
