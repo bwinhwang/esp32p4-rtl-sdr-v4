@@ -29,6 +29,7 @@
 #include "mode-s.h"
 #include "esp_task_wdt.h"
 #include "net_eth.h"
+#include "plane_cat.h"
 
 /* ── build config ────────────────────────────────────────────────────────── */
 #define CLIENT_NUM_EVENT_MSG  5
@@ -116,6 +117,7 @@ typedef struct {
     int64_t     last_seen_us;
     cpr_frame_t cpr_even;
     cpr_frame_t cpr_odd;
+    plane_cat_t category;
     bool        active;
 } aircraft_t;
 
@@ -539,7 +541,11 @@ static aircraft_t *find_or_create(uint32_t icao)
         memset(empty, 0, sizeof(aircraft_t));
         empty->icao   = icao;
         empty->active = true;
-        tui_log(1, "CONTACT  %06lX  first squawk", (unsigned long)icao);
+        /* No callsign this early, but an address inside a military block is
+         * already enough to classify -- and that is the one worth flagging. */
+        empty->category = plane_classify(icao, NULL);
+        tui_log(1, "CONTACT  %06lX  first squawk  %s", (unsigned long)icao,
+                plane_cat_label(empty->category));
         audio_play(AUDIO_EVT_NEW_CONTACT);
     }
     return empty;
@@ -1233,8 +1239,8 @@ static void tui_draw(void)
         /* left: column labels */
         char hdr[256];
         int n = snprintf(hdr, sizeof(hdr),
-            "  %-8s  %-9s  %8s  %7s  %-5s  %9s  %9s  %5s  %4s ",
-            "ICAO","CALLSIGN","ALT ft","SPD kt","HDG","LAT","LON","V/S","MSGS");
+            "  %-8s  %-9s  %-3s  %8s  %7s  %-5s  %9s  %9s  %5s  %4s ",
+            "ICAO","CALLSIGN","CAT","ALT ft","SPD kt","HDG","LAT","LON","V/S","MSGS");
         fb_printf(PH_DIM "%s" RESET, hdr);
         sp(LEFT_W - n);
         /* inner border */
@@ -1286,12 +1292,19 @@ static void tui_draw(void)
             int didx = (int)(((float)a->heading + 22.5f) / 45.0f) % 8;
             const char *cs = a->callsign[0] ? a->callsign : "--------";
 
+            const char *cat = plane_cat_label(a->category);
+            const char *cat_col = a->category == PLANE_MILITARY   ? AC_RED
+                                : a->category == PLANE_COMMERCIAL ? PH_MID
+                                : a->category == PLANE_GA         ? AC_CYAN
+                                                                  : PH_DIM;
+
             /* measure visible width of left panel content */
-            int vis = 2+8+2+9+2+8+2+7+2+(int)strlen(dirs[didx])+1+3
+            int vis = 2+8+2+9+2+3+2+8+2+7+2+(int)strlen(dirs[didx])+1+3
                       +2+9+2+9+2+(int)strlen(vs_plain)+2+4+1;
 
             fb_printf("  " AC_CYAN "%-8lX" RESET
                    "  " PH_HI   "%-9s" RESET
+                   "  " "%s%-3s" RESET
                    "  " "%s%8d" RESET
                    "  " PH_MID  "%7d" RESET
                    "  " PH_MID  "%s" RESET PH_DIM "-" RESET PH_HI "%03d" RESET
@@ -1300,6 +1313,7 @@ static void tui_draw(void)
                    "  " "%s"
                    "  " PH_DIM  "%4d" RESET " ",
                    (unsigned long)a->icao, cs,
+                   cat_col, cat,
                    alt_col, a->altitude,
                    a->velocity,
                    dirs[didx], a->heading,
@@ -1436,7 +1450,9 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
         a->callsign[8] = '\0';
         for (int i = 7; i >= 0 && a->callsign[i] == ' '; i--)
             a->callsign[i] = '\0';
-        tui_log(2, "IDENT    %06lX  %s", (unsigned long)icao, a->callsign);
+        a->category = plane_classify(icao, a->callsign);
+        tui_log(2, "IDENT    %06lX  %s  %s", (unsigned long)icao, a->callsign,
+                plane_cat_label(a->category));
     }
 
     if (mm->altitude)         a->altitude  = mm->altitude;
