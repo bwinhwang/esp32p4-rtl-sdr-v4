@@ -469,7 +469,13 @@ static int ctrl_transfer_locked(class_driver_t *driver_obj, uint8_t bm_req_type,
     adsbdev->transfer->num_bytes = sizePacket;
     adsbdev->transfer->device_handle = driver_obj->dev_hdl;
     adsbdev->transfer->timeout_ms = timeout;
-    adsbdev->transfer->context = (void *)&driver_obj;
+    /* The transfer's context is the driver object itself, not the address of
+     * this function's parameter -- that was a stack address that dangled the
+     * moment ctrl_transfer_locked() returned. It was harmless only because
+     * transfer_read_cb() never reads context; anything that starts reading it
+     * needs a pointer that outlives the transfer, which driver_obj (owned by
+     * rtlsdr_dev_t) is. */
+    adsbdev->transfer->context = driver_obj;
     adsbdev->transfer->callback = transfer_read_cb;
 
     if (bm_req_type == CTRL_OUT && data && wLength > 0) {
