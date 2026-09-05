@@ -70,3 +70,35 @@ CONFIG_ESP_HOSTED_SDIO_RESET_ACTIVE_HIGH=y
 # streaming host against a packet slave drops reads silently at sdio_drv.c:959
 # and looks exactly like an RPC timeout. See ../c6-notes.md.
 CONFIG_ESP_HOSTED_SDIO_OPTIMIZATION_RX_NONE=y
+
+# ── PSRAM ───────────────────────────────────────────────────────────────────
+# The part is an ESP32-P4NRW32X: 32 MB of PSRAM inside the package, so this is
+# purely a Kconfig question, never a board question. What forced it: internal
+# RAM free had fallen to ~46K once WiFi, the HTTP config server and the three
+# feeds were all up.
+# HEX (16-line) at 200 MHz is what this package is specified for. Both are
+# already esp32p4's Kconfig defaults, spelled out so a component default change
+# cannot silently move them. Rev 3.x silicon also offers 250M; left alone,
+# 200M is the speed proven on this part.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_HEX=y
+CONFIG_SPIRAM_SPEED_200M=y
+
+# Puts PSRAM behind ordinary malloc(), not just heap_caps_malloc(SPIRAM).
+# Note what this deliberately does NOT change, both left at their defaults:
+# SPIRAM_MALLOC_ALWAYSINTERNAL (16K) keeps every small allocation in internal
+# RAM, and SPIRAM_MALLOC_RESERVE_INTERNAL (32K) stays reserved for DMA/ISR
+# callers -- so no small struct silently lands on a bus that is unreachable
+# while the cache is disabled. esp_hosted's SDIO buffers are ~2K and therefore
+# stay internal, which is why enabling this does not disturb the C6 link.
+CONFIG_SPIRAM_USE_MALLOC=y
+
+# NOT enabled, on purpose:
+#   SPIRAM_TRY_ALLOCATE_WIFI_LWIP -- with esp_wifi_remote the WiFi buffers live
+#     on the C6; only lwIP's are local, and they are handed to the SDIO DMA.
+#     Available headroom if internal RAM ever gets tight again, but it is the
+#     kind of change that shows up as rare corruption, so it wants its own run.
+#   ESP_HOSTED_DFLT_TASK_FROM_SPIRAM -- task stacks in PSRAM are unreachable
+#     while the cache is disabled during a flash write (web_config writes NVS).
+#   ESP_HOSTED_MEMPOOL_PREFER_SPIRAM -- does not exist in esp_hosted 2.12.6,
+#     which is pinned to the slave firmware; it landed in 2.12.8.

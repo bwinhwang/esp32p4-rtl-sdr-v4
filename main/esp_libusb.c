@@ -6,6 +6,7 @@
 #include "freertos/queue.h"
 #include <string.h>
 #include <stdlib.h>
+#include "esp_heap_caps.h"
 
 static class_adsb_dev *adsbdev;
 
@@ -226,17 +227,33 @@ int esp_libusb_bulk_transfer(class_driver_t *driver_obj, unsigned char endpoint,
  * the ring with esp_libusb_stream_read(), decoupling demod-buffer assembly
  * from USB completion latency.
  *
- * This board (Waveshare ESP32-P4-WIFI6-DEV-KIT) has PSRAM pads on the
- * schematic (VDD_PSRAM_0/1) but CONFIG_SPIRAM is not enabled in this
- * project's sdkconfig, so the ring lives in internal RAM — sized down from
- * LakeShark's 256 KB/16-slot PSRAM version accordingly.
+ * The ring lives in PSRAM (the part is a P4NRW32X, 32 MB in package). It is
+ * safe there because it is touched only by the CPU: the USB stack DMAs into
+ * its own internal buffer and stream_push() memcpys from there, so the ring is
+ * never handed to a DMA engine and needs no esp_cache_msync() -- the P4 TRM
+ * guarantees coherence for pointer-only PSRAM access, including across the two
+ * cores, which matters here because the writer runs on core0 and the reader on
+ * core1. The one rule that follows: nothing that touches this buffer may run
+ * with the cache disabled, i.e. not from an ISR and not during a flash write.
+ * stream_push() is IRAM_ATTR but is *not* an ISR -- ESP-IDF runs transfer
+ * callbacks in whatever task called usb_host_client_handle_events().
+ *
+ * 128 KB was an internal-RAM budget, and at 2 MSPS x 2 bytes it is only 32 ms
+ * of slack. 1 MB is 256 ms, which is what buys margin against esp_hosted's
+ * SDIO/RPC tasks -- priority 23, no core affinity, not configurable (see
+ * CLAUDE.md) -- preempting adsb_rx_task mid-buffer. Keep it a power of two:
+ * stream_push()/stream_read() index it with %.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 #ifndef STREAM_XFER_NUM
 #define STREAM_XFER_NUM   8
 #endif
 #define STREAM_XFER_LEN   16384
+#if CONFIG_SPIRAM
+#define STREAM_RING_SIZE  (1024u * 1024u)
+#else
 #define STREAM_RING_SIZE  (128u * 1024u)
+#endif
 
 static uint8_t             *s_sring;
 static volatile uint32_t    s_shead, s_stail;
@@ -353,7 +370,18 @@ int esp_libusb_stream_start(class_driver_t *driver_obj, unsigned char endpoint)
     if (s_streaming) esp_libusb_stream_stop();
 
     if (!s_sring) {
+        /* Explicitly MALLOC_CAP_SPIRAM rather than relying on plain malloc()
+         * happening to land there: that only holds while the ring is bigger
+         * than CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL, which is a knob, not a
+         * guarantee. Falls back to internal RAM so a PSRAM-less build still
+         * runs -- at 1 MB that fallback will fail, which is why the size is
+         * conditional on CONFIG_SPIRAM too. */
+#if CONFIG_SPIRAM
+        s_sring = heap_caps_malloc(STREAM_RING_SIZE, MALLOC_CAP_SPIRAM);
+        if (!s_sring) s_sring = malloc(STREAM_RING_SIZE);
+#else
         s_sring = malloc(STREAM_RING_SIZE);
+#endif
         if (!s_sring) { tui_log(4, "USB      stream ring alloc failed"); return -1; }
     }
     if (!s_squeue) s_squeue = xQueueCreate(STREAM_XFER_NUM * 2, sizeof(int));

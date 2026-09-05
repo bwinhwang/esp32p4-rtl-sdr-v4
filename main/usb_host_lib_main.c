@@ -8,6 +8,10 @@
 #include "freertos/queue.h"
 #include "freertos/event_groups.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
+#if CONFIG_SPIRAM
+#include "esp_psram.h"
+#endif
 #include "esp_intr_alloc.h"
 #include "usb/usb_host.h"
 #include "driver/gpio.h"
@@ -96,6 +100,15 @@ static void usb_host_lib_task(void *arg)
 void app_main(void)
 {
     ESP_LOGI(TAG, "ESP32-P4 ADS-B Receiver starting");
+
+#if CONFIG_SPIRAM
+    /* esp_psram already logged the size before app_main, but that scrolls past
+     * the moment the TUI takes the console -- put it in the log panel too, so
+     * a running board can be asked whether PSRAM actually came up. */
+    ESP_LOGI(TAG, "PSRAM %uKB total, %uKB free",
+             (unsigned)(esp_psram_get_size() / 1024),
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
+#endif
 
     /* ── 1. Audio FIRST — boot beep proves codec is alive before USB ── */
     if (audio_init() == ESP_OK) {

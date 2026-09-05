@@ -1014,6 +1014,9 @@ typedef struct {
 
 static int         s_cpu_busy[2] = { -1, -1 };  /* -1 until first interval */
 static uint32_t    s_heap_free, s_heap_min, s_heap_big;
+#if CONFIG_SPIRAM
+static uint32_t    s_psram_free;
+#endif
 static task_stat_t s_tstat[CPU_STAT_MAX_TASKS];
 static int         s_tstat_n;
 
@@ -1100,9 +1103,17 @@ static void stats_sample(int64_t now)
 
     last_us = now;
 
-    s_heap_free = (uint32_t)esp_get_free_heap_size();
-    s_heap_min  = (uint32_t)esp_get_minimum_free_heap_size();
-    s_heap_big  = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
+    /* Explicitly MALLOC_CAP_INTERNAL, not esp_get_free_heap_size()/CAP_DEFAULT:
+     * once CONFIG_SPIRAM_USE_MALLOC is on, those fold 32 MB of PSRAM into the
+     * same figure and the internal-RAM number -- the one that actually runs
+     * out, and the one every earlier measurement in the notes refers to --
+     * vanishes behind it. This way HEAP means the same thing either way. */
+    s_heap_free = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    s_heap_min  = (uint32_t)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+    s_heap_big  = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+#if CONFIG_SPIRAM
+    s_psram_free = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+#endif
 }
 
 /* Right-hand panel, mode 2: who is actually eating each core.
@@ -1258,6 +1269,14 @@ static void tui_draw(void)
         char vol_str[8];
         snprintf(vol_str, sizeof(vol_str), "%3d%%", s_muted ? 0 : s_volume);
         char cpu0[12], cpu1[12];   /* %3d of an int can still be 11 chars */
+        /* Empty when PSRAM is off, so the row keeps its old width. With it on
+         * this is 11 chars against 14 of slack at TERM_W 154 -- see the column
+         * budget note in CLAUDE.md before adding a second field here. */
+        char psram[16] = "";
+#if CONFIG_SPIRAM
+        snprintf(psram, sizeof(psram), "  PSRAM %2luM",
+                 (unsigned long)(s_psram_free >> 20));
+#endif
         if (s_cpu_busy[0] < 0) { strcpy(cpu0, " --"); strcpy(cpu1, " --"); }
         else {
             snprintf(cpu0, sizeof(cpu0), "%3d", s_cpu_busy[0]);
@@ -1268,11 +1287,12 @@ static void tui_draw(void)
         int n = snprintf(scratch, sizeof(scratch),
             "  UP %-9s  ACFT %-3d  MSG/S %-5d  TOTAL %-8d"
             "  DEC %5.1f%%  ERR %5.1f%%  FIX %5.1f%%  VOL %s"
-            "  CPU0 %s%%  CPU1 %s%%  HEAP %3luK/%3luK",
+            "  CPU0 %s%%  CPU1 %s%%  HEAP %3luK/%3luK%s",
             uptime, ac, s_msg_rate, s_msg_count,
             s_decode_smooth, s_crc_smooth, s_fix_smooth, vol_str,
             cpu0, cpu1,
-            (unsigned long)(s_heap_free / 1024), (unsigned long)(s_heap_min / 1024));
+            (unsigned long)(s_heap_free / 1024), (unsigned long)(s_heap_min / 1024),
+            psram);
         if (n > TERM_W) n = TERM_W;
         fb_printf(PH_DIM "  UP " RESET PH_HI "%-9s" RESET
                PH_DIM "  ACFT " RESET PH_HI BOLD "%-3d" RESET
@@ -1285,7 +1305,8 @@ static void tui_draw(void)
                PH_DIM "  CPU0 " RESET "%s%s%%" RESET
                PH_DIM "  CPU1 " RESET "%s%s%%" RESET
                PH_DIM "  HEAP " RESET PH_MID "%3luK" RESET
-               PH_DIM "/" RESET "%s%3luK" RESET,
+               PH_DIM "/" RESET "%s%3luK" RESET
+               PH_DIM "%s" RESET,
                uptime, ac, s_msg_rate, s_msg_count,
                s_decode_smooth, s_crc_smooth, s_fix_smooth,
                s_muted ? AC_RED : PH_HI, vol_str,
@@ -1293,7 +1314,8 @@ static void tui_draw(void)
                s_cpu_busy[1] > 80 ? AC_AMBER : PH_HI, cpu1,
                (unsigned long)(s_heap_free / 1024),
                s_heap_big < 32768 ? AC_AMBER : PH_DIM,
-               (unsigned long)(s_heap_min / 1024));
+               (unsigned long)(s_heap_min / 1024),
+               psram);
         sp(TERM_W - n);
     }
     row_end();
