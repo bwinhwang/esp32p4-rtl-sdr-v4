@@ -31,3 +31,44 @@ menu "ADS-B Receiver"
             Longitude of the antenna. See ADSB_RX_LAT.
 
 endmenu
+
+menu "WiFi (ESP32-C6 co-processor)"
+
+    # The board runs permanently in APSTA: the SoftAP serves the in-car case
+    # (a phone talks straight to the board) while the STA side reconnects in
+    # the background for the fixed-at-home case. See net_wifi.c.
+
+    config ADSB_WIFI_AP_SSID
+        string "SoftAP SSID"
+        default "ADSB-P4"
+
+    config ADSB_WIFI_AP_PASS
+        string "SoftAP password (empty or <8 chars leaves the AP open)"
+        default ""
+        help
+            WPA2-PSK needs at least 8 characters; esp_wifi_set_config()
+            rejects a shorter one outright rather than weakening the key, so
+            anything shorter is treated as "no password wanted" and the AP
+            stays open. Fine on a bench, not on a roof.
+
+    config ADSB_WIFI_AP_CHANNEL
+        int "SoftAP channel"
+        range 1 13
+        default 1
+
+    config ADSB_WIFI_AP_MAX_CONN
+        int "SoftAP max associated stations"
+        range 1 10
+        default 4
+
+    # The upstream (STA) credentials are deliberately NOT Kconfig options.
+    # sdkconfig is tracked and this repo's remote is a public fork, so a
+    # password put here would be published. They live in NVS instead and are
+    # set from the config page at http://192.168.4.1/ -- see net_wifi.c.
+
+    config ADSB_WEB_PORT
+        int "Config page / HTTP API port"
+        range 1 65535
+        default 80
+
+endmenu

@@ -10,3 +10,10 @@ dependencies:
   # esp-eth-drivers; only esp_eth_phy_new_generic() is still in-tree.
   espressif/ip101: ^1.1
   espressif/mdns: ^1
+  # WiFi comes from the ESP32-C6 over SDIO. Pinned to the version the C6's
+  # slave firmware was built from -- host and co-processor must stay in
+  # lockstep (see ../c6-notes.md).
+  espressif/esp_hosted:
+    version: '==2.12.6'
+  espressif/esp_wifi_remote:
+    version: '>=1.3.1'

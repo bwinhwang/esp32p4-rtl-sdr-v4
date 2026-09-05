@@ -29,6 +29,7 @@
 #include "mode-s.h"
 #include "esp_task_wdt.h"
 #include "net_eth.h"
+#include "net_wifi.h"
 #include "feed_avr.h"
 #include "feed_beast.h"
 #include "feed_json.h"
@@ -1208,21 +1209,44 @@ static void tui_draw(void)
                         : est == NET_ETH_LINK   ? "dhcp..."
                         : est == NET_ETH_NOLINK ? "no link"
                                                 : "off";
+        /* WiFi shows both halves of the permanent APSTA at once: how many
+         * phones are on our own SoftAP, and the upstream lease when the STA
+         * side has one. Either can be the useful one depending on whether the
+         * board is in the car or at home. */
+        char wifi[24];
+        net_wifi_state_t wst = net_wifi_state();
+        int  wc  = net_wifi_ap_clients();
+        switch (wst) {
+        case NET_WIFI_STA: {
+            char sip[16];
+            net_wifi_sta_ip_str(sip, sizeof(sip));
+            snprintf(wifi, sizeof(wifi), "ap:%d %s", wc, sip);
+            break;
+        }
+        case NET_WIFI_AP:   snprintf(wifi, sizeof(wifi), "ap:%d", wc); break;
+        case NET_WIFI_INIT: snprintf(wifi, sizeof(wifi), "init");      break;
+        default:            snprintf(wifi, sizeof(wifi), "off");       break;
+        }
+
         char feed[8];
         int  nc = feed_avr_clients();
         snprintf(feed, sizeof(feed), "%d", nc);
         int n = (int)strlen("  ATC TERMINAL  //  ESP32-P4 ADS-B RECEIVER"
                             "  //  1090.000 MHz  //  2 MSPS  //  ETH "
-                            "  //  FEED ")
-              + (int)strlen(net) + (int)strlen(feed);
+                            "  //  WIFI   //  FEED ")
+              + (int)strlen(net) + (int)strlen(wifi) + (int)strlen(feed);
         fb_printf(PH_HI BOLD "  ATC TERMINAL" RESET
                PH_GRID "  //  " RESET PH_SCAN "ESP32-P4 ADS-B RECEIVER" RESET
                PH_GRID "  //  " RESET PH_HI "1090.000 MHz" RESET
                PH_GRID "  //  " RESET PH_MID "2 MSPS" RESET
                PH_GRID "  //  " RESET PH_DIM "ETH " RESET "%s%s" RESET
+               PH_GRID "  //  " RESET PH_DIM "WIFI " RESET "%s%s" RESET
                PH_GRID "  //  " RESET PH_DIM "FEED " RESET "%s%s" RESET,
                est == NET_ETH_READY ? PH_HI : est == NET_ETH_LINK ? PH_MID : PH_DIM,
-               net, nc ? PH_HI : PH_DIM, feed);
+               net,
+               (wst == NET_WIFI_STA || wc) ? PH_HI
+                                           : wst == NET_WIFI_AP ? PH_MID : PH_DIM,
+               wifi, nc ? PH_HI : PH_DIM, feed);
         sp(TERM_W - n);
     }
     row_end();

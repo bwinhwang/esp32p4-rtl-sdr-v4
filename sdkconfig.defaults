@@ -44,3 +44,29 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # esp_eth's emac_rx (prio 15) has the same problem and is handled in code
 # instead: ETH_MAC_FLAG_PIN_TO_CORE in net_eth.c pins it to the installing core.
 CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y
+
+# ── WiFi via the ESP32-C6 co-processor ──────────────────────────────────────
+# The P4 has no radio; esp_wifi_remote remotes the ordinary esp_wifi_* API to
+# the C6 over 4-bit SDIO. Pins are read off the schematic and happen to be
+# esp_hosted's stock P4 slot-1 defaults, but are spelled out so a component
+# default change cannot silently move them. The C6's CHIP_PU reaches P4 GPIO54
+# through 0R R78 and is active high.
+CONFIG_ESP_WIFI_REMOTE_ENABLED=y
+CONFIG_ESP_HOSTED_ENABLED=y
+CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE=y
+CONFIG_ESP_HOSTED_SDIO_SLOT_1=y
+CONFIG_ESP_HOSTED_SDIO_4_BIT_BUS=y
+CONFIG_ESP_HOSTED_SDIO_PIN_CMD=19
+CONFIG_ESP_HOSTED_SDIO_PIN_CLK=18
+CONFIG_ESP_HOSTED_SDIO_PIN_D0=14
+CONFIG_ESP_HOSTED_SDIO_PIN_D1=15
+CONFIG_ESP_HOSTED_SDIO_PIN_D2=16
+CONFIG_ESP_HOSTED_SDIO_PIN_D3=17
+CONFIG_ESP_HOSTED_SDIO_GPIO_RESET_SLAVE=54
+CONFIG_ESP_HOSTED_SDIO_RESET_ACTIVE_HIGH=y
+
+# PACKET MODE. The slave firmware flashed on the C6 (ESP-Hosted 2.12.6) was
+# built with CONFIG_ESP_SDIO_STREAMING_MODE=n, and the two ends must agree: a
+# streaming host against a packet slave drops reads silently at sdio_drv.c:959
+# and looks exactly like an RPC timeout. See ../c6-notes.md.
+CONFIG_ESP_HOSTED_SDIO_OPTIMIZATION_RX_NONE=y

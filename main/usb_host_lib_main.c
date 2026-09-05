@@ -12,6 +12,8 @@
 #include "usb/usb_host.h"
 #include "driver/gpio.h"
 #include "net_eth.h"
+#include "net_wifi.h"
+#include "web_config.h"
 #include "feed_avr.h"
 #include "feed_beast.h"
 #include "feed_json.h"
@@ -103,9 +105,20 @@ void app_main(void)
     /* ── 1.5. Ethernet ── non-fatal: the receiver is fully usable with no
      * cable in, and autoneg + DHCP finish long after this returns. */
     net_eth_start();
+
+    /* ── 1.6. WiFi on the C6 ── also non-fatal, and returns immediately: the
+     * SDIO probe and the co-processor's boot happen in net_wifi.c's own task
+     * so they do not delay USB enumeration below. */
+    net_wifi_start();
+
     feed_avr_start();
     feed_beast_start();
     feed_json_start();
+
+    /* Serves the upstream-WiFi form the STA side needs before it can join
+     * anything, so it must not depend on the STA side being up. It listens on
+     * every interface, which includes the SoftAP that is always on. */
+    web_config_start();
 
     /* WIFI6-DEV-KIT's Host-port VBUS is switched by an always-on load
      * switch (hardwired EN), unlike the Nano board which needed a GPIO
