@@ -18,6 +18,7 @@
 #include "net_eth.h"
 #include "net_wifi.h"
 #include "web_config.h"
+#include "shell.h"
 #include "feed_avr.h"
 #include "feed_beast.h"
 #include "feed_json.h"
@@ -132,6 +133,10 @@ void app_main(void)
      * anything, so it must not depend on the STA side being up. It listens on
      * every interface, which includes the SoftAP that is always on. */
     web_config_start();
+
+    /* Console REPL. Registers commands and starts its task; it stays dormant
+     * until ':' is pressed on the console, so it costs nothing until used. */
+    shell_init();
 
     /* WIFI6-DEV-KIT's Host-port VBUS is switched by an always-on load
      * switch (hardwired EN), unlike the Nano board which needed a GPIO

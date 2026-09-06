@@ -34,6 +34,8 @@
 #include "feed_beast.h"
 #include "feed_json.h"
 #include "plane_cat.h"
+#include "shell.h"
+#include "esp_console.h"
 
 /* ── build config ────────────────────────────────────────────────────────── */
 #define CLIENT_NUM_EVENT_MSG  5
@@ -1166,6 +1168,10 @@ static void render_tasks(char panel[RADAR_ROWS][RADAR_COLS + 1])
 
 static void tui_draw(void)
 {
+    /* The shell has the console: a repaint here would land on top of whatever
+     * the user is typing, and both write the same UART. */
+    if (shell_active()) return;
+
     int64_t now = esp_timer_get_time();
     if ((now - s_last_draw) < (TUI_REFRESH_MS * 1000LL)) return;
     s_last_draw = now;
@@ -1770,7 +1776,14 @@ void adsb_rx_task(void *arg)
         /* ── non-blocking keyread ── */
         uint8_t key = 0;
         if (uart_read_bytes(UART_NUM_0, &key, 1, 0) > 0) {
-            switch (key) {
+            /* This task is the demod hot path, so the shell only ever gets the
+             * byte queued here -- the command itself runs on core0. */
+            if (shell_active()) {
+                shell_feed(key);
+            } else switch (key) {
+                case ':':
+                    shell_enter();
+                    break;
                 case 'r': case 'R':
                     s_panel_mode = (s_panel_mode + 1) % 3;
                     tui_log(3, "PANEL    switched to %s",
@@ -1867,6 +1880,157 @@ static void usb_recover_task(void *arg)
 void adsb_request_recover(void)
 {
     if (s_recover_task_hdl) xTaskNotifyGive(s_recover_task_hdl);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * SHELL COMMANDS
+ *
+ * The receiver's own state lives in statics here (s_aircraft, rtldev), so
+ * these three commands are registered from this file rather than shell.c.
+ * They run on the shell task on core0.
+ *
+ * s_aircraft is read without a lock, exactly as tui_draw() already reads it
+ * from tui_task while adsb_rx_task writes it on core1 -- a torn field shows a
+ * wrong number for one listing and nothing worse.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static int cmd_ac(int argc, char **argv)
+{
+    int64_t now = esp_timer_get_time();
+    int     n   = 0;
+
+    printf("%-6s %-8s %-4s %6s %5s %4s %10s %10s %5s %4s\n",
+           "ICAO", "CALLSIGN", "CAT", "ALT", "SPD", "HDG", "LAT", "LON", "MSGS", "AGE");
+
+    for (int i = 0; i < MAX_TRACKED; i++) {
+        const aircraft_t *a = &s_aircraft[i];
+        if (!a->active) continue;
+        n++;
+
+        char lat[12] = "---", lon[12] = "---";
+        if (a->pos_valid) {
+            snprintf(lat, sizeof(lat), "%.4f", a->lat);
+            snprintf(lon, sizeof(lon), "%.4f", a->lon);
+        }
+        printf("%06lX %-8s %-4s %6d %5d %4d %10s %10s %5d %3llds\n",
+               (unsigned long)a->icao,
+               a->callsign[0] ? a->callsign : "-",
+               plane_cat_label(a->category),
+               a->altitude, a->velocity, a->heading,
+               lat, lon, a->msg_count,
+               (long long)((now - a->last_seen_us) / 1000000));
+    }
+    printf("%d of %d slots active\n", n, MAX_TRACKED);
+    return ESP_OK;
+}
+
+static int cmd_usb(int argc, char **argv)
+{
+    /* Declared here rather than included, for the same reason as in
+     * tui_draw(): esp_libusb.h carries its own unrelated class_driver_t. */
+    extern uint32_t esp_libusb_stream_avail(void);
+    extern uint64_t esp_libusb_stream_dropped(void);
+    extern int      esp_libusb_stream_slots(void);
+
+    if (argc > 1 && strcmp(argv[1], "reset") == 0) {
+        printf("requesting an RTL interface reset\n");
+        adsb_request_recover();
+        return ESP_OK;
+    }
+    if (argc > 1) {
+        printf("usage: usb          -- stream statistics\n"
+               "       usb reset    -- reset the RTL interface\n");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    printf("dongle    %s\n", rtldev ? "open" : "not enumerated");
+    printf("ring      %u byte(s) queued across %d slot(s)\n",
+           (unsigned)esp_libusb_stream_avail(), esp_libusb_stream_slots());
+    /* The number that matters: anything but 0 means IQ samples were lost
+     * because the demod loop did not drain the ring in time. */
+    printf("dropped   %llu\n", (unsigned long long)esp_libusb_stream_dropped());
+    return ESP_OK;
+}
+
+/* The dongle has no gain-mode getter, so mirror what was last set. Starts
+ * false because rtlsdr_setup_task() puts the tuner in auto gain at init. */
+static bool s_gain_manual = false;
+
+static int cmd_sdr(int argc, char **argv)
+{
+    if (!rtldev) { printf("no dongle enumerated\n"); return ESP_ERR_INVALID_STATE; }
+
+    if (argc == 1) {
+        /* 1 = locked, 0 = not, -1 = this tuner cannot report it. */
+        int pll = rtlsdr_get_tuner_pll_locked(rtldev);
+        printf("tuner     type %d, PLL %s\n",
+               (int)rtlsdr_get_tuner_type(rtldev),
+               pll > 0 ? "locked" : pll == 0 ? "UNLOCKED" : "n/a");
+        printf("freq      %u Hz\n",  (unsigned)rtlsdr_get_center_freq(rtldev));
+        printf("rate      %u Hz\n",  (unsigned)rtlsdr_get_sample_rate(rtldev));
+        printf("gain      %.1f dB (%s)\n", rtlsdr_get_tuner_gain(rtldev) / 10.0,
+               s_gain_manual ? "manual"
+                             : "auto -- the AGC overrides this; the number is only what was last set");
+        printf("ppm       %d\n",      rtlsdr_get_freq_correction(rtldev));
+
+        int gains[32];
+        int ng = rtlsdr_get_tuner_gains(rtldev, gains);
+        if (ng > 0) {
+            printf("available ");
+            for (int i = 0; i < ng && i < 32; i++) printf("%.1f ", gains[i] / 10.0);
+            printf("dB\n");
+        }
+        return ESP_OK;
+    }
+
+    if (strcmp(argv[1], "gain") == 0 && argc == 3) {
+        if (strcmp(argv[2], "auto") == 0) {
+            int r = rtlsdr_set_tuner_gain_mode(rtldev, 0);
+            if (r == 0) s_gain_manual = false;
+            printf("gain mode auto (%d)\n", r);
+            return r == 0 ? ESP_OK : ESP_FAIL;
+        }
+        int tenths = (int)(atof(argv[2]) * 10);
+        rtlsdr_set_tuner_gain_mode(rtldev, 1);
+        int r = rtlsdr_set_tuner_gain(rtldev, tenths);
+        if (r == 0) s_gain_manual = true;
+        printf("gain %.1f dB (%d)\n", tenths / 10.0, r);
+        return r == 0 ? ESP_OK : ESP_FAIL;
+    }
+
+    if (strcmp(argv[1], "freq") == 0 && argc == 3) {
+        /* Deliberately unguarded: retuning away from 1090 MHz stops ADS-B
+         * decoding until it is set back. Useful for proving the tuner works. */
+        uint32_t hz = (uint32_t)strtoul(argv[2], NULL, 10);
+        int      r  = rtlsdr_set_center_freq(rtldev, hz);
+        printf("freq %u Hz (%d)%s\n", (unsigned)hz, r,
+               (hz < 1089000000u || hz > 1091000000u) ? "  -- ADS-B decoding will stop" : "");
+        return r == 0 ? ESP_OK : ESP_FAIL;
+    }
+
+    printf("usage: sdr                  -- tuner status\n"
+           "       sdr gain <dB|auto>   -- set tuner gain\n"
+           "       sdr freq <Hz>        -- retune (1090000000 for ADS-B)\n");
+    return ESP_ERR_INVALID_ARG;
+}
+
+void adsb_register_shell_cmds(void)
+{
+    const esp_console_cmd_t cmds[] = {
+        { .command = "ac",  .help = "list the tracked aircraft",              .func = cmd_ac  },
+        { .command = "usb", .help = "IQ stream statistics, or reset the RTL", .func = cmd_usb },
+        { .command = "sdr", .help = "tuner status, gain and frequency",       .func = cmd_sdr },
+    };
+    for (int i = 0; i < (int)(sizeof(cmds) / sizeof(cmds[0])); i++)
+        ESP_ERROR_CHECK(esp_console_cmd_register(&cmds[i]));
+}
+
+void adsb_tui_resume(void)
+{
+    printf(CLS);
+    fflush(stdout);
+    s_dirty     = true;
+    s_last_draw = 0;    /* draw the next frame immediately, not one period on */
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
