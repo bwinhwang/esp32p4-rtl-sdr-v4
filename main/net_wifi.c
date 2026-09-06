@@ -290,6 +290,19 @@ static esp_err_t wifi_bringup(void)
     err = esp_wifi_start();
     if (err != ESP_OK) return err;
 
+    /* Turn modem sleep off. ESP-IDF defaults to WIFI_PS_MIN_MODEM, which lets
+     * the radio doze between the *upstream* AP's DTIM beacons -- and the C6 has
+     * one radio serving both halves of APSTA, so every nap is also a nap on the
+     * SoftAP. Associated stations miss frames and time out: measured here as a
+     * phone dropping off roughly every 20-40 s and rejoining by itself, with
+     * the AP beaconing normally throughout, which makes it look like a client
+     * problem rather than a radio one. Costs idle current the C6 would
+     * otherwise save; this board is USB-powered, so that is not a trade.
+     * Non-fatal if an older slave does not implement the call. */
+    esp_err_t pserr = esp_wifi_set_ps(WIFI_PS_NONE);
+    if (pserr != ESP_OK)
+        ESP_LOGW(TAG, "power save not disabled: %s", esp_err_to_name(pserr));
+
     /* ESP-IDF's default AP bitmap is 11B|11G|11N, so clients report "WiFi 4"
      * on a board sold as WIFI6-DEV-KIT. The C6 has HE (SOC_WIFI_HE_SUPPORT),
      * it is only off by default. Non-fatal: an older slave that does not
