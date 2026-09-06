@@ -1,4 +1,18 @@
 dependencies:
+  david-cermak/libssh:
+    component_hash: ae8918caecfceb8c9ffb49ceb888bbfb0502a14748450e6e77f797970720d7ce
+    dependencies:
+    - name: espressif/sock_utils
+      registry_url: https://components.espressif.com
+      require: private
+      version: '*'
+    - name: idf
+      require: private
+      version: '>=5.2'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 0.12.2
   espressif/eppp_link:
     component_hash: 04f7f31868b8ae6014c96132740a192d09611a6e46aaa7038c865ffc7e26b38f
     dependencies:
@@ -87,12 +101,22 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 1.11.1
-  espressif/usb:
-    component_hash: 6c2cff118141dbbca181d0d27d71801fdddfc78f7ac03ae43f6e5a8cbd89cb99
+  espressif/sock_utils:
+    component_hash: b2e5cafc60dfefd05720ababb9fca0dfe2830fb9d71f97e5336de36a84c591c9
     dependencies:
     - name: idf
       require: private
-      version: '>=5.5.3'
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 0.2.2
+  espressif/usb:
+    component_hash: 4f00ced5663505a368bafcb9bb6b2e4a5033cc5625b8f510755a75baadf4ff1d
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.4'
     source:
       registry_url: https://components.espressif.com/
       type: service
@@ -103,7 +127,7 @@ dependencies:
     - esp32p4
     - esp32h4
     - linux
-    version: 1.5.0
+    version: 1.4.0
   espressif/wifi_remote_over_eppp:
     component_hash: 06d8bc15348bbd21f1390daace36ed5adcf6026c93c5b69decc55fa04df2711a
     dependencies:
@@ -123,6 +147,7 @@ dependencies:
       type: idf
     version: 6.0.1
 direct_dependencies:
+- david-cermak/libssh
 - espressif/esp_codec_dev
 - espressif/esp_hosted
 - espressif/esp_wifi_remote
@@ -130,6 +155,6 @@ direct_dependencies:
 - espressif/mdns
 - espressif/usb
 - idf
-manifest_hash: 743c4d975dd66269b7ca1177bb3c2b8383e45fd048af344335e909f8bcba3519
+manifest_hash: 2218944a82f2f5b1fcc155a50aa6347eb43e9f0e1d95bf37f67e6bf596e4caf8
 target: esp32p4
 version: 3.0.0

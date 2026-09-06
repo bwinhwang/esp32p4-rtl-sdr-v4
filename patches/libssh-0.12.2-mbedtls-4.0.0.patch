@@ -1,0 +1,46 @@
+--- mbedcrypto_v4.c	2026-09-06 20:54:37.517166216 +0800
++++ mbedcrypto_v4.c	2026-09-06 20:54:37.519166221 +0800
+@@ -33,7 +33,10 @@
+ int mbedtls_pk_rsa_set_pubkey(mbedtls_pk_context *pk,
+                               const unsigned char *key,
+                               size_t key_len);
+-int mbedtls_pk_set_pubkey_from_prv(mbedtls_pk_context *pk);
++/* Released mbedTLS 4.0.0 names this mbedtls_pk_rsa_set_pubkey_from_prv()
++ * (pk_internal.h, exported from libmbed-builtin.a). The generic name
++ * libssh declares here belongs to a later 4.x snapshot. */
++int mbedtls_pk_rsa_set_pubkey_from_prv(mbedtls_pk_context *pk);
+ 
+ static int ssh_mbedtls_rsa_compute_crt(const mbedtls_mpi *P,
+                                        const mbedtls_mpi *Q,
+@@ -250,8 +253,11 @@
+         return 1;
+     }
+ 
+-    psa_type = pk->MBEDTLS_PRIVATE(psa_type);
+-    return PSA_KEY_TYPE_IS_RSA(psa_type) != 0;
++    /* Released mbedTLS 4.0.0 (what ESP-IDF v6.0 ships) dropped the psa_type
++     * field from mbedtls_pk_context; the key type is carried by pk_info, which
++     * mbedtls_pk_can_do() above already consults. */
++    (void)psa_type;
++    return 0;
+ }
+ 
+ int ssh_mbedtls_rng(void *ctx, unsigned char *output, size_t len)
+@@ -334,7 +340,7 @@
+            src->MBEDTLS_PRIVATE(pub_raw),
+            src->MBEDTLS_PRIVATE(pub_raw_len));
+     dst->MBEDTLS_PRIVATE(pub_raw_len) = src->MBEDTLS_PRIVATE(pub_raw_len);
+-    dst->MBEDTLS_PRIVATE(psa_type) = src->MBEDTLS_PRIVATE(psa_type);
++    /* psa_type: gone in released mbedTLS 4.0.0 -- see ssh_mbedtls_pk_is_rsa(). */
+     dst->MBEDTLS_PRIVATE(bits) = src->MBEDTLS_PRIVATE(bits);
+ #if defined(PSA_WANT_KEY_TYPE_ECC_PUBLIC_KEY)
+     dst->MBEDTLS_PRIVATE(ec_family) = src->MBEDTLS_PRIVATE(ec_family);
+@@ -398,7 +404,7 @@
+             mbedtls_pk_free(pk);
+             return rc;
+         }
+-        return mbedtls_pk_set_pubkey_from_prv(pk);
++        return mbedtls_pk_rsa_set_pubkey_from_prv(pk);
+     }
+ 
+     rc = mbedtls_pk_rsa_set_pubkey(pk, der, der_len);

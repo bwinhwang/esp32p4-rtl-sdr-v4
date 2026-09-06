@@ -24,8 +24,11 @@
  * report those as unavailable rather than faulting). */
 void shell_init(void);
 
-/* True while the shell owns the console. tui_draw() returns early on this, and
- * the key handler routes bytes to shell_feed() instead of the TUI hotkeys. */
+/* True while the *UART* shell owns the console. tui_draw() returns early on
+ * this, and the key handler routes bytes to shell_feed() instead of the TUI
+ * hotkeys. A remote session does not suspend the TUI: it writes to a socket,
+ * not to UART0, so the radar keeps running on the serial monitor while
+ * somebody is logged in over the network. */
 bool shell_active(void);
 
 /* Hands the console to the shell. Called from the TUI key handler. */
@@ -33,6 +36,24 @@ void shell_enter(void);
 
 /* Queues one byte of console input. No-op when the shell is not active. */
 void shell_feed(uint8_t byte);
+
+/* ── remote sessions (net_ssh.c) ─────────────────────────────────────────────
+ * The UART path above hands bytes over to the shell task because its reader
+ * sits in adsb_rx_task on the demod hot path. A network transport has no such
+ * problem -- its own task is already on core0 and may block -- so it drives
+ * the line editor directly instead, in its own task. That keeps every libssh
+ * call on one thread, which libssh sessions require anyway.
+ *
+ * shell_remote_open() claims the console; it fails if the UART shell or
+ * another remote session already holds it (one line buffer, one command
+ * context, and one global stdout -- see net_ssh.c).
+ *
+ * shell_remote_byte() runs one input byte to completion in the caller's task
+ * and returns false once the user has left ('exit', 'quit' or Ctrl-D), after
+ * which the caller must call shell_remote_close(). */
+bool shell_remote_open(void);
+bool shell_remote_byte(uint8_t byte);
+void shell_remote_close(void);
 
 /* ── implemented in class_driver.c ───────────────────────────────────────────
  * The commands that read the receiver's own state (the aircraft table, the

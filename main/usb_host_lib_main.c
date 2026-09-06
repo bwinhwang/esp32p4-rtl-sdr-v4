@@ -19,6 +19,7 @@
 #include "net_wifi.h"
 #include "web_config.h"
 #include "shell.h"
+#include "net_ssh.h"
 #include "feed_avr.h"
 #include "feed_beast.h"
 #include "feed_json.h"
@@ -137,6 +138,12 @@ void app_main(void)
     /* Console REPL. Registers commands and starts its task; it stays dormant
      * until ':' is pressed on the console, so it costs nothing until used. */
     shell_init();
+
+    /* The same REPL over SSH. Must follow shell_init(), which creates the
+     * console the session drives, and net_ssh registers its own `ssh` command
+     * into it. Binds INADDR_ANY like the feeds, so Ethernet, the SoftAP and
+     * the STA are all covered with no per-interface code. */
+    net_ssh_start();
 
     /* WIFI6-DEV-KIT's Host-port VBUS is switched by an always-on load
      * switch (hardwired EN), unlike the Nano board which needed a GPIO

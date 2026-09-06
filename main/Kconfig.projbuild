@@ -71,4 +71,14 @@ menu "WiFi (ESP32-C6 co-processor)"
         range 1 65535
         default 80
 
+    config ADSB_SSH_PORT
+        int "SSH console port"
+        range 1 65535
+        default 22
+        help
+            Port the SSH console listens on. The login itself is NOT a Kconfig
+            option for the same reason as the WiFi password above -- it lives
+            in NVS and is set with `ssh set <user> <pass>` from the serial
+            console. With no password stored the server does not listen.
+
 endmenu

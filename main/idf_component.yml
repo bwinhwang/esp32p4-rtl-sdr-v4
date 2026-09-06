@@ -17,3 +17,6 @@ dependencies:
     version: '==2.12.6'
   espressif/esp_wifi_remote:
     version: '>=1.3.1'
+  # SSH server (vendored upstream libssh). See main/net_ssh.c and the note in
+  # the top-level CMakeLists about mbedTLS 4.0.0.
+  david-cermak/libssh: '^0.12.2'

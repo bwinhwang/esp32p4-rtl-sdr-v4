@@ -42,24 +42,32 @@
 #define SHELL_QUEUE_LEN  256
 #define PROMPT           "p4> "
 
-static volatile bool s_active;
-static QueueHandle_t s_q;
-static char          s_line[SHELL_LINE_MAX];
-static int           s_len;
+/* Which transport owns the console. There is one line buffer, one command
+ * context and -- under picolibc -- one global stdout, so ownership is
+ * exclusive; see net_ssh.h. */
+typedef enum { OWNER_NONE = 0, OWNER_UART, OWNER_SSH } owner_t;
 
-bool shell_active(void) { return s_active; }
+static volatile owner_t s_owner;
+static QueueHandle_t    s_q;
+static char             s_line[SHELL_LINE_MAX];
+static int              s_len;
+
+/* Only the UART session suspends the TUI. A remote session writes to a socket,
+ * so the two never touch the same UART and the radar can keep running. */
+bool shell_active(void) { return s_owner == OWNER_UART; }
 
 void shell_feed(uint8_t byte)
 {
-    if (s_active && s_q) xQueueSend(s_q, &byte, 0);
+    if (s_owner == OWNER_UART && s_q) xQueueSend(s_q, &byte, 0);
 }
 
 void shell_enter(void)
 {
-    if (!s_q) return;         /* shell_init() never ran */
+    if (!s_q) return;                     /* shell_init() never ran */
+    if (s_owner != OWNER_NONE) return;    /* a remote session has the console */
     xQueueReset(s_q);
-    s_len    = 0;
-    s_active = true;          /* the task prints the banner; see shell_task() */
+    s_len   = 0;
+    s_owner = OWNER_UART;     /* the task prints the banner; see shell_task() */
 }
 
 /* ═════════════════════════════════════════════════════════════════════════════
@@ -264,7 +272,7 @@ static int cmd_restart(int argc, char **argv)
 
 static int cmd_exit(int argc, char **argv)
 {
-    s_active = false;   /* shell_task() sees this and hands the console back */
+    s_owner = OWNER_NONE;   /* the session loop sees this and hands back */
     return ESP_OK;
 }
 
@@ -295,7 +303,7 @@ static void handle_byte(uint8_t b)
         case '\n':
             run_line();
             s_len = 0;
-            if (s_active) printf(PROMPT);
+            if (s_owner != OWNER_NONE) printf(PROMPT);
             break;
 
         case 0x7f:          /* DEL */
@@ -313,7 +321,7 @@ static void handle_byte(uint8_t b)
             break;
 
         case 0x04:          /* Ctrl-D on an empty line -- leave the shell */
-            if (s_len == 0) { s_active = false; break; }
+            if (s_len == 0) { s_owner = OWNER_NONE; break; }
             break;
 
         default:
@@ -329,14 +337,14 @@ static void handle_byte(uint8_t b)
 static void shell_task(void *arg)
 {
     while (true) {
-        if (!s_active) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
+        if (s_owner != OWNER_UART) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
 
         printf("\033[2J\033[H"                        /* the TUI left a full screen */
                "ADS-B console. 'help' lists commands, 'exit' returns to the TUI.\n\n"
                PROMPT);
         fflush(stdout);
 
-        while (s_active) {
+        while (s_owner == OWNER_UART) {
             uint8_t b;
             /* Timed rather than blocking so 'exit' (which runs on this task,
              * inside handle_byte) is not what has to wake the loop. */
@@ -347,6 +355,38 @@ static void shell_task(void *arg)
         fflush(stdout);
         adsb_tui_resume();
     }
+}
+
+/* ═════════════════════════════════════════════════════════════════════════════
+ * Remote sessions
+ *
+ * No task and no queue of its own: the transport calls these from the task it
+ * already has. See the comment in shell.h.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+bool shell_remote_open(void)
+{
+    if (!s_q) return false;                  /* shell_init() never ran */
+    if (s_owner != OWNER_NONE) return false; /* console already claimed */
+    s_len   = 0;
+    s_owner = OWNER_SSH;
+
+    printf("ADS-B console. 'help' lists commands, 'exit' closes the session.\n\n"
+           PROMPT);
+    fflush(stdout);
+    return true;
+}
+
+bool shell_remote_byte(uint8_t byte)
+{
+    if (s_owner != OWNER_SSH) return false;
+    handle_byte(byte);
+    return s_owner == OWNER_SSH;
+}
+
+void shell_remote_close(void)
+{
+    if (s_owner == OWNER_SSH) s_owner = OWNER_NONE;
 }
 
 /* ═════════════════════════════════════════════════════════════════════════════

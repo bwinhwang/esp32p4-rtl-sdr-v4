@@ -45,6 +45,17 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # instead: ETH_MAC_FLAG_PIN_TO_CORE in net_eth.c pins it to the installing core.
 CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y
 
+# libssh's getpass.c uses struct termios unconditionally (it is client-side
+# interactive password entry, dead code for a server), and IDF's
+# sys/termios.h defines nothing without this. Defaults to n since v6.0, so
+# the component does not build on a stock v6 config without it.
+CONFIG_VFS_SUPPORT_TERMIOS=y
+
+# Socket budget. The default 10 was already tight with three feed listeners
+# (:30001 AVR, :30005 Beast, :8888 JSON) plus their clients and the config
+# page's httpd; net_ssh.c adds a listener and an accepted session on top.
+CONFIG_LWIP_MAX_SOCKETS=16
+
 # ── WiFi via the ESP32-C6 co-processor ──────────────────────────────────────
 # The P4 has no radio; esp_wifi_remote remotes the ordinary esp_wifi_* API to
 # the C6 over 4-bit SDIO. Pins are read off the schematic and happen to be
