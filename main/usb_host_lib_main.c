@@ -101,12 +101,19 @@ static void usb_host_lib_task(void *arg)
 
 void app_main(void)
 {
+    /* The console comes first: shell_init() installs the UART0 driver, so
+     * everything logged below goes out through its interrupt-driven TX rather
+     * than uart_vfs's busy-spin, and the command set is registered before
+     * anything can want it. The prompt itself waits for
+     * shell_console_start() at the end of this function. */
+    shell_init();
+
     ESP_LOGI(TAG, "ESP32-P4 ADS-B Receiver starting");
 
 #if CONFIG_SPIRAM
-    /* esp_psram already logged the size before app_main, but that scrolls past
-     * the moment the TUI takes the console -- put it in the log panel too, so
-     * a running board can be asked whether PSRAM actually came up. */
+    /* esp_psram already logged the size before app_main, but that scrolls off
+     * a long-running console -- put it in the receiver's own log ring too, so
+     * a running board can be asked (`log tail`) whether PSRAM came up. */
     ESP_LOGI(TAG, "PSRAM %uKB total, %uKB free",
              (unsigned)(esp_psram_get_size() / 1024),
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
@@ -135,14 +142,10 @@ void app_main(void)
      * every interface, which includes the SoftAP that is always on. */
     web_config_start();
 
-    /* Console REPL. Registers commands and starts its task; it stays dormant
-     * until ':' is pressed on the console, so it costs nothing until used. */
-    shell_init();
-
-    /* The same REPL over SSH. Must follow shell_init(), which creates the
-     * console the session drives, and net_ssh registers its own `ssh` command
-     * into it. Binds INADDR_ANY like the feeds, so Ethernet, the SoftAP and
-     * the STA are all covered with no per-interface code. */
+    /* The same REPL over SSH; it registers its own `ssh` command into the
+     * console shell_init() already set up. Binds INADDR_ANY like the feeds, so
+     * Ethernet, the SoftAP and the STA are all covered with no per-interface
+     * code. */
     net_ssh_start();
 
     /* WIFI6-DEV-KIT's Host-port VBUS is switched by an always-on load
@@ -183,6 +186,14 @@ void app_main(void)
                                            &class_driver_task_hdl, 0);
     assert(task_created == pdTRUE);
     vTaskDelay(10);
+
+    /* ── 3.5. Console and display ──
+     * The draw task runs from here rather than from the receiver so the
+     * display is available with no dongle enumerated; it paints only while
+     * `tui` has put it in the foreground. The prompt comes last, after the
+     * loudest part of boot, so it is not immediately scrolled away. */
+    adsb_tui_start();
+    shell_console_start();
 
     /* ── 4. Event loop ── */
     while (1) {

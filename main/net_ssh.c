@@ -485,20 +485,25 @@ static void reject_extra(void)
 
 static void run_shell(ssh_channel ch)
 {
-    /* The swap has to happen before shell_remote_open(), which prints the
-     * banner with printf() -- doing it the other way round sends the banner
-     * to the serial console and the client sees a blank session. */
+    /* Three steps in a fixed order, none of them interchangeable (shell.h
+     * states the contract). Claim first and unredirected: the serial shell now
+     * sits at a prompt permanently, so this takes the console away from it,
+     * and until it has let go its own echo printf()s would land in this
+     * session. Swap stdout second. Print the banner last -- doing that before
+     * the swap sends it to the serial console and the client sees a blank
+     * session. */
+    if (!shell_remote_claim()) {
+        static const char busy[] =
+            "\r\nconsole busy: another session has it\r\n";
+        ssh_channel_write(ch, busy, sizeof(busy) - 1);
+        return;
+    }
+
     ring_reset();
     stdio_save_t saved;
     stdio_redirect(s_out, &saved);   /* see the file header for why this is global */
 
-    if (!shell_remote_open()) {
-        stdio_restore(&saved);
-        static const char busy[] =
-            "\r\nconsole busy: another session (or the serial shell) has it\r\n";
-        ssh_channel_write(ch, busy, sizeof(busy) - 1);
-        return;
-    }
+    shell_remote_open();
 
     s_state = NET_SSH_SESSION;
     flush_ring(ch);             /* the banner shell_remote_open() just printed */

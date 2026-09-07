@@ -21,7 +21,6 @@
 #include "driver/i2s_std.h"
 #include "driver/i2c_master.h"
 #include "driver/uart.h"
-#include "driver/uart_vfs.h"
 #include "esp_codec_dev.h"
 #include "esp_codec_dev_defaults.h"
 #include "es8311_codec.h"
@@ -42,7 +41,10 @@
 #define MAX_PACKET_SIZE       16384
 #define DEFAULT_BUF_LENGTH    (MAX_PACKET_SIZE * 2)
 #define MAX_TRACKED           16
-#define LOG_LINES             7
+/* Ring depth, not screen depth: the TUI shows the last LOG_SHOW of these, and
+ * `log tail` -- the only way to see receiver events while the display is in
+ * the background -- reads the rest. 32 x 81 B of internal RAM. */
+#define LOG_LINES             32
 /* A full repaint is ~13 KB, and pushing bytes at the console UART costs ~7 us
  * of CPU each, so this constant sets core0 load directly: at 150 ms it was
  * 90 KB/s, which is 98% of the 921600-baud line rate and 63% of the core.
@@ -158,6 +160,14 @@ static int64_t     s_rate_ts     = 0;
 static int64_t     s_start_us    = 0;
 static int64_t     s_last_draw   = 0;
 static bool        s_dirty       = false;
+/* Held for the duration of one frame. The shell's console task takes it when
+ * the display leaves the foreground, so a repaint already in flight finishes
+ * before the prompt is drawn over it -- otherwise the ~13 KB frame and the
+ * banner interleave on UART0 (the draw task is priority 2, the console task 3,
+ * so the console does preempt it mid-frame). */
+static SemaphoreHandle_t s_paint_lock = NULL;
+static volatile bool s_rx_running  = false;  /* adsb_rx_task is up          */
+static volatile bool s_inject_req  = false;  /* the 't' hotkey, see below   */
 static float       s_decode_smooth = 0.0f;
 static float       s_crc_smooth    = 0.0f;
 static float       s_fix_smooth    = 0.0f;
@@ -510,12 +520,33 @@ static bool cpr_decode(aircraft_t *a)
  * LOG / AIRCRAFT HELPERS
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/* Before the TUI's first frame there's no box on screen to protect, but
- * there's also no tui_draw() call yet to ever surface a queued s_log[]
- * entry -- so anything logged during device setup (USB enumeration, tuner
- * bring-up) needs to also go out raw, or a setup-time hang/error becomes
- * completely silent instead of just ugly. */
-static bool s_tui_active = false;
+/* Receiver events go to the TUI's LOG panel, and -- while the display is not
+ * in front -- to the console as they happen, filtered by this. ADSB_ECHO_ALL
+ * is what the panel shows and is unusable at a prompt with an antenna
+ * connected: on_msg() logs an ALT or VEL line for every decoded frame, several
+ * a second. ADSB_ECHO_BRIEF keeps the colours that mark an event rather than a
+ * measurement -- 1 (first contact, bring-up) and 4 (anything wrong).
+ *
+ * It starts at ALL so a failure during boot -- USB enumeration, tuner
+ * bring-up -- is not silent, and shell_console_start() drops it to BRIEF once
+ * the prompt is up. `log tail` shows the ring either way. */
+static volatile int s_log_echo = ADSB_ECHO_ALL;
+
+void adsb_log_echo_set(int level) { s_log_echo = level; }
+int  adsb_log_echo_get(void)      { return s_log_echo; }
+
+void adsb_log_dump(int n)
+{
+    if (n <= 0 || n > LOG_LINES) n = LOG_LINES;
+    if (n > s_log_head)          n = s_log_head;
+
+    if (n == 0) { printf("(no receiver events yet)\n"); return; }
+
+    for (int i = n - 1; i >= 0; i--) {
+        const log_entry_t *e = &s_log[(s_log_head - 1 - i + LOG_LINES * 2) % LOG_LINES];
+        if (e->text[0]) printf("%s\n", e->text);
+    }
+}
 
 void tui_log(uint8_t color, const char *fmt, ...)
 {
@@ -528,7 +559,11 @@ void tui_log(uint8_t color, const char *fmt, ...)
     s_log_head++;
     s_dirty = true;
 
-    if (!s_tui_active) {
+    int  lvl  = s_log_echo;
+    bool echo = (lvl >= ADSB_ECHO_ALL) ||
+                (lvl == ADSB_ECHO_BRIEF && (color == 1 || color == 4));
+
+    if (echo && !shell_tui_foreground()) {
         printf("%s\n", s_log[(s_log_head - 1) % LOG_LINES].text);
         fflush(stdout);
     }
@@ -1168,13 +1203,21 @@ static void render_tasks(char panel[RADAR_ROWS][RADAR_COLS + 1])
 
 static void tui_draw(void)
 {
-    /* The shell has the console: a repaint here would land on top of whatever
-     * the user is typing, and both write the same UART. */
-    if (shell_active()) return;
+    /* The display is a foreground application on the serial console: with the
+     * shell in front, a repaint would land on top of whatever the user is
+     * typing, and both write the same UART. */
+    if (!shell_tui_foreground()) return;
 
     int64_t now = esp_timer_get_time();
     if ((now - s_last_draw) < (TUI_REFRESH_MS * 1000LL)) return;
     s_last_draw = now;
+
+    if (s_paint_lock) {
+        xSemaphoreTake(s_paint_lock, portMAX_DELAY);
+        /* The foreground can have changed while this waited -- adsb_tui_hold()
+         * is the other side of this lock and gives it back straight away. */
+        if (!shell_tui_foreground()) { xSemaphoreGive(s_paint_lock); return; }
+    }
 
     /* The frame goes straight to the UART, so anything another task left in
      * stdout's buffer has to get out first or it lands mid-frame. */
@@ -1519,7 +1562,7 @@ static void tui_draw(void)
     fb_printf(BR EL "\n" RESET);
     fb_printf(PH_DIM "  R828D  " PH_GRID "|" RESET
            PH_DIM "  RAFAEL MICRO  " PH_GRID "|" RESET
-           PH_DIM "  ctrl+] EXIT  " PH_GRID "|" RESET
+           PH_DIM "  [Q] SHELL  " PH_GRID "|" RESET
            PH_DIM "  [M]UTE  " PH_GRID "|" RESET
            PH_DIM "  [+/-] VOL  " PH_GRID "|" RESET
            PH_DIM "  [R] RADAR/WFALL/TASKS  " PH_GRID "|" RESET
@@ -1527,6 +1570,8 @@ static void tui_draw(void)
 
     fb_flush();
     probe_frame(now, (uint32_t)(esp_timer_get_time() - now));
+
+    if (s_paint_lock) xSemaphoreGive(s_paint_lock);
 }
 
 
@@ -1616,9 +1661,10 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
 
 /* ── synthetic contacts ('t' key) ─────────────────────────────────────────
  * Drives the table, the radar and the log with no antenna and no dongle, so
- * display and (later) feed work can be tested indoors. Called only from
- * adsb_rx_task's key handler, which is the same task on_msg() runs in -- so
- * it touches s_aircraft[] under exactly the same rules the real path does. */
+ * display and feed work can be tested indoors. s_aircraft[] has no lock, so
+ * this must run in adsb_rx_task -- the task on_msg() runs in -- whenever that
+ * task exists; adsb_tui_key() defers to it through s_inject_req for exactly
+ * that reason. */
 static void inject_fake_aircraft(void)
 {
     /* One entry per plane_classify() bucket, so four presses put one of each
@@ -1709,6 +1755,67 @@ static void tui_task(void *arg)
     }
 }
 
+/* Waits for any frame in flight to finish. shell.c calls this after clearing
+ * the foreground flag, so by the time it returns the display is guaranteed to
+ * have stopped writing UART0 and the prompt can be drawn safely. */
+void adsb_tui_hold(void)
+{
+    if (!s_paint_lock) return;
+    xSemaphoreTake(s_paint_lock, portMAX_DELAY);
+    xSemaphoreGive(s_paint_lock);
+}
+
+void adsb_tui_start(void)
+{
+    s_paint_lock = xSemaphoreCreateMutex();
+
+    /* Created once, from app_main, and never destroyed: tui_draw() returns
+     * immediately while the display is in the background, so `tui` is a state
+     * change rather than a task lifecycle. It also means the display works
+     * with no dongle enumerated -- nothing in tui_draw() touches rtldev. */
+    xTaskCreatePinnedToCore(tui_task, "tui", 6144, NULL, 2, NULL, 0);
+}
+
+/* One keystroke, from shell.c's console task on core0. The keys that leave the
+ * display never reach here. Everything below either writes a scalar the draw
+ * task only reads, or defers to the demod task -- see s_inject_req. */
+void adsb_tui_key(uint8_t key)
+{
+    switch (key) {
+        case 'r': case 'R':
+            s_panel_mode = (s_panel_mode + 1) % 3;
+            tui_log(3, "PANEL    switched to %s",
+                    s_panel_mode == 0 ? "RADAR"
+                  : s_panel_mode == 1 ? "WATERFALL" : "TASKS");
+            s_dirty = true;
+            break;
+        case 'm': case 'M':
+            s_muted = !s_muted;
+            tui_log(2, "AUDIO    %s", s_muted ? "muted" : "unmuted");
+            s_dirty = true;
+            break;
+        case '+': case '=':
+            s_volume += 10;
+            if (s_volume > 100) s_volume = 100;
+            s_dirty = true;
+            break;
+        case '-':
+            s_volume -= 10;
+            if (s_volume < 0) s_volume = 0;
+            s_dirty = true;
+            break;
+        case 't': case 'T':
+            /* Hand it to adsb_rx_task, which is where on_msg() writes the same
+             * table. With no dongle that task does not exist and there is no
+             * writer to race, so do it here instead. */
+            if (s_rx_running) s_inject_req = true;
+            else              inject_fake_aircraft();
+            break;
+        default:
+            break;
+    }
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * ADSB RX TASK  — also polls UART0 for keystrokes
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -1743,29 +1850,10 @@ void adsb_rx_task(void *arg)
     bool full_buffer = false;
     mode_s_init(&state);
 
-    /* configure UART0 for non-blocking key reads. The baud MUST stay at the
-     * console's configured rate -- this is the same UART stdout goes out on,
-     * so hardcoding a slower one both garbles the monitor and throttles
-     * tui_draw() to a crawl (a full 154-col frame is ~20 KB of UTF-8+ANSI). */
-    uart_config_t uart_cfg = {
-        .baud_rate  = CONFIG_ESP_CONSOLE_UART_BAUDRATE,
-        .data_bits  = UART_DATA_8_BITS,
-        .parity     = UART_PARITY_DISABLE,
-        .stop_bits  = UART_STOP_BITS_1,
-        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
-    };
-    uart_param_config(UART_NUM_0, &uart_cfg);
-    /* Console stdout otherwise goes through uart_vfs's default tx_func, which
-     * busy-spins on the TX FIFO one byte at a time -- it never yields, so a
-     * slow/heavy tui_draw() can starve IDLE1 long enough to trip the task
-     * watchdog. Routing stdout through this driver's buffered+interrupt TX
-     * makes printf() a semaphore-blocked (yielding) call instead. */
-    uart_driver_install(UART_NUM_0, 256, 4096, 0, NULL, 0);
-    uart_vfs_dev_use_driver(UART_NUM_0);
-
-    printf(CLS);
-    s_tui_active = true;
-    xTaskCreatePinnedToCore(tui_task, "tui", 6144, NULL, 2, NULL, 0);
+    /* UART0 is set up and read by shell.c's console task -- see the note there
+     * on why the reader had to leave this task. The display's own draw task is
+     * started from app_main and runs whether or not a dongle ever appears. */
+    s_rx_running = true;
 
     bool stream_started = (rtlsdr_stream_start(rtldev) == 0);
     if (!stream_started) tui_log(4, "STREAM   start failed, retrying");
@@ -1773,45 +1861,11 @@ void adsb_rx_task(void *arg)
     int64_t last_yield = esp_timer_get_time();
 
     while (true) {
-        /* ── non-blocking keyread ── */
-        uint8_t key = 0;
-        if (uart_read_bytes(UART_NUM_0, &key, 1, 0) > 0) {
-            /* This task is the demod hot path, so the shell only ever gets the
-             * byte queued here -- the command itself runs on core0. */
-            if (shell_active()) {
-                shell_feed(key);
-            } else switch (key) {
-                case ':':
-                    shell_enter();
-                    break;
-                case 'r': case 'R':
-                    s_panel_mode = (s_panel_mode + 1) % 3;
-                    tui_log(3, "PANEL    switched to %s",
-                            s_panel_mode == 0 ? "RADAR"
-                          : s_panel_mode == 1 ? "WATERFALL" : "TASKS");
-                    s_dirty = true;
-                    break;
-                case 'm': case 'M':
-                    s_muted = !s_muted;
-                    tui_log(2, "AUDIO    %s", s_muted ? "muted" : "unmuted");
-                    s_dirty = true;
-                    break;
-                case '+': case '=':
-                    s_volume += 10;
-                    if (s_volume > 100) s_volume = 100;
-                    s_dirty = true;
-                    break;
-                case '-':
-                    s_volume -= 10;
-                    if (s_volume < 0) s_volume = 0;
-                    s_dirty = true;
-                    break;
-                case 't': case 'T':
-                    inject_fake_aircraft();
-                    break;
-                default: break;
-            }
-        }
+        /* The 't' hotkey is served here rather than where the key is read:
+         * inject_fake_aircraft() writes s_aircraft[] and this is the task
+         * on_msg() runs in, which is the only thing that makes the synthetic
+         * contacts race-free (there is no lock on that table). */
+        if (s_inject_req) { s_inject_req = false; inject_fake_aircraft(); }
 
         if (!stream_started) {
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -2025,6 +2079,8 @@ void adsb_register_shell_cmds(void)
         ESP_ERROR_CHECK(esp_console_cmd_register(&cmds[i]));
 }
 
+/* Called when the display comes to the foreground: wipe whatever the shell
+ * left on screen and put a frame up now rather than one refresh period later. */
 void adsb_tui_resume(void)
 {
     printf(CLS);
