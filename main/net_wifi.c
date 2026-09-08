@@ -31,7 +31,7 @@
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "nvs_flash.h"
-#include "esp_libusb.h"   /* tui_log() */
+#include "shell.h"       /* sys_log() */
 #include "net_wifi.h"
 
 #define AP_SSID     CONFIG_ADSB_WIFI_AP_SSID
@@ -64,6 +64,7 @@ static volatile int      s_ap_clients;
 static volatile uint32_t s_sta_ip4;      /* raw, so a reader can't catch a
                                           * half-written string */
 static volatile bool     s_sta_want;     /* an upstream SSID is configured */
+static volatile int      s_join_fail = -1;   /* last reported join failure   */
 static esp_netif_t      *s_sta_netif;
 static TaskHandle_t      s_task;         /* woken to retry a join at once */
 
@@ -165,7 +166,7 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
     switch (id) {
     case WIFI_EVENT_AP_START:
         if (s_state != NET_WIFI_STA) s_state = NET_WIFI_AP;
-        tui_log(1, "WIFI     SoftAP \"%s\" up on ch %d", AP_SSID, AP_CHANNEL);
+        sys_log(1, "WIFI     SoftAP \"%s\" up on ch %d", AP_SSID, AP_CHANNEL);
         break;
 
     /* Counted from events rather than esp_wifi_ap_get_sta_list(): the TUI
@@ -174,14 +175,14 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
     case WIFI_EVENT_AP_STACONNECTED: {
         const wifi_event_ap_staconnected_t *e = data;
         s_ap_clients++;
-        tui_log(1, "WIFI     station joined " MACSTR " (%d on AP)",
+        sys_log(1, "WIFI     station joined " MACSTR " (%d on AP)",
                 MAC2STR(e->mac), s_ap_clients);
         break;
     }
     case WIFI_EVENT_AP_STADISCONNECTED: {
         const wifi_event_ap_stadisconnected_t *e = data;
         if (s_ap_clients > 0) s_ap_clients--;
-        tui_log(4, "WIFI     station left " MACSTR " (%d on AP)",
+        sys_log(4, "WIFI     station left " MACSTR " (%d on AP)",
                 MAC2STR(e->mac), s_ap_clients);
         break;
     }
@@ -191,13 +192,21 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
         s_sta_ip4 = 0;
         if (s_state == NET_WIFI_STA) {
             s_state = NET_WIFI_AP;
-            tui_log(4, "WIFI     upstream lost (reason %d)", e->reason);
-        } else if (s_sta_want) {
+            sys_log(4, "WIFI     upstream lost (reason %d)", e->reason);
+        } else if (s_sta_want && e->reason != s_join_fail) {
             /* A join that never succeeded has to be reported too. Without
              * this, a wrong password, a 5GHz-only SSID and a typo all look
              * identical from outside -- the board just sits at "AP only"
-             * forever. 201=NO_AP_FOUND, 202=AUTH_FAIL, 15=handshake timeout. */
-            tui_log(4, "WIFI     join failed, reason %d (201=no AP 202=auth "
+             * forever. 201=NO_AP_FOUND, 202=AUTH_FAIL, 15=handshake timeout.
+             *
+             * Once per *reason*, not once per attempt: the retry loop tries
+             * every 30 s and an out-of-range home AP never stops failing, so
+             * repeating it says nothing new and buries everything else on the
+             * console. A changed reason is news -- the AP came back and the
+             * password is wrong -- and so is the next failure after a join
+             * that worked, which clears this. */
+            s_join_fail = e->reason;
+            sys_log(4, "WIFI     join failed, reason %d (201=no AP 202=auth "
                        "15=bad key)", e->reason);
         }
         /* No reconnect from here: the retry loop in net_wifi_task owns the
@@ -214,9 +223,10 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
 static void on_sta_got_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     const ip_event_got_ip_t *e = data;
-    s_sta_ip4 = e->ip_info.ip.addr;
-    s_state   = NET_WIFI_STA;
-    tui_log(1, "WIFI     upstream " IPSTR "  gw " IPSTR,
+    s_sta_ip4   = e->ip_info.ip.addr;
+    s_state     = NET_WIFI_STA;
+    s_join_fail = -1;
+    sys_log(1, "WIFI     upstream " IPSTR "  gw " IPSTR,
             IP2STR(&e->ip_info.ip), IP2STR(&e->ip_info.gw));
 }
 
@@ -323,7 +333,7 @@ static void net_wifi_task(void *arg)
 
     if (wifi_bringup() != ESP_OK) {
         s_state = NET_WIFI_OFF;
-        tui_log(4, "WIFI     bring-up failed, radio unavailable");
+        sys_log(4, "WIFI     bring-up failed, radio unavailable");
         vTaskDelete(NULL);
         return;
     }

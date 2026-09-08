@@ -7,6 +7,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include "esp_heap_caps.h"
+#include "shell.h"        /* sys_log() */
 
 static class_adsb_dev *adsbdev;
 
@@ -22,7 +23,7 @@ void init_adsb_dev()
 
     esp_err_t r = usb_host_transfer_alloc(256, 0, &adsbdev->transfer);
     if (r != ESP_OK) {
-        tui_log(4, "USB      ctrl xfer alloc failed");
+        sys_log(4, "USB      ctrl xfer alloc failed");
     }
 }
 
@@ -112,10 +113,10 @@ static int bulk_xfer_init(class_driver_t *driver_obj, int length,
         s_nslots++;
     }
     if (s_nslots == 0) {
-        tui_log(4, "USB      bulk init: no xfer slots (DMA)");
+        sys_log(4, "USB      bulk init: no xfer slots (DMA)");
         return -1;
     }
-    tui_log(1, "USB      bulk %d slots x %uB (~%dms buffered)",
+    sys_log(1, "USB      bulk %d slots x %uB (~%dms buffered)",
             s_nslots, (unsigned)s_xfer_size,
             (int)((s_nslots * s_xfer_size) / 1920));
     return 0;
@@ -151,10 +152,10 @@ static void bulk_recover(class_driver_t *driver_obj, unsigned char endpoint)
         s_recover_fails = 0;
         if (++s_teardowns >= 3) {
             s_teardowns = 0;
-            tui_log(4, "USB      bulk unrecoverable, reopening RTL dev");
+            sys_log(4, "USB      bulk unrecoverable, reopening RTL dev");
             adsb_request_recover();
         } else {
-            tui_log(2, "USB      bulk repeated fails, teardown+reinit");
+            sys_log(2, "USB      bulk repeated fails, teardown+reinit");
             esp_libusb_bulk_teardown();
         }
     }
@@ -177,7 +178,7 @@ int esp_libusb_bulk_transfer(class_driver_t *driver_obj, unsigned char endpoint,
             xSemaphoreTake(s_xfer_sem[i], 0);
             if (bulk_submit(s_xfer[i], timeout) != ESP_OK) {
                 static int64_t le = 0; int64_t now = esp_timer_get_time();
-                if (now - le > 1000000LL) { tui_log(4, "USB      bulk prime failed (slot %d)", i); le = now; }
+                if (now - le > 1000000LL) { sys_log(4, "USB      bulk prime failed (slot %d)", i); le = now; }
                 bulk_recover(driver_obj, endpoint);
                 vTaskDelay(pdMS_TO_TICKS(50));
                 return -1;
@@ -189,12 +190,12 @@ int esp_libusb_bulk_transfer(class_driver_t *driver_obj, unsigned char endpoint,
     int idx = s_read_idx;
 
     if (xSemaphoreTake(s_xfer_sem[idx], pdMS_TO_TICKS(timeout + 500)) != pdTRUE) {
-        tui_log(4, "USB      bulk timeout (slot %d)", idx);
+        sys_log(4, "USB      bulk timeout (slot %d)", idx);
         bulk_recover(driver_obj, endpoint);
         return -1;
     }
     if (!s_xfer_ok[idx]) {
-        tui_log(2, "USB      bulk STALL/fail (slot %d)", idx);
+        sys_log(2, "USB      bulk STALL/fail (slot %d)", idx);
         bulk_recover(driver_obj, endpoint);
         vTaskDelay(pdMS_TO_TICKS(20));
         return -1;
@@ -209,7 +210,7 @@ int esp_libusb_bulk_transfer(class_driver_t *driver_obj, unsigned char endpoint,
     xSemaphoreTake(s_xfer_sem[idx], 0);
     if (bulk_submit(s_xfer[idx], timeout) != ESP_OK) {
         static int64_t lr = 0; int64_t now = esp_timer_get_time();
-        if (now - lr > 1000000LL) { tui_log(4, "USB      bulk repost failed (slot %d)", idx); lr = now; }
+        if (now - lr > 1000000LL) { sys_log(4, "USB      bulk repost failed (slot %d)", idx); lr = now; }
         bulk_recover(driver_obj, endpoint);
         return 0;
     }
@@ -340,17 +341,17 @@ static void stream_pump_task(void *arg)
             if (s_streaming && bytes == 0 && drops == 0) {
                 ovf_secs = 0;
                 stall_secs++;
-                tui_log(2, "USB      stream stalled %ds, re-priming", stall_secs);
+                sys_log(2, "USB      stream stalled %ds, re-priming", stall_secs);
                 stream_reprime();
                 if (stall_secs >= 5) {
-                    tui_log(4, "USB      pump dead %ds, reopening RTL dev", stall_secs);
+                    sys_log(4, "USB      pump dead %ds, reopening RTL dev", stall_secs);
                     stall_secs = 0;
                     adsb_request_recover();
                 }
             } else {
                 stall_secs = 0;
                 if (drops && ++ovf_secs >= 10) {
-                    tui_log(2, "IQ       ring full, consumer behind (%lu KB/s lost)",
+                    sys_log(2, "IQ       ring full, consumer behind (%lu KB/s lost)",
                             (unsigned long)(drops / 1024));
                     ovf_secs = 0;
                 } else if (!drops) {
@@ -382,10 +383,10 @@ int esp_libusb_stream_start(class_driver_t *driver_obj, unsigned char endpoint)
 #else
         s_sring = malloc(STREAM_RING_SIZE);
 #endif
-        if (!s_sring) { tui_log(4, "USB      stream ring alloc failed"); return -1; }
+        if (!s_sring) { sys_log(4, "USB      stream ring alloc failed"); return -1; }
     }
     if (!s_squeue) s_squeue = xQueueCreate(STREAM_XFER_NUM * 2, sizeof(int));
-    if (!s_squeue) { tui_log(4, "USB      stream queue alloc failed"); return -1; }
+    if (!s_squeue) { sys_log(4, "USB      stream queue alloc failed"); return -1; }
     xQueueReset(s_squeue);
     s_shead = s_stail = 0; s_sdropped = 0;
     s_sdev = driver_obj->dev_hdl; s_sep = endpoint;
@@ -408,8 +409,8 @@ int esp_libusb_stream_start(class_driver_t *driver_obj, unsigned char endpoint)
         }
         posted++;
     }
-    if (posted == 0) { s_streaming = false; tui_log(4, "USB      stream: 0 xfers posted"); return -1; }
-    tui_log(1, "USB      stream: %d x %dB posted, %uKB ring, pump up",
+    if (posted == 0) { s_streaming = false; sys_log(4, "USB      stream: 0 xfers posted"); return -1; }
+    sys_log(1, "USB      stream: %d x %dB posted, %uKB ring, pump up",
             posted, STREAM_XFER_LEN, (unsigned)(STREAM_RING_SIZE / 1024));
     return 0;
 }
@@ -488,18 +489,18 @@ static int ctrl_transfer_locked(class_driver_t *driver_obj, uint8_t bm_req_type,
 
     esp_err_t r = usb_host_transfer_submit_control(driver_obj->client_hdl, adsbdev->transfer);
     if (r != ESP_OK) {
-        tui_log(4, "USB      ctrl xfer submit failed: %d", r);
+        sys_log(4, "USB      ctrl xfer submit failed: %d", r);
         vTaskDelay(pdMS_TO_TICKS(50));
         return -1;
     }
 
     if (xSemaphoreTake(adsbdev->done_sem, pdMS_TO_TICKS(timeout + 500)) != pdTRUE) {
-        tui_log(4, "USB      ctrl xfer timed out");
+        sys_log(4, "USB      ctrl xfer timed out");
         return -1;
     }
 
     if (!adsbdev->is_success) {
-        tui_log(2, "USB      ctrl xfer STALL/fail");
+        sys_log(2, "USB      ctrl xfer STALL/fail");
         vTaskDelay(pdMS_TO_TICKS(50));
         return -1;
     }
@@ -520,7 +521,7 @@ int esp_libusb_control_transfer(class_driver_t *driver_obj, uint8_t bm_req_type,
     /* Held across submit *and* the done_sem wait: the shared slot is only free
      * once the reply has been copied out. */
     if (xSemaphoreTake(adsbdev->ctrl_mux, pdMS_TO_TICKS(timeout + 1000)) != pdTRUE) {
-        tui_log(4, "USB      ctrl xfer busy");
+        sys_log(4, "USB      ctrl xfer busy");
         return -1;
     }
     int r = ctrl_transfer_locked(driver_obj, bm_req_type, b_request,

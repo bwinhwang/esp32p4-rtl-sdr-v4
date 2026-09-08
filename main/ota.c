@@ -26,7 +26,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#include "esp_libusb.h"   /* tui_log() */
+#include "shell.h"       /* sys_log() */
 #include "ota.h"
 
 static const char *TAG = "ota";
@@ -54,7 +54,7 @@ static void confirm_task(void *arg)
     esp_ota_img_states_t st;
     if (esp_ota_get_state_partition(run, &st) == ESP_OK && st == ESP_OTA_IMG_PENDING_VERIFY) {
         esp_ota_mark_app_valid_cancel_rollback();
-        tui_log(1, "OTA      %s confirmed valid, rollback cancelled", run->label);
+        sys_log(1, "OTA      %s confirmed valid, rollback cancelled", run->label);
     }
     vTaskDelete(NULL);
 }
@@ -110,7 +110,7 @@ static esp_err_t ota_post(httpd_req_t *req)
     int    remaining = req->content_len;
     size_t total     = 0;
     int    idle      = 0;
-    tui_log(1, "OTA      receiving %d bytes -> %s", remaining, target->label);
+    sys_log(1, "OTA      receiving %d bytes -> %s", remaining, target->label);
 
     while (remaining > 0) {
         int want = remaining < OTA_RECV_BUF ? remaining : OTA_RECV_BUF;
@@ -125,7 +125,7 @@ static esp_err_t ota_post(httpd_req_t *req)
             if (++idle >= OTA_RECV_IDLE_MAX) {
                 free(buf);
                 esp_ota_abort(handle);
-                tui_log(4, "OTA      upload stalled after %u bytes, aborted", (unsigned)total);
+                sys_log(4, "OTA      upload stalled after %u bytes, aborted", (unsigned)total);
                 httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT, "upload stalled");
                 return ESP_FAIL;
             }
@@ -171,7 +171,7 @@ static esp_err_t ota_post(httpd_req_t *req)
     int  n = snprintf(msg, sizeof(msg), "ok, %u bytes -> %s, rebooting\n",
                        (unsigned)total, target->label);
     httpd_resp_send(req, msg, n);
-    tui_log(1, "OTA      %u bytes flashed to %s, rebooting", (unsigned)total, target->label);
+    sys_log(1, "OTA      %u bytes flashed to %s, rebooting", (unsigned)total, target->label);
 
     vTaskDelay(pdMS_TO_TICKS(300));   /* let the response leave the socket first */
     esp_restart();

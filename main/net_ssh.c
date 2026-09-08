@@ -97,20 +97,27 @@ static size_t ring_used(void)
     return (s_head - s_tail) % OUT_RING_SZ;
 }
 
-static void ring_push(const uint8_t *data, size_t n)
+/* Returns how many bytes were accepted. The two callers want opposite things
+ * from a short push: a log line is dropped (never block a logger on the
+ * network), a frame waits for room -- see net_ssh_tui_write(). */
+static size_t ring_push(const uint8_t *data, size_t n)
 {
-    if (!s_ring || xSemaphoreTake(s_ring_mux, 0) != pdTRUE) {
-        s_ring_dropped += n;    /* never block a logger on the network */
-        return;
-    }
+    if (!s_ring || xSemaphoreTake(s_ring_mux, 0) != pdTRUE) return 0;
+
     size_t space = OUT_RING_SZ - 1 - ring_used();
-    if (n > space) { s_ring_dropped += n - space; n = space; }
+    if (n > space) n = space;
 
     for (size_t i = 0; i < n; i++) {
         s_ring[s_head] = data[i];
         s_head = (s_head + 1) % OUT_RING_SZ;
     }
     xSemaphoreGive(s_ring_mux);
+    return n;
+}
+
+static void log_push(const uint8_t *data, size_t n)
+{
+    s_ring_dropped += (uint32_t)(n - ring_push(data, n));
 }
 
 static size_t ring_pop(uint8_t *dst, size_t max)
@@ -132,6 +139,35 @@ static void ring_reset(void)
     s_head = s_tail = 0;
     s_ring_dropped  = 0;
     xSemaphoreGive(s_ring_mux);
+}
+
+#define TUI_STALL_MS  200
+
+/* The display's frame, straight from fb_flush() in class_driver.c: ~20 KB per
+ * repaint, already CRLF-expanded, bypassing stdout for the same reason it
+ * bypasses the UART VFS on the serial side -- stdio and the VFS both cost per
+ * call, not per byte, and a frame is thousands of calls.
+ *
+ * A frame must not be dropped a piece at a time the way a log line can: what
+ * would be lost is half an ANSI escape, and the screen then stays wrong until
+ * the next repaint. So this waits for room -- the draw task is priority 2 and
+ * has nowhere to be. It waits with a bound because the task that drains this
+ * ring is also the one that processes the keystroke leaving the display: if it
+ * is stuck in ssh_channel_write() against a client that stopped reading, room
+ * is never coming. */
+void net_ssh_tui_write(const char *data, size_t n)
+{
+    if (!s_ring || net_ssh_state() != NET_SSH_SESSION) return;
+
+    for (int waited = 0; n > 0; ) {
+        size_t did = ring_push((const uint8_t *)data, n);
+        data += did;
+        n    -= did;
+        if (n == 0) break;
+        if (waited >= TUI_STALL_MS) { s_ring_dropped += (uint32_t)n; return; }
+        vTaskDelay(pdMS_TO_TICKS(10));
+        waited += 10;
+    }
 }
 
 /* The funopen() stream stdout is pointed at. Allocated once and never closed:
@@ -201,11 +237,11 @@ static int out_write(void *cookie, const char *data, int n)
     for (int i = 0; i < n; i++) {
         if (data[i] != '\n') continue;
         if ((i > 0 ? data[i - 1] : prev) == '\r') continue;   /* already CRLF */
-        if (i > start) ring_push((const uint8_t *)data + start, (size_t)(i - start));
-        ring_push((const uint8_t *)"\r\n", 2);
+        if (i > start) log_push((const uint8_t *)data + start, (size_t)(i - start));
+        log_push((const uint8_t *)"\r\n", 2);
         start = i + 1;
     }
-    if (n > start) ring_push((const uint8_t *)data + start, (size_t)(n - start));
+    if (n > start) log_push((const uint8_t *)data + start, (size_t)(n - start));
 
     prev = data[n - 1];
     return n;                   /* drops are counted, not reported as errors */
@@ -640,6 +676,7 @@ static void ssh_task(void *arg)
         }
         s_state = NET_SSH_LISTEN;
         strlcpy(s_peer, "---", sizeof(s_peer));
+        s_cols = s_rows = 0;    /* the next client's cb_pty fills these in */
 
         ssh_session session = ssh_new();
         if (!session) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
@@ -745,6 +782,8 @@ static int cmd_ssh(int argc, char **argv)
 net_ssh_state_t net_ssh_state(void) { return s_state; }
 
 void net_ssh_peer_str(char *dst, size_t n) { strlcpy(dst, s_peer, n); }
+
+int net_ssh_pty_cols(void) { return s_cols; }
 
 void net_ssh_user_str(char *dst, size_t n)
 {

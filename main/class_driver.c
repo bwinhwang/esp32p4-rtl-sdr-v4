@@ -20,7 +20,6 @@
 #include "usb/usb_host.h"
 #include "driver/i2s_std.h"
 #include "driver/i2c_master.h"
-#include "driver/uart.h"
 #include "esp_codec_dev.h"
 #include "esp_codec_dev_defaults.h"
 #include "es8311_codec.h"
@@ -133,7 +132,17 @@ typedef struct {
 typedef struct {
     char    text[80];
     uint8_t color;
+    uint8_t facility;   /* LOG_SYS / LOG_AIR -- see the echo filter below */
 } log_entry_t;
+
+/* Where a line belongs, which is not the same question as how bad it is (that
+ * is the colour). The board's events are the ones somebody at a prompt is
+ * waiting for; the sky's are the display's subject matter; the display's own
+ * answers to a keystroke are meaningful only to whoever pressed it, and would
+ * otherwise land in the *other* transport's prompt. */
+#define LOG_SYS  0
+#define LOG_AIR  1
+#define LOG_UI   2
 
 /* ── audio events ────────────────────────────────────────────────────────── */
 typedef enum {
@@ -520,16 +529,20 @@ static bool cpr_decode(aircraft_t *a)
  * LOG / AIRCRAFT HELPERS
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/* Receiver events go to the TUI's LOG panel, and -- while the display is not
- * in front -- to the console as they happen, filtered by this. ADSB_ECHO_ALL
- * is what the panel shows and is unusable at a prompt with an antenna
- * connected: on_msg() logs an ALT or VEL line for every decoded frame, several
- * a second. ADSB_ECHO_BRIEF keeps the colours that mark an event rather than a
- * measurement -- 1 (first contact, bring-up) and 4 (anything wrong).
+/* Every event goes to the LOG panel; this decides which of them also reach a
+ * console at a prompt. The ladder is by facility rather than by severity,
+ * because that is the distinction that matters at a prompt: the board's own
+ * events are rare and are what the user is waiting for, while the sky's arrive
+ * several a second with an antenna connected -- on_msg() logs an ALT or VEL
+ * line per decoded frame -- and are already on screen in the display.
+ *
+ * BRIEF is the middle ground: board events plus the two aircraft lines that
+ * mark an event rather than a measurement, colours 1 (first contact) and 4
+ * (lost). See shell.h for the levels themselves.
  *
  * It starts at ALL so a failure during boot -- USB enumeration, tuner
- * bring-up -- is not silent, and shell_console_start() drops it to BRIEF once
- * the prompt is up. `log tail` shows the ring either way. */
+ * bring-up -- is not silent, and shell_console_start() drops it to the default
+ * once the prompt is up. `log tail` shows the ring either way. */
 static volatile int s_log_echo = ADSB_ECHO_ALL;
 
 void adsb_log_echo_set(int level) { s_log_echo = level; }
@@ -548,25 +561,56 @@ void adsb_log_dump(int n)
     }
 }
 
-void tui_log(uint8_t color, const char *fmt, ...)
+static bool echo_wanted(uint8_t facility, uint8_t color)
 {
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(s_log[s_log_head % LOG_LINES].text,
-              sizeof(s_log[0].text), fmt, ap);
-    va_end(ap);
-    s_log[s_log_head % LOG_LINES].color = color;
+    switch (s_log_echo) {
+        case ADSB_ECHO_ALL:   return true;
+        case ADSB_ECHO_BRIEF: return facility == LOG_AIR ? (color == 1 || color == 4)
+                                                        : facility == LOG_SYS;
+        case ADSB_ECHO_SYS:   return facility == LOG_SYS;
+        default:              return false;
+    }
+}
+
+static void log_put(uint8_t facility, uint8_t color, const char *fmt, va_list ap)
+{
+    log_entry_t *e = &s_log[s_log_head % LOG_LINES];
+
+    vsnprintf(e->text, sizeof(e->text), fmt, ap);
+    e->color    = color;
+    e->facility = facility;
     s_log_head++;
     s_dirty = true;
 
-    int  lvl  = s_log_echo;
-    bool echo = (lvl >= ADSB_ECHO_ALL) ||
-                (lvl == ADSB_ECHO_BRIEF && (color == 1 || color == 4));
+    /* Not echoed while the display owns stdout: the line would land inside a
+     * half-painted frame, and the viewer is already looking at the panel it
+     * went into. */
+    if (echo_wanted(facility, color) && !shell_tui_foreground())
+        shell_async_print(e->text);
+}
 
-    if (echo && !shell_tui_foreground()) {
-        printf("%s\n", s_log[(s_log_head - 1) % LOG_LINES].text);
-        fflush(stdout);
-    }
+void sys_log(uint8_t color, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    log_put(LOG_SYS, color, fmt, ap);
+    va_end(ap);
+}
+
+void air_log(uint8_t color, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    log_put(LOG_AIR, color, fmt, ap);
+    va_end(ap);
+}
+
+void ui_log(uint8_t color, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    log_put(LOG_UI, color, fmt, ap);
+    va_end(ap);
 }
 
 static aircraft_t *find_or_create(uint32_t icao)
@@ -585,7 +629,7 @@ static aircraft_t *find_or_create(uint32_t icao)
         /* No callsign this early, but an address inside a military block is
          * already enough to classify -- and that is the one worth flagging. */
         empty->category = plane_classify(icao, NULL);
-        tui_log(1, "CONTACT  %06lX  first squawk  %s", (unsigned long)icao,
+        air_log(1, "CONTACT  %06lX  first squawk  %s", (unsigned long)icao,
                 plane_cat_label(empty->category));
         audio_play(AUDIO_EVT_NEW_CONTACT);
     }
@@ -599,7 +643,7 @@ static int active_count(void)
     for (int i = 0; i < MAX_TRACKED; i++) {
         if (!s_aircraft[i].active) continue;
         if (now - s_aircraft[i].last_seen_us > 60000000LL) {
-            tui_log(4, "LOST     %06lX  (%s)",
+            air_log(4, "LOST     %06lX  (%s)",
                     (unsigned long)s_aircraft[i].icao,
                     s_aircraft[i].callsign[0] ?
                         s_aircraft[i].callsign : "--------");
@@ -685,14 +729,12 @@ size_t aircraft_export_ndjson(char *buf, size_t bufsize)
  * calls uart_write_bytes(&c, 1) for each -- a mutex take/give and a ringbuf
  * send per byte, ~20000 per frame.
  *
- * So the frame is assembled here with memcpy and handed to uart_write_bytes()
- * in whole runs, CRLF expanded by hand: stdio and the VFS are both out of the
- * path. This is why neither -O2 nor setvbuf ever moved the number -- the cost
- * was inside prebuilt libc and IDF, and it was never the write count.
- * printf() elsewhere (ESP_LOG, boot) still goes the normal way.
+ * So the frame is assembled here with memcpy and handed to the sinks in whole
+ * runs, CRLF expanded by hand: stdio and the VFS are both out of the path.
+ * This is why neither -O2 nor setvbuf ever moved the number -- the cost was
+ * inside prebuilt libc and IDF, and it was never the write count. printf()
+ * elsewhere (ESP_LOG, boot) still goes the normal way.
  * ───────────────────────────────────────────────────────────────────────── */
-
-#define CONSOLE_UART  ((uart_port_t)CONFIG_ESP_CONSOLE_UART_NUM)
 
 static char s_fb[4096];
 static int  s_fb_len;
@@ -702,6 +744,61 @@ static int  s_fb_len;
  * per-second totals of frames, bytes, time assembling and time writing. */
 static uint32_t s_pf_bytes, s_pf_out_us;                        /* this frame */
 static uint32_t s_pr_fps, s_pr_bytes, s_pr_out_ms, s_pr_asm_ms; /* last second*/
+
+/* ── frame sinks ──────────────────────────────────────────────────────────
+ * Who is watching, and nothing about what they are. shell.c attaches the
+ * transport whose `tui` ran; see the service contract in shell.h.
+ *
+ * No lock, by the same discipline the rest of the display uses: `fn` is the
+ * slot's published flag, so attach writes it last and detach clears it first,
+ * and detach is followed by adsb_tui_hold() to wait out a run already in
+ * flight. Reading it per run rather than once per frame is what bounds that
+ * wait -- for the SSH sink the task calling detach is also the one draining
+ * the ring the sink would otherwise sit waiting for room in, so it has to stop
+ * being called at the next run and not at the end of the repaint. Whatever it
+ * was already sent is wiped by the clear-screen the leaver prints anyway. */
+#define TUI_MAX_SINKS  2
+
+static struct {
+    tui_sink_fn volatile fn;    /* NULL = free slot */
+    void                *ctx;
+} s_sinks[TUI_MAX_SINKS];
+
+static bool sinks_attached(void)
+{
+    for (int i = 0; i < TUI_MAX_SINKS; i++)
+        if (s_sinks[i].fn) return true;
+    return false;
+}
+
+/* Not thread-safe against a concurrent attach, and does not need to be: the
+ * only callers are the two `tui` commands, and shell.c's exclusive console
+ * ownership means at most one of them is ever running. A viewer attached from
+ * some other task would have to bring its own serialisation. */
+bool tui_attach(tui_sink_fn fn, void *ctx)
+{
+    for (int i = 0; i < TUI_MAX_SINKS; i++) {
+        if (s_sinks[i].fn) continue;
+        s_sinks[i].ctx = ctx;
+        s_sinks[i].fn  = fn;    /* last: this is what publishes the slot */
+        return true;
+    }
+    return false;
+}
+
+void tui_detach(tui_sink_fn fn, void *ctx)
+{
+    for (int i = 0; i < TUI_MAX_SINKS; i++)
+        if (s_sinks[i].fn == fn && s_sinks[i].ctx == ctx) s_sinks[i].fn = NULL;
+}
+
+static void fb_out(const char *p, size_t n)
+{
+    for (int i = 0; i < TUI_MAX_SINKS; i++) {
+        tui_sink_fn fn = s_sinks[i].fn;
+        if (fn) fn(s_sinks[i].ctx, p, n);
+    }
+}
 
 static void fb_flush(void)
 {
@@ -716,9 +813,9 @@ static void fb_flush(void)
     while (rem > 0) {
         const char *nl  = memchr(p, '\n', (size_t)rem);
         int         run = nl ? (int)(nl - p) : rem;
-        if (run > 0) uart_write_bytes(CONSOLE_UART, p, (size_t)run);
+        if (run > 0) fb_out(p, (size_t)run);
         if (!nl) break;
-        uart_write_bytes(CONSOLE_UART, "\r\n", 2);
+        fb_out("\r\n", 2);
         p    = nl + 1;
         rem -= run + 1;
     }
@@ -1203,10 +1300,11 @@ static void render_tasks(char panel[RADAR_ROWS][RADAR_COLS + 1])
 
 static void tui_draw(void)
 {
-    /* The display is a foreground application on the serial console: with the
-     * shell in front, a repaint would land on top of whatever the user is
-     * typing, and both write the same UART. */
-    if (!shell_tui_foreground()) return;
+    /* The display is a foreground application on each transport: with a shell
+     * in front instead, a repaint would land on top of whatever that user is
+     * typing. One frame is assembled here and fb_flush() hands it to every
+     * sink that asked for it. */
+    if (!sinks_attached()) return;
 
     int64_t now = esp_timer_get_time();
     if ((now - s_last_draw) < (TUI_REFRESH_MS * 1000LL)) return;
@@ -1216,7 +1314,7 @@ static void tui_draw(void)
         xSemaphoreTake(s_paint_lock, portMAX_DELAY);
         /* The foreground can have changed while this waited -- adsb_tui_hold()
          * is the other side of this lock and gives it back straight away. */
-        if (!shell_tui_foreground()) { xSemaphoreGive(s_paint_lock); return; }
+        if (!sinks_attached()) { xSemaphoreGive(s_paint_lock); return; }
     }
 
     /* The frame goes straight to the UART, so anything another task left in
@@ -1535,19 +1633,35 @@ static void tui_draw(void)
     sep_split();
 
     /* event log */
+    static const char hdr[] = "  EVENT LOG   aircraft only -- the board logs to the console";
     row_begin();
-    fb_printf(PH_DIM "  EVENT LOG"); sp(LEFT_W - 11);
+    fb_printf(PH_DIM "%s", hdr); sp(LEFT_W - (int)sizeof(hdr) + 1);
     fb_printf(PH_GRID VL RESET); sp(RADAR_COLS);
     row_end();
 
+    /* Seven lines for the sky and for whatever the display said back to a
+     * keystroke -- LOG_SYS is deliberately not among them. The header row
+     * already carries ETH, WIFI and FEED and the radar panel carries USB drop,
+     * so the board's state is on screen continuously; what a board line adds
+     * here is a link retrying on a timer pushing the aircraft off the panel
+     * every 30 s. They go to the console instead, and `log tail` still shows
+     * everything in one stream. */
+    int shown[LOG_SHOW];
+    int nshown = 0;
+    for (int back = 0; back < LOG_LINES && nshown < LOG_SHOW; back++) {
+        int idx = (s_log_head - 1 - back + LOG_LINES * 2) % LOG_LINES;
+        if (!s_log[idx].text[0] || s_log[idx].facility == LOG_SYS) continue;
+        shown[nshown++] = idx;       /* newest first; drawn bottom-up below */
+    }
+
     static const char *log_cols[] = { PH_DIM, PH_HI, AC_AMBER, AC_CYAN, AC_RED };
-    for (int i = LOG_SHOW - 1; i >= 0; i--) {
-        int idx = (s_log_head - 1 - i + LOG_LINES * 2) % LOG_LINES;
+    for (int row = LOG_SHOW - 1; row >= 0; row--) {
         row_begin();
         fb_printf("  ");
-        if (s_log[idx].text[0]) {
-            int tlen = (int)strnlen(s_log[idx].text, sizeof(s_log[0].text));
-            fb_printf("%s%s" RESET, log_cols[s_log[idx].color], s_log[idx].text);
+        if (row < nshown) {
+            const log_entry_t *e = &s_log[shown[row]];
+            int tlen = (int)strnlen(e->text, sizeof(e->text));
+            fb_printf("%s%s" RESET, log_cols[e->color], e->text);
             sp(LEFT_W - 2 - tlen);
         } else {
             fb_printf(PH_DIM "~" RESET); sp(LEFT_W - 3);
@@ -1614,7 +1728,7 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
         for (int i = 7; i >= 0 && a->callsign[i] == ' '; i--)
             a->callsign[i] = '\0';
         a->category = plane_classify(icao, a->callsign);
-        tui_log(2, "IDENT    %06lX  %s  %s", (unsigned long)icao, a->callsign,
+        air_log(2, "IDENT    %06lX  %s  %s", (unsigned long)icao, a->callsign,
                 plane_cat_label(a->category));
     }
 
@@ -1644,7 +1758,7 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
             a->cpr_odd  = (cpr_frame_t){ mm->raw_latitude, mm->raw_longitude, ts, true };
         bool was_valid = a->pos_valid;
         if (cpr_decode(a) && !was_valid) {
-            tui_log(3, "FIX      %06lX  %+.4f  %+.4f",
+            air_log(3, "FIX      %06lX  %+.4f  %+.4f",
                     (unsigned long)icao, a->lat, a->lon);
             audio_play(AUDIO_EVT_POSITION);
         }
@@ -1652,9 +1766,9 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
 
     if (mm->msgtype == 17) {
         if (mm->metype >= 9 && mm->metype <= 18 && mm->altitude)
-            tui_log(0, "ALT      %06lX  %d ft", (unsigned long)icao, a->altitude);
+            air_log(0, "ALT      %06lX  %d ft", (unsigned long)icao, a->altitude);
         else if (mm->metype >= 19 && mm->metype <= 22 && mm->velocity)
-            tui_log(0, "VEL      %06lX  %d kt  hdg=%d  vs=%d",
+            air_log(0, "VEL      %06lX  %d kt  hdg=%d  vs=%d",
                     (unsigned long)icao, a->velocity, a->heading, a->vert_rate);
     }
 }
@@ -1707,7 +1821,7 @@ static void inject_fake_aircraft(void)
     a->heading   =        ((seq *   53) % 360);
     a->vert_rate = -1600 + ((seq *  448) % 3200);
 
-    tui_log(3, "FAKE     %06lX  %s  %s", (unsigned long)a->icao,
+    air_log(3, "FAKE     %06lX  %s  %s", (unsigned long)a->icao,
             a->callsign[0] ? a->callsign : "--------",
             plane_cat_label(a->category));
 
@@ -1784,14 +1898,14 @@ void adsb_tui_key(uint8_t key)
     switch (key) {
         case 'r': case 'R':
             s_panel_mode = (s_panel_mode + 1) % 3;
-            tui_log(3, "PANEL    switched to %s",
+            ui_log(3, "PANEL    switched to %s",
                     s_panel_mode == 0 ? "RADAR"
                   : s_panel_mode == 1 ? "WATERFALL" : "TASKS");
             s_dirty = true;
             break;
         case 'm': case 'M':
             s_muted = !s_muted;
-            tui_log(2, "AUDIO    %s", s_muted ? "muted" : "unmuted");
+            ui_log(2, "AUDIO    %s", s_muted ? "muted" : "unmuted");
             s_dirty = true;
             break;
         case '+': case '=':
@@ -1825,7 +1939,7 @@ void adsb_rx_task(void *arg)
     s_start_us = esp_timer_get_time();
     s_rate_ts  = s_start_us;
 
-    tui_log(1, "INIT     adsb_rx running on CPU1");
+    sys_log(1, "INIT     adsb_rx running on CPU1");
 
     {
         enum rtlsdr_tuner tt = rtlsdr_get_tuner_type(rtldev);
@@ -1834,7 +1948,7 @@ void adsb_rx_task(void *arg)
         uint32_t sr   = rtlsdr_get_sample_rate(rtldev);
         uint32_t ref  = rtlsdr_get_tuner_xtal(rtldev);
 
-        tui_log(lock == 1 ? 1 : 4,
+        sys_log(lock == 1 ? 1 : 4,
                 "INIT     %s %s  %lu.%03lu MHz  %lu.%03lu MSPS  ref %lu.%03lu MHz",
                 tt == RTLSDR_TUNER_R828D ? "R828D"
                     : tt == RTLSDR_TUNER_R820T ? "R820T" : "tuner",
@@ -1845,7 +1959,7 @@ void adsb_rx_task(void *arg)
     }
 
     uint8_t *buffer = malloc(DEFAULT_BUF_LENGTH);
-    if (!buffer) { tui_log(4, "OOM rx buffer"); vTaskDelete(NULL); return; }
+    if (!buffer) { sys_log(4, "OOM rx buffer"); vTaskDelete(NULL); return; }
 
     bool full_buffer = false;
     mode_s_init(&state);
@@ -1856,7 +1970,7 @@ void adsb_rx_task(void *arg)
     s_rx_running = true;
 
     bool stream_started = (rtlsdr_stream_start(rtldev) == 0);
-    if (!stream_started) tui_log(4, "STREAM   start failed, retrying");
+    if (!stream_started) sys_log(4, "STREAM   start failed, retrying");
 
     int64_t last_yield = esp_timer_get_time();
 
@@ -1886,7 +2000,7 @@ void adsb_rx_task(void *arg)
             if (full_buffer) {
                 demodulate(buffer, DEFAULT_BUF_LENGTH);
             } else if (got > 0) {
-                tui_log(3, "SHORT READ  got=%d", got);
+                sys_log(3, "SHORT READ  got=%d", got);
             }
         }
 
@@ -1922,11 +2036,11 @@ static void usb_recover_task(void *arg)
 {
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        tui_log(4, "USB      pipe wedged, resetting RTL interface");
+        sys_log(4, "USB      pipe wedged, resetting RTL interface");
         if (rtldev && rtlsdr_reset_interface(rtldev) == 0) {
-            tui_log(2, "USB      interface reset OK");
+            sys_log(2, "USB      interface reset OK");
         } else {
-            tui_log(4, "USB      interface reset FAILED - replug dongle");
+            sys_log(4, "USB      interface reset FAILED - replug dongle");
         }
     }
 }
@@ -2078,6 +2192,8 @@ void adsb_register_shell_cmds(void)
     for (int i = 0; i < (int)(sizeof(cmds) / sizeof(cmds[0])); i++)
         ESP_ERROR_CHECK(esp_console_cmd_register(&cmds[i]));
 }
+
+int adsb_tui_cols(void) { return TERM_W + 2; }
 
 /* Called when the display comes to the foreground: wipe whatever the shell
  * left on screen and put a frame up now rather than one refresh period later. */

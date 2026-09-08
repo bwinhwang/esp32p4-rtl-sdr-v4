@@ -13,7 +13,7 @@
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "mdns.h"
-#include "esp_libusb.h"   /* tui_log() */
+#include "shell.h"       /* sys_log() */
 #include "net_eth.h"
 
 /* Lets readsb's net-connector (and anything else on the LAN) address the
@@ -57,7 +57,7 @@ static void on_eth_event(void *arg, esp_event_base_t base, int32_t id, void *dat
         esp_eth_ioctl(eth, ETH_CMD_G_SPEED, &speed);
         esp_eth_ioctl(eth, ETH_CMD_G_DUPLEX_MODE, &duplex);
         s_state = NET_ETH_LINK;
-        tui_log(1, "ETH      link up  %s Mbps %s-duplex",
+        sys_log(1, "ETH      link up  %s Mbps %s-duplex",
                 speed  == ETH_SPEED_100M  ? "100"  : "10",
                 duplex == ETH_DUPLEX_FULL ? "full" : "half");
         break;
@@ -65,7 +65,7 @@ static void on_eth_event(void *arg, esp_event_base_t base, int32_t id, void *dat
     case ETHERNET_EVENT_DISCONNECTED:
         s_ip4   = 0;
         s_state = NET_ETH_NOLINK;
-        tui_log(4, "ETH      link down");
+        sys_log(4, "ETH      link down");
         break;
     default:
         break;
@@ -77,7 +77,7 @@ static void on_got_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
     const ip_event_got_ip_t *e = data;
     s_ip4   = e->ip_info.ip.addr;
     s_state = NET_ETH_READY;
-    tui_log(1, "ETH      " IPSTR "  gw " IPSTR "  mask " IPSTR,
+    sys_log(1, "ETH      " IPSTR "  gw " IPSTR "  mask " IPSTR,
             IP2STR(&e->ip_info.ip), IP2STR(&e->ip_info.gw),
             IP2STR(&e->ip_info.netmask));
 }

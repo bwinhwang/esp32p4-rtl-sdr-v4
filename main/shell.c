@@ -22,6 +22,7 @@
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -44,6 +45,7 @@
 
 #include "shell.h"
 #include "net_eth.h"
+#include "net_ssh.h"
 #include "net_wifi.h"
 #include "feed_avr.h"
 #include "feed_beast.h"
@@ -56,6 +58,7 @@
 #define SHELL_LINE_MAX   160
 #define PROMPT           "p4> "
 #define CLS              "\033[2J\033[H"
+#define WIPE_LINE        "\r\033[K"
 #define CONSOLE_UART     ((uart_port_t)CONFIG_ESP_CONSOLE_UART_NUM)
 
 /* How long shell_remote_claim() waits for the console task to finish whatever
@@ -70,9 +73,12 @@ typedef enum { OWNER_NONE = 0, OWNER_UART, OWNER_SSH } owner_t;
 
 static volatile owner_t  s_owner;
 static volatile bool     s_tui_fg;        /* the TUI is the serial foreground */
+static volatile bool     s_tui_ssh;       /* ...and/or the session's          */
 static volatile bool     s_ready;         /* shell_console_start() has run    */
 static volatile bool     s_remote_quit;   /* the SSH user typed exit/Ctrl-D   */
+static volatile bool     s_running;       /* a command is producing output    */
 static bool              s_clear_pending; /* the TUI left a full screen       */
+static TaskHandle_t      s_console_tsk;
 
 /* Held by the console task for as long as it is touching the line buffer or
  * printing, and taken by shell_remote_claim() so an arriving SSH session can
@@ -84,7 +90,32 @@ static SemaphoreHandle_t s_lock;
 static char              s_line[SHELL_LINE_MAX];
 static int               s_len;
 
-bool shell_tui_foreground(void) { return s_tui_fg; }
+/* The transports the display can be attached to. Both write below stdio: the
+ * UART one for the reason in class_driver.c's frame-buffer comment, the SSH
+ * one because a frame must not be dropped a piece at a time. This file is
+ * where they belong -- it is already the one arbitrating between the two --
+ * and it is what keeps the display itself from knowing either exists. */
+static void uart_sink(void *ctx, const char *data, size_t n)
+{
+    (void)ctx;
+    uart_write_bytes(CONSOLE_UART, data, n);
+}
+
+static void ssh_sink(void *ctx, const char *data, size_t n)
+{
+    (void)ctx;
+    net_ssh_tui_write(data, n);
+}
+
+/* The transport holding stdout is the one an echoed log line would land on, so
+ * that is the only display state worth testing here. While the display is up
+ * on the serial console the console is unowned (see cmd_tui), which leaves
+ * s_tui_fg as the answer -- including when an SSH session is at a prompt
+ * alongside it, where echoing into the session is exactly right. */
+bool shell_tui_foreground(void)
+{
+    return (s_owner == OWNER_SSH) ? s_tui_ssh : s_tui_fg;
+}
 
 /* Writes straight to the UART, bypassing stdout. The console task's own
  * printf() is unusable in exactly the moments this is needed -- while an SSH
@@ -93,6 +124,88 @@ bool shell_tui_foreground(void) { return s_tui_fg; }
 static void uart_note(const char *s)
 {
     uart_write_bytes(CONSOLE_UART, s, strlen(s));
+}
+
+/* ── output that arrives on its own schedule ─────────────────────────────────
+ * A WiFi event, a USB stall, an esp_log line from any task in the system: all
+ * of them used to land wherever the cursor happened to be, which at a prompt
+ * means on top of a half-typed command. The line buffer was never damaged --
+ * only what the terminal showed -- so the user was left looking at wreckage
+ * and retyping a command that was still perfectly intact.
+ *
+ * So wipe the prompt line, print, and draw the prompt and the buffer again.
+ * Everything goes through stdout, which means whichever transport owns the
+ * console gets it, session included.
+ *
+ * The lock is taken with no wait, and both failure paths fall back to a plain
+ * print rather than to a redraw that would be wrong. A wait would be worse
+ * than useless: the console task holds this for as long as a command runs, so
+ * a `tasks` sampling its 1 s window would park the WiFi event task in here. */
+void shell_async_print(const char *line)
+{
+    if (!line || !*line) return;
+    if (!s_lock) { printf("%s\n", line); fflush(stdout); return; }
+
+    /* Reachable from a command's own thread -- anything a command calls may
+     * log -- and that thread already holds the lock. */
+    bool self = (xTaskGetCurrentTaskHandle() == s_console_tsk);
+    bool held = !self && xSemaphoreTake(s_lock, 0) == pdTRUE;
+
+    /* Only redraw when there is an idle prompt to redraw. A running command
+     * has the console to itself and its output is mid-line; a display in front
+     * of stdout has no prompt at all and would take the escape codes into its
+     * frame. */
+    bool at_prompt = (self || held) && s_ready && !s_running &&
+                     s_owner != OWNER_NONE && !shell_tui_foreground();
+
+    if (at_prompt) printf(WIPE_LINE);
+    printf("%s\n", line);
+    if (at_prompt) {
+        printf(PROMPT);
+        if (s_len > 0) printf("%.*s", s_len, s_line);
+    }
+    fflush(stdout);
+
+    if (held) xSemaphoreGive(s_lock);
+}
+
+/* esp_log's whole output, routed through the same path. IDF, the WiFi stack
+ * and esp_hosted all log from their own tasks and none of them knows a prompt
+ * exists; without this the fix above would cover the receiver's own events and
+ * nothing else, which is most of what actually interrupts a session.
+ *
+ * One call is one line -- esp_log_writev() formats the level, timestamp, tag
+ * and message into a single vprintf -- so the trailing newline is stripped and
+ * shell_async_print() puts it back where it belongs. Truncation only affects
+ * unusually long lines and beats a per-task heap allocation on this path.
+ *
+ * A line printed while the display is in front still lands in the frame; it is
+ * gone by the next repaint, and losing an IDF error entirely is worse. The
+ * receiver's own events do not have that problem -- they are already in the
+ * panel, so log_put() does not echo them at all in that state.
+ *
+ * The re-entry test is not theoretical caution: everything below printf() is
+ * free to log, and one such line arriving inside this hook is an unbreakable
+ * loop on a board nobody is watching. */
+static int log_vprintf(const char *fmt, va_list ap)
+{
+    static volatile TaskHandle_t s_in_log;
+
+    TaskHandle_t me = xTaskGetCurrentTaskHandle();
+    if (s_in_log == me) return 0;
+    s_in_log = me;
+
+    char buf[160];
+
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    if (n <= 0) { s_in_log = NULL; return n; }
+
+    int len = n < (int)sizeof(buf) - 1 ? n : (int)sizeof(buf) - 1;
+    while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r')) buf[--len] = '\0';
+    if (len > 0) shell_async_print(buf);
+
+    s_in_log = NULL;
+    return n;
 }
 
 /* ═════════════════════════════════════════════════════════════════════════════
@@ -257,9 +370,9 @@ static int cmd_wifi(int argc, char **argv)
 static int cmd_log(int argc, char **argv)
 {
     /* Two different logs share this command because they are one thing to the
-     * user: esp_log's per-tag levels, and the TUI's own event ring (the LOG
-     * panel), which is otherwise invisible whenever the TUI is not in front. */
-    static const char *echo_names[] = { "off", "brief", "all" };
+     * user: esp_log's per-tag levels, and the event ring behind the LOG panel,
+     * which is otherwise invisible whenever the display is not in front. */
+    static const char *echo_names[] = { "off", "sys", "brief", "all" };
 
     if (argc == 1 || strcmp(argv[1], "tail") == 0) {
         adsb_log_dump(argc >= 3 ? atoi(argv[2]) : 0);
@@ -268,23 +381,24 @@ static int cmd_log(int argc, char **argv)
     }
 
     if (strcmp(argv[1], "echo") == 0) {
-        for (int i = 0; argc == 3 && i < 3; i++) {
+        for (int i = 0; argc == 3 && i < 4; i++) {
             if (strcmp(argv[2], echo_names[i]) != 0) continue;
             adsb_log_echo_set(i);
-            printf("receiver log echo %s\n", echo_names[i]);
+            printf("event echo %s\n", echo_names[i]);
             return ESP_OK;
         }
-        printf("usage: log echo <off|brief|all>\n"
-               "  brief -- first contacts, bring-up and failures (default)\n"
-               "  all   -- every decode too; unusable at a prompt with traffic\n");
+        printf("usage: log echo <off|sys|brief|all>\n"
+               "  sys   -- the board only: USB, WiFi, Ethernet, OTA (default)\n"
+               "  brief -- plus first and lost contacts\n"
+               "  all   -- plus every decode; unusable at a prompt with traffic\n");
         return ESP_ERR_INVALID_ARG;
     }
 
     if (argc != 3) {
-        printf("usage: log                    -- recent receiver events\n"
-               "       log tail [n]           -- the last n of them\n"
-               "       log echo <off|brief|all> -- mirror new ones to this console\n"
-               "       log <tag|*> <level>    -- none|error|warn|info|debug|verbose\n");
+        printf("usage: log                      -- recent events\n"
+               "       log tail [n]             -- the last n of them\n"
+               "       log echo <off|sys|brief|all> -- which reach this prompt\n"
+               "       log <tag|*> <level>      -- none|error|warn|info|debug|verbose\n");
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -389,23 +503,43 @@ static int cmd_restart(int argc, char **argv)
 
 static int cmd_tui(int argc, char **argv)
 {
-    /* The TUI paints UART0 directly (fb_flush() -> uart_write_bytes), so it
-     * has nowhere to go in a session that is not the serial one. */
-    if (s_owner != OWNER_UART) {
-        printf("the display paints on the serial console; run 'tui' from there\n");
-        return ESP_ERR_INVALID_STATE;
-    }
+    int cols = (s_owner == OWNER_SSH) ? net_ssh_pty_cols() : 0;
+    if (cols > 0 && cols < adsb_tui_cols())
+        printf("note: the display is %d columns wide and this terminal is %d --"
+               " widen it or the frame wraps\n", adsb_tui_cols(), cols);
 
     printf("entering the display -- 'q', ':' or Ctrl-C returns to this prompt\n");
     fflush(stdout);
 
-    /* Releasing the console rather than holding it is what stops run_line()
-     * printing a prompt over the first frame, and lets an SSH session in while
-     * the display is up. */
-    s_tui_fg = true;
-    s_owner  = OWNER_NONE;
-    adsb_tui_resume();          /* clears the screen, forces a frame now */
+    /* Clear before attaching, never after: the draw task starts the moment a
+     * sink appears, and a frame begun first would be half-wiped by the clear
+     * that was meant to precede it. */
+    adsb_tui_resume();
+
+    if (s_owner == OWNER_SSH) {
+        /* Ownership deliberately stays: net_ssh.c still has stdout pointed at
+         * this session, so letting the serial shell settle() in behind us
+         * would send its banner and its prompt down the wire. The display
+         * needs no line buffer anyway -- only the hotkey branch in
+         * shell_remote_byte(). */
+        if (!tui_attach(ssh_sink, NULL)) goto full;
+        s_tui_ssh = true;
+    } else {
+        /* The serial side is the opposite case: releasing the console rather
+         * than holding it is what stops run_line() printing a prompt over the
+         * first frame, and lets an SSH session in while the display is up. */
+        if (!tui_attach(uart_sink, NULL)) goto full;
+        s_tui_fg = true;
+        s_owner  = OWNER_NONE;
+    }
+
     return ESP_OK;
+
+full:
+    /* Unreachable with one slot per transport, but the alternative to saying so
+     * is a display that announced itself and then never paints. */
+    printf("no free display slot\n");
+    return ESP_ERR_NO_MEM;
 }
 
 static int cmd_exit(int argc, char **argv)
@@ -436,7 +570,9 @@ static void run_line(void)
     if (s_len == 0) return;
 
     int       ret = 0;
+    s_running     = true;
     esp_err_t err = esp_console_run(s_line, &ret);
+    s_running     = false;
 
     if (err == ESP_ERR_NOT_FOUND)      printf("unknown command: %s (try 'help')\n", s_line);
     else if (err == ESP_ERR_INVALID_ARG) { /* empty line -- nothing to say */ }
@@ -451,9 +587,10 @@ static void handle_byte(uint8_t b)
         case '\n':
             run_line();
             s_len = 0;
-            /* A command may have handed the console on ('tui') or asked to
-             * close the session ('exit') -- neither wants a prompt after it. */
-            if (s_owner != OWNER_NONE && !s_remote_quit) printf(PROMPT);
+            /* A command may have opened the display ('tui' -- which hands the
+             * console on over serial and keeps it over SSH) or asked to close
+             * the session ('exit'). None of them wants a prompt after it. */
+            if (s_owner != OWNER_NONE && !s_remote_quit && !s_tui_ssh) printf(PROMPT);
             break;
 
         case 0x7f:          /* DEL */
@@ -510,19 +647,54 @@ static void settle(void)
     fflush(stdout);
 }
 
+/* True when the key means "leave the display"; anything else has already been
+ * handed to it. The leave keys are decided here rather than in class_driver.c
+ * so that ownership stays in one file, and both transports route through this
+ * so they cannot drift apart. */
+static bool tui_hotkey(uint8_t b)
+{
+    switch (b) {
+        case 'q': case 'Q':
+        case ':':
+        case 0x03:      /* Ctrl-C */
+        case 0x04:      /* Ctrl-D */
+            return true;
+        default:
+            adsb_tui_key(b);
+            return false;
+    }
+}
+
 static void leave_tui(void)
 {
+    /* An SSH session holds the console, so there is no prompt to come back to.
+     * Leaving anyway would strand the serial port on a blank screen that also
+     * takes no keys -- the console task drops them while it owns nothing --
+     * until that session happens to end. Stay in the display instead, and say
+     * why through the LOG panel, which is the one thing on this screen the
+     * user can still see. */
+    if (s_owner != OWNER_NONE) {
+        ui_log(4, "CONSOLE  held by an SSH session -- staying in the display");
+        return;
+    }
+
+    tui_detach(uart_sink, NULL);
     s_tui_fg        = false;
     s_clear_pending = true;     /* settle() wipes the frame the TUI left */
-    adsb_tui_hold();            /* but let the frame in flight finish first */
+    adsb_tui_hold();            /* but let the run in flight finish first */
+}
 
-    if (s_owner == OWNER_NONE) return;
-
-    /* An SSH session took the console while the display was up, so there is no
-     * prompt to come back to yet. Say so on the wire rather than through
-     * stdout, which is pointed at that session. */
-    uart_note("\r\n[console held by an SSH session -- the serial shell returns "
-              "when it ends]\r\n");
+/* The SSH half of leave_tui(). It prints rather than leaving that to settle():
+ * the session never gave the console up, so there is nothing for settle() to
+ * take back -- and it must not, with stdout still pointed here. */
+static void leave_tui_ssh(void)
+{
+    tui_detach(ssh_sink, NULL);
+    s_tui_ssh = false;
+    adsb_tui_hold();            /* let the run in flight finish first */
+    s_len = 0;
+    printf(CLS PROMPT);
+    fflush(stdout);
 }
 
 static void console_task(void *arg)
@@ -539,19 +711,7 @@ static void console_task(void *arg)
             if (s_owner == OWNER_UART) {
                 handle_byte(b);
             } else if (s_tui_fg) {
-                /* Display hotkeys. The keys that leave it are handled here so
-                 * that ownership stays in one file; the rest go to the TUI. */
-                switch (b) {
-                    case 'q': case 'Q':
-                    case ':':
-                    case 0x03:      /* Ctrl-C */
-                    case 0x04:      /* Ctrl-D */
-                        leave_tui();
-                        break;
-                    default:
-                        adsb_tui_key(b);
-                        break;
-                }
+                if (tui_hotkey(b)) leave_tui();
             }
             /* else: an SSH session holds the console and the display is not up
              * -- there is nothing safe to do with the byte, so drop it. */
@@ -604,6 +764,12 @@ void shell_remote_open(void)
 bool shell_remote_byte(uint8_t byte)
 {
     if (s_owner != OWNER_SSH) return false;
+
+    if (s_tui_ssh) {
+        if (tui_hotkey(byte)) leave_tui_ssh();
+        return true;            /* the display has no way to end the session */
+    }
+
     handle_byte(byte);
     return !s_remote_quit;
 }
@@ -611,6 +777,16 @@ bool shell_remote_byte(uint8_t byte)
 void shell_remote_close(void)
 {
     if (s_owner != OWNER_SSH) return;
+
+    /* Dropped without printing anything: stdout has already been restored to
+     * the serial console by now, and the ring this frame would go into is
+     * about to stop being drained. */
+    if (s_tui_ssh) {
+        tui_detach(ssh_sink, NULL);
+        s_tui_ssh = false;
+        adsb_tui_hold();
+    }
+
     s_owner       = OWNER_NONE;
     s_remote_quit = false;
     /* settle() reprints the serial prompt on the console task's next pass. */
@@ -667,7 +843,7 @@ void shell_init(void)
     reg("log",     "recent receiver events, echo control, esp_log levels",         cmd_log);
     reg("sys",     "firmware build, IDF version, uptime, reset reason",            cmd_sys);
     reg("ota",     "OTA slot/version status, or 'ota rollback' to revert",         cmd_ota);
-    reg("tui",     "open the radar display on the serial console",                 cmd_tui);
+    reg("tui",     "open the radar display on this console; 'q' returns",          cmd_tui);
     reg("restart", "reboot the board",                                             cmd_restart);
     reg("exit",    "close this session (SSH); the serial console is top level",    cmd_exit);
     reg("quit",    "alias for exit",                                               cmd_exit);
@@ -680,16 +856,20 @@ void shell_init(void)
     /* core0 at priority 3, matching web_config.c's httpd: a command may block
      * for seconds, and core1 is the demod loop. Never raise this to
      * adsb_rx_task's 5 or above. */
-    xTaskCreatePinnedToCore(console_task, "shell", 6144, NULL, 3, NULL, 0);
+    xTaskCreatePinnedToCore(console_task, "shell", 6144, NULL, 3, &s_console_tsk, 0);
+
+    /* Last, so nothing above can log through a half-built console. */
+    esp_log_set_vprintf(log_vprintf);
 }
 
 void shell_console_start(void)
 {
-    /* Boot is over, so stop mirroring every decode to the console: with an
-     * antenna connected they arrive several times a second and the prompt
-     * becomes unusable. First contacts, bring-up and failures still come
-     * through; `log tail` shows the rest, `log echo all` puts it all back. */
-    adsb_log_echo_set(ADSB_ECHO_BRIEF);
+    /* Boot is over, so stop mirroring the sky to the console: with an antenna
+     * connected those arrive several times a second and are on screen in the
+     * display anyway. The board keeps talking -- USB, WiFi, Ethernet, OTA --
+     * which is what a prompt is for. `log echo brief` adds first and lost
+     * contacts back, `log echo all` the rest, `log tail` shows it regardless. */
+    adsb_log_echo_set(ADSB_ECHO_SYS);
 
     s_ready = true;     /* the console task's settle() prints the first prompt */
 }

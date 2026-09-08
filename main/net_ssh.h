@@ -51,6 +51,16 @@ net_ssh_state_t net_ssh_state(void);
 /* Peer address of the current session, or "---". */
 void net_ssh_peer_str(char *dst, size_t n);
 
+/* Terminal width the client asked for, 0 if it never requested a PTY or no
+ * session is up. The radar wants a wide window, so `tui` warns on a narrow
+ * one rather than letting the frame wrap into nonsense. */
+int net_ssh_pty_cols(void);
+
+/* One already-CRLF-expanded run of the display's frame, from fb_flush(). Not
+ * a general output path: it bypasses stdout, and it blocks briefly when the
+ * ring is full instead of dropping. No-op when no session is up. */
+void net_ssh_tui_write(const char *data, size_t n);
+
 /* Username the server will accept ("---" when no credentials are stored). */
 void net_ssh_user_str(char *dst, size_t n);
 

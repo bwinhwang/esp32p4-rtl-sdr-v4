@@ -20,7 +20,7 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
-#include "esp_libusb.h"   /* tui_log() */
+#include "shell.h"       /* sys_log() */
 #include "net_eth.h"
 #include "net_wifi.h"
 #include "ota.h"
@@ -195,7 +195,7 @@ static esp_err_t wifi_post(httpd_req_t *req)
                             esp_err_to_name(err));
         return ESP_FAIL;
     }
-    tui_log(1, "WEB      upstream SSID set to \"%s\"", ssid[0] ? ssid : "(none)");
+    sys_log(1, "WEB      upstream SSID set to \"%s\"", ssid[0] ? ssid : "(none)");
 
     /* 303 so a reload of the result page is a GET, not a re-POST. */
     httpd_resp_set_status(req, "303 See Other");

@@ -84,9 +84,11 @@ needs it.
 *TUI is a rough Draft and will be expanded
 - **ADS-B decoder** using the mode-s library, decoding DF17 extended squitter messages
 - **Console REPL** on the serial port (and over SSH) — aircraft table, USB/tuner state, task CPU, heap, network and WiFi setup, all without a host tool
-- **Live TUI** rendered via ANSI escape codes directly in the ESP-IDF serial monitor — no host software required; opened with the `tui` command
+- **Live TUI** rendered via ANSI escape codes — no host software required; opened with the `tui` command in the ESP-IDF serial monitor, over SSH, or both at once
 - **Aircraft tracking table** showing ICAO address, callsign, altitude, ground speed, heading, EW/NS velocity components, vertical rate, and message count
 - **Event log** showing new contacts, lost contacts, identification, altitude, and velocity events
+  — split by facility, so a console prompt gets the board's events (USB, WiFi, Ethernet, OTA) while
+  the aircraft traffic stays in the display; `log echo <off|sys|brief|all>` moves the line
 - **Decode quality bars** [CURRENTLY BUGGED] — showing decode rate and CRC error rate in real time
 - **60-second contact timeout** — aircraft are removed from the table if no messages are received for 60 seconds
 
@@ -121,7 +123,8 @@ step needed anymore.
 The serial monitor comes up at a `p4> ` command prompt — the same console the
 SSH server serves — so the board is usable with no dongle, no antenna and no
 network. `help` lists the commands; `tui` opens the live display once the
-dongle enumerates and the tuner locks, and `q` there returns to the prompt.
+dongle enumerates and the tuner locks, and `q` there returns to the prompt. It
+works the same way in an SSH session — the display needs a 156-column window.
 Press `ctrl+]` to exit the monitor itself.
 
 ---
