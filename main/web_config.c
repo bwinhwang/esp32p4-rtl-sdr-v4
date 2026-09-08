@@ -15,12 +15,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "esp_app_desc.h"
 #include "esp_check.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_ota_ops.h"
 #include "esp_libusb.h"   /* tui_log() */
 #include "net_eth.h"
 #include "net_wifi.h"
+#include "ota.h"
 #include "web_config.h"
 
 /* Defined in class_driver.c; same extern-rather-than-header approach the feed
@@ -112,17 +115,22 @@ static esp_err_t root_get(httpd_req_t *req)
                      : ws == NET_WIFI_INIT ? "starting"
                                            : "off";
 
+    const esp_app_desc_t *app  = esp_app_get_description();
+    const esp_partition_t *run = esp_ota_get_running_partition();
+
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_send_chunk(req, PAGE_HEAD, HTTPD_RESP_USE_STRLEN);
 
     snprintf(row, sizeof(row),
         "<table>"
+        "<tr><td>Firmware</td><td>%s (%s)</td></tr>"
         "<tr><td>Ethernet</td><td>%s</td></tr>"
         "<tr><td>WiFi</td><td>%s</td></tr>"
         "<tr><td>SoftAP clients</td><td>%d</td></tr>"
         "<tr><td>Upstream SSID</td><td>%s</td></tr>"
         "<tr><td>Upstream IP</td><td>%s</td></tr>"
         "</table>",
+        app->version, run->label,
         eth_ip, wtxt, net_wifi_ap_clients(),
         esc[0] ? esc : "<i>not configured</i>", sta_ip);
     httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
@@ -139,7 +147,9 @@ static esp_err_t root_get(httpd_req_t *req)
     httpd_resp_send_chunk(req,
         "<p class=n>Stored in NVS on the board, never in the firmware image.<br>"
         "Feeds: AVR :30001 &middot; Beast :30005 &middot; JSON :8888 "
-        "(raw TCP, not HTTP) &middot; <a href=/aircraft.json>/aircraft.json</a></p>",
+        "(raw TCP, not HTTP) &middot; <a href=/aircraft.json>/aircraft.json</a><br>"
+        "OTA: <code>curl -H 'Expect:' --data-binary "
+        "@build/usb_host_lib_example.bin http://&lt;this-ip&gt;/ota</code></p>",
         HTTPD_RESP_USE_STRLEN);
     return httpd_resp_send_chunk(req, NULL, 0);
 }
@@ -235,8 +245,16 @@ esp_err_t web_config_start(void)
     cfg.core_id         = 0;
     cfg.task_priority   = 3;
     cfg.stack_size      = 5120;
-    cfg.max_uri_handlers = 4;
+    cfg.max_uri_handlers = 5;   /* root, wifi, aircraft.json, ota, +1 spare */
     cfg.lru_purge_enable = true;   /* a phone that walks away must not wedge it */
+    /* A handler that only ever reads gives TCP nothing to probe with, so a
+     * peer that disappears without a FIN is invisible to it -- and POST /ota
+     * reads for seconds at a time. Keepalive is what eventually errors that
+     * recv out; ota.c's own idle bound covers the case anyway. */
+    cfg.keep_alive_enable   = true;
+    cfg.keep_alive_idle     = 10;
+    cfg.keep_alive_interval = 5;
+    cfg.keep_alive_count    = 3;
 
     httpd_handle_t srv = NULL;
     esp_err_t err = httpd_start(&srv, &cfg);
@@ -252,6 +270,7 @@ esp_err_t web_config_start(void)
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++)
         httpd_register_uri_handler(srv, &uris[i]);
+    ota_register_http(srv);
 
     ESP_LOGI(TAG, "config page on :%d", CONFIG_ADSB_WEB_PORT);
     return ESP_OK;

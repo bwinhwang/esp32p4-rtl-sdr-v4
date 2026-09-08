@@ -38,6 +38,15 @@ CONFIG_PARTITION_TABLE_OFFSET=0x10000
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
+# ── OTA ──────────────────────────────────────────────────────────────────────
+# partitions.csv carries ota_0/ota_1 + otadata. Rollback is what makes an OTA
+# push survivable with nobody watching a screen: a freshly-flashed image boots
+# into ESP_OTA_IMG_PENDING_VERIFY, and if it panics, watchdogs, or just never
+# calls esp_ota_mark_app_valid_cancel_rollback() (see main/ota.c) before the
+# next reset, the bootloader reverts to the previous slot on its own -- no
+# manual recovery step, no serial cable needed.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
 # lwIP's tcpip task is prio 18 and defaults to no affinity, which puts it above
 # adsb_rx_task (prio 5) and free to land on core1 -- every packet would then
 # preempt the demod loop mid-buffer and drop IQ. Core0 is where the headroom is.

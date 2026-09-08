@@ -17,6 +17,7 @@
 #include "driver/gpio.h"
 #include "net_eth.h"
 #include "net_wifi.h"
+#include "ota.h"
 #include "web_config.h"
 #include "shell.h"
 #include "net_ssh.h"
@@ -118,6 +119,12 @@ void app_main(void)
              (unsigned)(esp_psram_get_size() / 1024),
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
 #endif
+
+    /* Logs the running OTA slot + starts the rollback-confirm timer. Ordering
+     * relative to everything below does not matter -- it only touches
+     * otadata and spawns its own task -- so it goes first, before anything
+     * that can itself fail and obscure which slot was even running. */
+    ota_init();
 
     /* ── 1. Audio FIRST — boot beep proves codec is alive before USB ── */
     if (audio_init() == ESP_OK) {

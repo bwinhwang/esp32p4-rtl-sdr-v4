@@ -40,6 +40,7 @@
 #include "esp_timer.h"
 #include "esp_app_desc.h"
 #include "esp_idf_version.h"
+#include "esp_ota_ops.h"
 
 #include "shell.h"
 #include "net_eth.h"
@@ -309,6 +310,70 @@ static int cmd_sys(int argc, char **argv)
     printf("uptime    %lldd %02lld:%02lld:%02lld\n",
            up / 86400, (up % 86400) / 3600, (up % 3600) / 60, up % 60);
     printf("reset     %d\n", (int)esp_reset_reason());
+    return ESP_OK;
+}
+
+/* ── ota ──────────────────────────────────────────────────────────────────── */
+static const char *ota_state_name(esp_ota_img_states_t st)
+{
+    switch (st) {
+    case ESP_OTA_IMG_NEW:            return "new";
+    case ESP_OTA_IMG_PENDING_VERIFY: return "pending-verify";
+    case ESP_OTA_IMG_VALID:          return "valid";
+    case ESP_OTA_IMG_INVALID:        return "invalid";
+    case ESP_OTA_IMG_ABORTED:        return "aborted";
+    default:                         return "undefined";
+    }
+}
+
+static int cmd_ota(int argc, char **argv)
+{
+    const esp_partition_t *run   = esp_ota_get_running_partition();
+    const esp_partition_t *other = esp_ota_get_next_update_partition(NULL);
+
+    if (argc >= 2 && strcmp(argv[1], "rollback") == 0) {
+        esp_ota_img_states_t st = ESP_OTA_IMG_UNDEFINED;
+        esp_ota_get_state_partition(run, &st);
+
+        /* Still unconfirmed: this is exactly the rollback path
+         * BOOTLOADER_APP_ROLLBACK_ENABLE exists for, done on demand instead
+         * of waiting out a crash. Does not return on success. */
+        if (st == ESP_OTA_IMG_PENDING_VERIFY) {
+            printf("pending-verify -- rolling back to the previous slot now\n");
+            fflush(stdout);
+            esp_ota_mark_app_invalid_rollback_and_reboot();
+            printf("rollback failed: no valid previous image to boot\n");
+            return ESP_FAIL;
+        }
+
+        /* Already confirmed valid: "rollback" here just means "boot the
+         * other slot next time", for reverting a bad OTA push after the
+         * 20s auto-confirm window in ota.c has already closed. */
+        if (!other) {
+            printf("no other OTA slot to roll back to\n");
+            return ESP_ERR_INVALID_STATE;
+        }
+        esp_err_t err = esp_ota_set_boot_partition(other);
+        if (err != ESP_OK) {
+            printf("esp_ota_set_boot_partition: %s\n", esp_err_to_name(err));
+            return ESP_FAIL;
+        }
+        printf("next boot -> %s, restarting...\n", other->label);
+        fflush(stdout);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        esp_restart();
+        return ESP_OK;      /* not reached */
+    }
+
+    esp_ota_img_states_t rst = ESP_OTA_IMG_UNDEFINED, ost = ESP_OTA_IMG_UNDEFINED;
+    esp_ota_get_state_partition(run, &rst);
+    if (other) esp_ota_get_state_partition(other, &ost);
+
+    printf("running   %-8s %s\n", run->label, ota_state_name(rst));
+    if (other) printf("other     %-8s %s\n", other->label, ota_state_name(ost));
+    printf("app       %s\n", esp_app_get_description()->version);
+    printf("push a new image: curl -H \"Expect:\" --data-binary @build/<app>.bin"
+           " http://<board-ip>/ota\n");
     return ESP_OK;
 }
 
@@ -601,6 +666,7 @@ void shell_init(void)
     reg("wifi",    "WiFi status, or set the upstream credentials in NVS",          cmd_wifi);
     reg("log",     "recent receiver events, echo control, esp_log levels",         cmd_log);
     reg("sys",     "firmware build, IDF version, uptime, reset reason",            cmd_sys);
+    reg("ota",     "OTA slot/version status, or 'ota rollback' to revert",         cmd_ota);
     reg("tui",     "open the radar display on the serial console",                 cmd_tui);
     reg("restart", "reboot the board",                                             cmd_restart);
     reg("exit",    "close this session (SSH); the serial console is top level",    cmd_exit);
