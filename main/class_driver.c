@@ -1261,8 +1261,13 @@ static void render_tasks(char panel[RADAR_ROWS][RADAR_COLS + 1])
     }
     snprintf(panel[0], RADAR_COLS + 1, " %-11s %4s %4s %8s", "TASK", "CPU", "CORE", "STACK");
 
-    /* last 4 rows belong to the probes below */
-    for (int r = 1; r < RADAR_ROWS - 4 && r - 1 < s_tstat_n; r++) {
+    /* last 2 rows belong to the frame-render probe below. USB drop and the
+     * FEED counters used to live here too, but that made them invisible
+     * whenever RADAR or WFALL was the selected panel; they moved to
+     * render_net_panel() beside the EVENT LOG instead, which is on screen
+     * regardless of the R selection -- freeing these two rows back to the
+     * task list. */
+    for (int r = 1; r < RADAR_ROWS - 2 && r - 1 < s_tstat_n; r++) {
         task_stat_t *t = &s_tstat[r - 1];
         char core[4];
         if (t->core < 0) snprintf(core, sizeof(core), "-");
@@ -1271,23 +1276,74 @@ static void render_tasks(char panel[RADAR_ROWS][RADAR_COLS + 1])
                  t->name, t->pct, core, (unsigned long)t->stack_hwm);
     }
 
-    /* Declared here rather than included: esp_libusb.h carries its own,
-     * unrelated struct class_driver_t that clashes with this file's. */
-    extern uint64_t esp_libusb_stream_dropped(void);
-
-    snprintf(panel[RADAR_ROWS - 4], RADAR_COLS + 1, " FRAME %5luB  %2lu/s",
+    snprintf(panel[RADAR_ROWS - 2], RADAR_COLS + 1, " FRAME %5luB  %2lu/s",
              (unsigned long)s_pr_bytes, (unsigned long)s_pr_fps);
-    snprintf(panel[RADAR_ROWS - 3], RADAR_COLS + 1, " asm %3lums/s   out %3lums/s",
+    snprintf(panel[RADAR_ROWS - 1], RADAR_COLS + 1, " asm %3lums/s   out %3lums/s",
              (unsigned long)s_pr_asm_ms, (unsigned long)s_pr_out_ms);
-    snprintf(panel[RADAR_ROWS - 2], RADAR_COLS + 1, " USB drop %llu",
-             (unsigned long long)esp_libusb_stream_dropped());
-    snprintf(panel[RADAR_ROWS - 1], RADAR_COLS + 1, " FEED avr%dc:%lu  bst%dc:%lu",
-             feed_avr_clients(), (unsigned long)feed_avr_sent(),
-             feed_beast_clients(), (unsigned long)feed_beast_sent());
 
     /* snprintf NUL-terminates early; repaint the tail as spaces so the panel
      * stays a fixed-width block (the TUI never clears, it overwrites). */
     for (int r = 0; r < RADAR_ROWS; r++) {
+        int len = (int)strlen(panel[r]);
+        for (int c = len; c < RADAR_COLS; c++) panel[r][c] = ' ';
+        panel[r][RADAR_COLS] = '\0';
+    }
+}
+
+/* Right side of the EVENT LOG panel, otherwise blank -- see tui_draw() below.
+ * Unlike RADAR/WFALL/TASKS this is not one of the R-cycled modes, it is
+ * always on screen, which is the whole reason USB drop and the FEED
+ * counters moved here from render_tasks(): those numbers matter continuously
+ * and used to be visible only while TASKS happened to be selected. */
+static void render_net_panel(char panel[LOG_SHOW][RADAR_COLS + 1])
+{
+    for (int r = 0; r < LOG_SHOW; r++) {
+        memset(panel[r], ' ', RADAR_COLS);
+        panel[r][RADAR_COLS] = '\0';
+    }
+
+    char ip[24], ssid[36];
+
+    net_eth_ip_str(ip, sizeof(ip));
+    snprintf(panel[0], RADAR_COLS + 1, " ETH   %s", ip);
+
+    snprintf(panel[1], RADAR_COLS + 1, " AP    %-3s  %d client(s)",
+             net_wifi_ap_enabled() ? "on" : "off", net_wifi_ap_clients());
+
+    net_wifi_sta_ssid(ssid, sizeof(ssid));
+    /* Precision on %s, not just width: an SSID can run to 32 bytes, longer
+     * than this row has room for once the prefix is in, and an unbounded %s
+     * trips -Werror=format-truncation since gcc can't prove the row buffer
+     * is big enough. Truncating is fine here -- the row is display-only. */
+    snprintf(panel[2], RADAR_COLS + 1, " STA   %-3s  ssid %.24s",
+             net_wifi_sta_enabled() ? "on" : "off", ssid[0] ? ssid : "(unset)");
+
+    /* Row 3 is conditional -- blank when there is nothing worth saying (no
+     * upstream configured at all), same as cmd_net()'s retry line in shell.c. */
+    if (net_wifi_state() == NET_WIFI_STA) {
+        net_wifi_sta_ip_str(ip, sizeof(ip));
+        snprintf(panel[3], RADAR_COLS + 1, "       joined %s", ip);
+    } else if (ssid[0] && net_wifi_sta_enabled()) {
+        int tries, next_s;
+        net_wifi_sta_retry(&tries, &next_s);
+        snprintf(panel[3], RADAR_COLS + 1, "       fail %dx  next %ds%s",
+                 tries, next_s, net_wifi_ap_clients() > 0 ? " (held)" : "");
+    } else if (ssid[0]) {
+        snprintf(panel[3], RADAR_COLS + 1, "       disabled (creds kept)");
+    }
+
+    /* Declared here rather than included: esp_libusb.h carries its own,
+     * unrelated struct class_driver_t that clashes with this file's. */
+    extern uint64_t esp_libusb_stream_dropped(void);
+    snprintf(panel[4], RADAR_COLS + 1, " USB   drop %llu",
+             (unsigned long long)esp_libusb_stream_dropped());
+
+    snprintf(panel[5], RADAR_COLS + 1, " FEED  avr%dc:%lu  bst%dc:%lu  json%dc",
+             feed_avr_clients(), (unsigned long)feed_avr_sent(),
+             feed_beast_clients(), (unsigned long)feed_beast_sent(),
+             feed_json_clients());
+
+    for (int r = 0; r < LOG_SHOW; r++) {
         int len = (int)strlen(panel[r]);
         for (int c = len; c < RADAR_COLS; c++) panel[r][c] = ' ';
         panel[r][RADAR_COLS] = '\0';
@@ -1644,7 +1700,8 @@ static void tui_draw(void)
     static const char hdr[] = "  EVENT LOG   aircraft only -- the board logs to the console";
     row_begin();
     fb_printf(PH_DIM "%s", hdr); sp(LEFT_W - (int)sizeof(hdr) + 1);
-    fb_printf(PH_GRID VL RESET); sp(RADAR_COLS);
+    fb_printf(PH_GRID VL RESET);
+    fb_printf(PH_DIM " %-*s" RESET, RADAR_COLS - 1, " NET");
     row_end();
 
     /* Seven lines for the sky and for whatever the display said back to a
@@ -1663,6 +1720,8 @@ static void tui_draw(void)
     }
 
     static const char *log_cols[] = { PH_DIM, PH_HI, AC_AMBER, AC_CYAN, AC_RED };
+    char net_panel[LOG_SHOW][RADAR_COLS + 1];
+    render_net_panel(net_panel);
     for (int row = LOG_SHOW - 1; row >= 0; row--) {
         row_begin();
         fb_printf("  ");
@@ -1674,8 +1733,10 @@ static void tui_draw(void)
         } else {
             fb_printf(PH_DIM "~" RESET); sp(LEFT_W - 3);
         }
-        /* right side of log rows: blank panel column */
-        fb_printf(PH_GRID VL RESET); sp(RADAR_COLS);
+        /* right side of log rows: the NET panel, top row first as `row`
+         * counts down from LOG_SHOW-1 to 0 */
+        fb_printf(PH_GRID VL RESET);
+        fb_printf(PH_MID "%s" RESET, net_panel[LOG_SHOW - 1 - row]);
         row_end();
     }
 
