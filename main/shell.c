@@ -302,11 +302,14 @@ static const char *eth_state_str(net_eth_state_t s)
 
 static const char *wifi_state_str(net_wifi_state_t s)
 {
+    /* NET_WIFI_AP only means "not joined upstream" -- whether anything is
+     * beaconing depends on the SoftAP switch. */
+    bool ap = net_wifi_ap_enabled();
     switch (s) {
         case NET_WIFI_OFF:  return "off";
         case NET_WIFI_INIT: return "bringing up";
-        case NET_WIFI_AP:   return "AP only";
-        case NET_WIFI_STA:  return "AP + STA joined";
+        case NET_WIFI_AP:   return ap ? "AP only"         : "idle";
+        case NET_WIFI_STA:  return ap ? "AP + STA joined" : "STA joined";
         default:            return "?";
     }
 }
@@ -321,8 +324,17 @@ static int cmd_net(int argc, char **argv)
     net_wifi_sta_ip_str(ip, sizeof(ip));
     net_wifi_sta_ssid(ssid, sizeof(ssid));
     printf("wifi   %-18s %s\n", wifi_state_str(net_wifi_state()), ip);
-    printf("  ap clients %d   sta ssid %s\n",
-           net_wifi_ap_clients(), ssid[0] ? ssid : "(unset)");
+    printf("  ap  %-3s  %d client(s)\n",
+           net_wifi_ap_enabled() ? "on" : "off", net_wifi_ap_clients());
+    printf("  sta %-3s  ssid %s\n",
+           net_wifi_sta_enabled() ? "on" : "off", ssid[0] ? ssid : "(unset)");
+    if (ssid[0] && net_wifi_sta_enabled() && net_wifi_state() != NET_WIFI_STA) {
+        int tries, next_s;
+        net_wifi_sta_retry(&tries, &next_s);
+        printf("           join failed %dx, next attempt in %ds%s\n",
+               tries, next_s,
+               net_wifi_ap_clients() > 0 ? " (held back: SoftAP in use)" : "");
+    }
 
     /* Both interfaces can hold addresses on the same subnet at home, in which
      * case only the Ethernet one answers: lwIP's ip4_route() picks the first
@@ -335,7 +347,23 @@ static int cmd_net(int argc, char **argv)
     return ESP_OK;
 }
 
-/* ── wifi ─────────────────────────────────────────────────────────────────── */
+/* ── wifi ───────────────────────────────────────────────────────────────── */
+/* -1 for anything that is not the word on or the word off. */
+static int onoff(const char *s)
+{
+    if (strcmp(s, "on")  == 0) return 1;
+    if (strcmp(s, "off") == 0) return 0;
+    return -1;
+}
+
+/* Whether the board would still be reachable over IP with the SoftAP gone.
+ * The STA address is not always reachable from the LAN (see CLAUDE.md on both
+ * interfaces landing in one subnet), so this is a floor, not a promise. */
+static bool reachable_without_ap(void)
+{
+    return net_eth_state() == NET_ETH_READY || net_wifi_state() == NET_WIFI_STA;
+}
+
 static int cmd_wifi(int argc, char **argv)
 {
     if (argc == 1) return cmd_net(argc, argv);
@@ -346,9 +374,17 @@ static int cmd_wifi(int argc, char **argv)
             printf("upstream credentials cleared (%s)\n", esp_err_to_name(e));
             return e;
         }
+        if (argc == 3 && onoff(argv[2]) >= 0) {
+            bool on = onoff(argv[2]);
+            esp_err_t e = net_wifi_set_sta_enabled(on);
+            printf("sta %s (%s); credentials kept\n",
+                   on ? "enabled, joining now" : "disabled, association dropped",
+                   esp_err_to_name(e));
+            return e;
+        }
         if (argc != 4) {
             printf("usage: wifi sta <ssid> <password>\n"
-                   "       wifi sta clear\n");
+                   "       wifi sta on | off | clear\n");
             return ESP_ERR_INVALID_ARG;
         }
         /* Stored in NVS, never in the image -- sdkconfig is tracked and this
@@ -360,9 +396,36 @@ static int cmd_wifi(int argc, char **argv)
         return e;
     }
 
+    if (strcmp(argv[1], "ap") == 0 && argc >= 3 && onoff(argv[2]) >= 0) {
+        bool on    = onoff(argv[2]);
+        bool force = argc > 3 && strcmp(argv[3], "force") == 0;
+
+        /* The switch is persisted, so getting this wrong on a headless board
+         * costs a serial cable rather than a reboot. */
+        if (!on && !force && !reachable_without_ap()) {
+            printf("refusing: nothing else is up (eth %s, wifi %s), so turning\n"
+                   "the SoftAP off would leave this board reachable only over\n"
+                   "the serial port -- and the setting survives a reboot.\n"
+                   "Use 'wifi ap off force' if that is what you want.\n",
+                   eth_state_str(net_eth_state()),
+                   wifi_state_str(net_wifi_state()));
+            return ESP_ERR_INVALID_STATE;
+        }
+
+        esp_err_t e = net_wifi_set_ap_enabled(on);
+        if (e != ESP_OK) {
+            printf("ap %s failed: %s\n", on ? "on" : "off", esp_err_to_name(e));
+            return e;
+        }
+        printf("SoftAP %s\n", on ? "on" : "off, associated stations dropped");
+        return ESP_OK;
+    }
+
     printf("usage: wifi                       -- status\n"
            "       wifi sta <ssid> <password> -- set upstream credentials\n"
-           "       wifi sta clear             -- forget them\n");
+           "       wifi sta on | off          -- STA half; credentials kept\n"
+           "       wifi sta clear             -- forget them\n"
+           "       wifi ap  on | off          -- SoftAP half\n");
     return ESP_ERR_INVALID_ARG;
 }
 
@@ -839,7 +902,7 @@ void shell_init(void)
     reg("free",    "internal and PSRAM heap, free / minimum-ever / largest block", cmd_free);
     reg("tasks",   "per-task core, priority, CPU% over 1 s, and stack headroom",   cmd_tasks);
     reg("net",     "interface addresses and per-feed client counts",               cmd_net);
-    reg("wifi",    "WiFi status, or set the upstream credentials in NVS",          cmd_wifi);
+    reg("wifi",    "WiFi status, upstream credentials, or switch either half off",  cmd_wifi);
     reg("log",     "recent receiver events, echo control, esp_log levels",         cmd_log);
     reg("sys",     "firmware build, IDF version, uptime, reset reason",            cmd_sys);
     reg("ota",     "OTA slot/version status, or 'ota rollback' to revert",         cmd_ota);

@@ -1378,10 +1378,18 @@ static void tui_draw(void)
         case NET_WIFI_STA: {
             char sip[16];
             net_wifi_sta_ip_str(sip, sizeof(sip));
-            snprintf(wifi, sizeof(wifi), "ap:%d %s", wc, sip);
+            /* "ap:0" would read as a SoftAP nobody has joined, which is not
+             * the same thing as one that is switched off. */
+            if (net_wifi_ap_enabled())
+                snprintf(wifi, sizeof(wifi), "ap:%d %s", wc, sip);
+            else
+                snprintf(wifi, sizeof(wifi), "sta %s", sip);
             break;
         }
-        case NET_WIFI_AP:   snprintf(wifi, sizeof(wifi), "ap:%d", wc); break;
+        case NET_WIFI_AP:
+            if (net_wifi_ap_enabled()) snprintf(wifi, sizeof(wifi), "ap:%d", wc);
+            else                       snprintf(wifi, sizeof(wifi), "idle");
+            break;
         case NET_WIFI_INIT: snprintf(wifi, sizeof(wifi), "init");      break;
         default:            snprintf(wifi, sizeof(wifi), "off");       break;
         }

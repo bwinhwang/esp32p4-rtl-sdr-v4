@@ -110,10 +110,15 @@ static esp_err_t root_get(httpd_req_t *req)
     html_escape(ssid, esc, sizeof(esc));
 
     net_wifi_state_t ws = net_wifi_state();
-    const char *wtxt = ws == NET_WIFI_STA  ? "AP + joined upstream"
-                     : ws == NET_WIFI_AP   ? "AP only"
-                     : ws == NET_WIFI_INIT ? "starting"
-                                           : "off";
+    bool ap_on  = net_wifi_ap_enabled();
+    bool sta_on = net_wifi_sta_enabled();
+    /* NET_WIFI_AP means "not joined upstream", which is not the same as the
+     * SoftAP being up -- either half can be switched off. */
+    const char *wtxt = ws == NET_WIFI_INIT ? "starting"
+                     : ws == NET_WIFI_OFF  ? "off"
+                     : ws == NET_WIFI_STA  ? (ap_on ? "AP + joined upstream"
+                                                    : "joined upstream")
+                                           : (ap_on ? "AP only" : "idle");
 
     const esp_app_desc_t *app  = esp_app_get_description();
     const esp_partition_t *run = esp_ota_get_running_partition();
@@ -126,12 +131,14 @@ static esp_err_t root_get(httpd_req_t *req)
         "<tr><td>Firmware</td><td>%s (%s)</td></tr>"
         "<tr><td>Ethernet</td><td>%s</td></tr>"
         "<tr><td>WiFi</td><td>%s</td></tr>"
-        "<tr><td>SoftAP clients</td><td>%d</td></tr>"
+        "<tr><td>SoftAP</td><td>%s, %d client(s)</td></tr>"
+        "<tr><td>Upstream (STA)</td><td>%s</td></tr>"
         "<tr><td>Upstream SSID</td><td>%s</td></tr>"
         "<tr><td>Upstream IP</td><td>%s</td></tr>"
         "</table>",
         app->version, run->label,
-        eth_ip, wtxt, net_wifi_ap_clients(),
+        eth_ip, wtxt, ap_on ? "on" : "off", net_wifi_ap_clients(),
+        sta_on ? "on" : "off",
         esc[0] ? esc : "<i>not configured</i>", sta_ip);
     httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
 
@@ -142,6 +149,23 @@ static esp_err_t root_get(httpd_req_t *req)
         "<label>Password</label>"
         "<input name=pass type=password placeholder=\"unchanged if left blank\">"
         "<button type=submit>Save &amp; connect</button></form>", esc);
+    httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
+
+    /* One-click toggles rather than a checkbox and a Save: each is a single
+     * decision and the page is read on a phone. The STA one is the interesting
+     * one in the car -- an upstream SSID that is out of range makes the radio
+     * sweep the band on a timer, and the SoftAP serving this very page goes
+     * off channel each time. */
+    snprintf(row, sizeof(row),
+        "<p class=n>Radio halves &mdash; both settings survive a reboot.</p>"
+        "<form method=post action=/radio style=\"display:inline\">"
+        "<input type=hidden name=sta value=%s>"
+        "<button type=submit>Turn upstream (STA) %s</button></form> "
+        "<form method=post action=/radio style=\"display:inline\">"
+        "<input type=hidden name=ap value=%s>"
+        "<button type=submit>Turn SoftAP %s</button></form>",
+        sta_on ? "off" : "on", sta_on ? "off" : "on",
+        ap_on  ? "off" : "on", ap_on  ? "off" : "on");
     httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
 
     httpd_resp_send_chunk(req,
@@ -203,6 +227,58 @@ static esp_err_t wifi_post(httpd_req_t *req)
     return httpd_resp_send(req, NULL, 0);
 }
 
+/* ── POST /radio ───────────────────────────────────────────────────────── */
+
+static esp_err_t radio_post(httpd_req_t *req)
+{
+    char body[64];
+    int  len = req->content_len < (int)sizeof(body) - 1
+             ? req->content_len : (int)sizeof(body) - 1;
+    int  got = httpd_req_recv(req, body, len);
+    if (got <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
+        return ESP_FAIL;
+    }
+    body[got] = '\0';
+
+    char val[8] = {0};
+    bool is_ap  = httpd_query_key_value(body, "ap", val, sizeof(val)) == ESP_OK;
+    if (!is_ap && httpd_query_key_value(body, "sta", val, sizeof(val)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "want ap= or sta=");
+        return ESP_FAIL;
+    }
+    bool on = strcmp(val, "on") == 0;
+
+    /* Turning the SoftAP off from a browser is very often turning it off from
+     * a browser *on that SoftAP*, which disconnects the client mid-request and
+     * persists across reboots. Refused unless something else is up; the serial
+     * console's "wifi ap off force" is the deliberate way to do it anyway. */
+    if (is_ap && !on &&
+        net_eth_state() != NET_ETH_READY && net_wifi_state() != NET_WIFI_STA) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN,
+            "Nothing else is up, so switching the SoftAP off would make this "
+            "board unreachable except over its serial port. Use 'wifi ap off "
+            "force' on the console if that is intended.");
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = is_ap ? net_wifi_set_ap_enabled(on)
+                          : net_wifi_set_sta_enabled(on);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "%s %s failed: %s", is_ap ? "ap" : "sta",
+                 on ? "on" : "off", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            esp_err_to_name(err));
+        return ESP_FAIL;
+    }
+    sys_log(1, "WEB      %s switched %s", is_ap ? "SoftAP" : "STA",
+            on ? "on" : "off");
+
+    httpd_resp_set_status(req, "303 See Other");
+    httpd_resp_set_hdr(req, "Location", "/");
+    return httpd_resp_send(req, NULL, 0);
+}
+
 /* ── GET /aircraft.json ────────────────────────────────────────────────── */
 
 static esp_err_t aircraft_get(httpd_req_t *req)
@@ -245,7 +321,7 @@ esp_err_t web_config_start(void)
     cfg.core_id         = 0;
     cfg.task_priority   = 3;
     cfg.stack_size      = 5120;
-    cfg.max_uri_handlers = 5;   /* root, wifi, aircraft.json, ota, +1 spare */
+    cfg.max_uri_handlers = 6;   /* root, wifi, radio, aircraft.json, ota, +1 */
     cfg.lru_purge_enable = true;   /* a phone that walks away must not wedge it */
     /* A handler that only ever reads gives TCP nothing to probe with, so a
      * peer that disappears without a FIN is invisible to it -- and POST /ota
@@ -266,6 +342,7 @@ esp_err_t web_config_start(void)
     static const httpd_uri_t uris[] = {
         { .uri = "/",              .method = HTTP_GET,  .handler = root_get     },
         { .uri = "/wifi",          .method = HTTP_POST, .handler = wifi_post    },
+        { .uri = "/radio",         .method = HTTP_POST, .handler = radio_post   },
         { .uri = "/aircraft.json", .method = HTTP_GET,  .handler = aircraft_get },
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++)
