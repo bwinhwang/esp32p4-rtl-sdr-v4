@@ -12,11 +12,9 @@
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/idf_additions.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
-#include "esp_heap_caps.h"
 #include "esp_attr.h"
 #include "usb/usb_host.h"
 #include "driver/i2s_std.h"
@@ -27,35 +25,20 @@
 #include "rtl-sdr.h"
 #include "mode-s.h"
 #include "esp_task_wdt.h"
-#include "net_eth.h"
-#include "net_wifi.h"
 #include "feed_avr.h"
 #include "feed_beast.h"
 #include "feed_json.h"
 #include "plane_cat.h"
+#include "adsb.h"
 #include "shell.h"
-#include "screen.h"
-#include "top.h"
 #include "esp_console.h"
 
 /* ── build config ────────────────────────────────────────────────────────── */
 #define CLIENT_NUM_EVENT_MSG  5
 #define MAX_PACKET_SIZE       16384
 #define DEFAULT_BUF_LENGTH    (MAX_PACKET_SIZE * 2)
-/* Table depth, not screen depth: the TUI paints TABLE_ROWS of these and the
- * header's ACFT count says how many there really are. A full table drops
- * new contacts on the floor (find_or_create() returns NULL) rather than
- * evicting, so size it for the busiest sky, not the screen. ~100 B each. */
-#define MAX_TRACKED           64
-/* Ring depth, not screen depth: the TUI shows the last LOG_SHOW of these, and
- * `log tail` -- the only way to see receiver events while the display is in
- * the background -- reads the rest. 32 x 81 B of internal RAM. */
-#define LOG_LINES             32
-/* A full repaint is ~13 KB, and pushing bytes at the console UART costs ~7 us
- * of CPU each, so this constant sets core0 load directly: at 150 ms it was
- * 90 KB/s, which is 98% of the 921600-baud line rate and 63% of the core.
- * Raise it before blaming anything else for core0 being busy. */
-#define TUI_REFRESH_MS        500
+/* A contact with no frame for this long is dropped from the table. */
+#define CONTACT_TTL_US        60000000LL
 
 /* ── audio pins (Waveshare ESP32-P4-WIFI6-DEV-KIT + ES8311) ──────────────── */
 #define I2C_SCL_PIN     8
@@ -106,51 +89,6 @@ typedef struct {
     } constant;
 } class_driver_t;
 
-/* ── CPR frame ───────────────────────────────────────────────────────────── */
-typedef struct {
-    int     raw_lat;
-    int     raw_lon;
-    int64_t ts_us;
-    bool    valid;
-} cpr_frame_t;
-
-/* ── aircraft record ─────────────────────────────────────────────────────── */
-typedef struct {
-    uint32_t    icao;
-    char        callsign[9];
-    int         altitude;
-    int         velocity;
-    int         heading;
-    float       lat;
-    float       lon;
-    bool        pos_valid;
-    int         ew_velocity;
-    int         ns_velocity;
-    int         vert_rate;
-    int         msg_count;
-    int64_t     last_seen_us;
-    cpr_frame_t cpr_even;
-    cpr_frame_t cpr_odd;
-    plane_cat_t category;
-    bool        active;
-} aircraft_t;
-
-/* ── event log ───────────────────────────────────────────────────────────── */
-typedef struct {
-    char    text[80];
-    uint8_t color;
-    uint8_t facility;   /* LOG_SYS / LOG_AIR -- see the echo filter below */
-} log_entry_t;
-
-/* Where a line belongs, which is not the same question as how bad it is (that
- * is the colour). The board's events are the ones somebody at a prompt is
- * waiting for; the sky's are the display's subject matter; the display's own
- * answers to a keystroke are meaningful only to whoever pressed it, and would
- * otherwise land in the *other* transport's prompt. */
-#define LOG_SYS  0
-#define LOG_AIR  1
-#define LOG_UI   2
-
 /* ── audio events ────────────────────────────────────────────────────────── */
 typedef enum {
     AUDIO_EVT_NONE = 0,
@@ -175,56 +113,25 @@ static EXT_RAM_BSS_ATTR mode_s_t state;   /* 8 KB, mostly the ICAO cache */
  * purpose: s_log (any path may log, including ones that must stay IRAM-safe)
  * and mode-s.c's maglut (2M random lookups/s; untested from PSRAM). */
 static EXT_RAM_BSS_ATTR aircraft_t s_aircraft[MAX_TRACKED];
-static log_entry_t s_log[LOG_LINES];
+static log_entry_t s_log[ADSB_LOG_LINES];
 static int         s_log_head    = 0;
 static int         s_msg_count   = 0;
-static int         s_msg_rate    = 0;
 static int         s_msg_bucket  = 0;
-static int64_t     s_rate_ts     = 0;
-static int64_t     s_start_us    = 0;
 static volatile bool s_rx_running  = false;  /* adsb_rx_task is up          */
 static volatile bool s_inject_req  = false;  /* the 't' hotkey, see below   */
-static float       s_decode_smooth = 0.0f;
-static float       s_crc_smooth    = 0.0f;
-static float       s_fix_smooth    = 0.0f;
+
+/* Closed once a second by tracker_tick(); read by adsb_stats_get(). */
+static int           s_msg_rate;
+static float         s_dec_pct, s_fix_pct;
+static float         s_max_range_km;
+static int64_t       s_tick_us;
+static unsigned long s_tick_ok, s_tick_bad, s_tick_fix;
 
 /* audio */
 static i2s_chan_handle_t  s_i2s_tx  = NULL;
 static volatile int       s_volume  = 70;
 static volatile bool      s_muted   = false;
 static QueueHandle_t      s_audio_q = NULL;
-
-/* ── ANSI / phosphor-green ATC palette ───────────────────────────────────── */
-#define RESET    "\033[0m"
-#define BOLD     "\033[1m"
-#define DIM      "\033[2m"
-
-/* 24-bit RGB phosphor green palette */
-#define PH_HI    "\033[38;2;0;255;80m"     /* bright phosphor    */
-#define PH_MID   "\033[38;2;0;200;60m"     /* mid phosphor       */
-#define PH_DIM   "\033[38;2;0;100;30m"     /* dim phosphor       */
-#define PH_SCAN  "\033[38;2;140;255;140m"  /* scan highlight     */
-#define PH_GRID  "\033[38;2;0;60;20m"      /* grid lines         */
-
-/* accent colours */
-#define AC_AMBER "\033[38;2;255;180;0m"    /* warning amber      */
-#define AC_RED   "\033[38;2;255;60;60m"    /* alert red          */
-#define AC_CYAN  "\033[38;2;0;220;220m"    /* info cyan          */
-#define AC_WHITE "\033[38;2;220;255;220m"  /* near-white         */
-
-/* box drawing UTF-8 */
-#define HL   "\xe2\x94\x80"
-#define VL   "\xe2\x94\x82"
-#define TL   "\xe2\x94\x8c"
-#define TR   "\xe2\x94\x90"
-#define BL   "\xe2\x94\x94"
-#define BR   "\xe2\x94\x98"
-#define TR_  "\xe2\x94\x9c"
-#define TL_  "\xe2\x94\xa4"
-#define T_UP "\xe2\x94\xb4"
-#define CROSS "\xe2\x94\xbc"
-#define BLK  "\xe2\x96\x88"
-#define BBLK "\xe2\x96\x91"
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * AUDIO
@@ -556,13 +463,13 @@ int  adsb_log_echo_get(void)      { return s_log_echo; }
 
 void adsb_log_dump(int n)
 {
-    if (n <= 0 || n > LOG_LINES) n = LOG_LINES;
+    if (n <= 0 || n > ADSB_LOG_LINES) n = ADSB_LOG_LINES;
     if (n > s_log_head)          n = s_log_head;
 
     if (n == 0) { printf("(no receiver events yet)\n"); return; }
 
     for (int i = n - 1; i >= 0; i--) {
-        const log_entry_t *e = &s_log[(s_log_head - 1 - i + LOG_LINES * 2) % LOG_LINES];
+        const log_entry_t *e = &s_log[(s_log_head - 1 - i + ADSB_LOG_LINES * 2) % ADSB_LOG_LINES];
         if (e->text[0]) printf("%s\n", e->text);
     }
 }
@@ -580,12 +487,18 @@ static bool echo_wanted(uint8_t facility, uint8_t color)
 
 static void log_put(uint8_t facility, uint8_t color, const char *fmt, va_list ap)
 {
-    log_entry_t *e = &s_log[s_log_head % LOG_LINES];
+    /* Measurements (an ALT or VEL line per decoded frame, colour 0) are not
+     * kept: at a few per second they would turn the ring over in seconds and
+     * the events -- the reason the panel exists -- with it. They still reach a
+     * prompt at `log echo all`. */
+    bool keep = !(facility == LOG_AIR && color == 0);
+    log_entry_t  scratch;
+    log_entry_t *e = keep ? &s_log[s_log_head % ADSB_LOG_LINES] : &scratch;
 
     vsnprintf(e->text, sizeof(e->text), fmt, ap);
     e->color    = color;
     e->facility = facility;
-    s_log_head++;
+    if (keep) s_log_head++;
 
     /* Not echoed while a screen owns stdout: the line would land inside a
      * half-painted frame, and the viewer is already looking at the panel it
@@ -641,33 +554,103 @@ static aircraft_t *find_or_create(uint32_t icao)
     return empty;
 }
 
-static int active_count(void)
+int adsb_log_recent(const log_entry_t **out, int n)
 {
-    int n = 0;
-    int64_t now = esp_timer_get_time();
-    for (int i = 0; i < MAX_TRACKED; i++) {
-        if (!s_aircraft[i].active) continue;
-        if (now - s_aircraft[i].last_seen_us > 60000000LL) {
-            air_log(4, "LOST     %06lX  (%s)",
-                    (unsigned long)s_aircraft[i].icao,
-                    s_aircraft[i].callsign[0] ?
-                        s_aircraft[i].callsign : "--------");
-            s_aircraft[i].active = false;
-            audio_play(AUDIO_EVT_LOST_CONTACT);
-        } else {
-            n++;
-        }
+    int found = 0;
+    for (int back = 0; back < ADSB_LOG_LINES && found < n; back++) {
+        const log_entry_t *e = &s_log[(s_log_head - 1 - back + ADSB_LOG_LINES * 2) % ADSB_LOG_LINES];
+        if (!e->text[0] || e->facility == LOG_SYS) continue;
+        out[found++] = e;
     }
-    return n;
+    return found;
 }
+
+/* Kconfig has no float type, so the antenna position arrives as strings. */
+static void antenna_pos(float *lat, float *lon)
+{
+    static float clat, clon;
+    static bool  parsed;
+    if (!parsed) {
+        clat = strtof(CONFIG_ADSB_RX_LAT, NULL);
+        clon = strtof(CONFIG_ADSB_RX_LON, NULL);
+        parsed = true;
+    }
+    *lat = clat;
+    *lon = clon;
+}
+
+/* Equirectangular is plenty at ADS-B ranges: under 0.5% error at 400 km. */
+static void update_range(aircraft_t *a)
+{
+    float clat, clon;
+    antenna_pos(&clat, &clon);
+    float dy = (a->lat - clat) * 111.32f;
+    float dx = (a->lon - clon) * 111.32f * cosf(clat * (float)M_PI / 180.0f);
+    a->dist_km = sqrtf(dx * dx + dy * dy);
+    float brg  = atan2f(dx, dy) * 180.0f / (float)M_PI;
+    a->brg_deg = brg < 0 ? brg + 360.0f : brg;
+}
+
+/* Once a second, in adsb_rx_task: expires contacts and closes the rate
+ * window. The percentages are over that window rather than since boot, so
+ * they follow the antenna and the gain setting rather than averaging them
+ * away; the EMA keeps a quiet sky from flipping them frame to frame. */
+static void tracker_tick(int64_t now)
+{
+    if (now - s_tick_us < 1000000LL) return;
+    s_tick_us = now;
+
+    s_msg_rate   = s_msg_bucket;
+    s_msg_bucket = 0;
+
+    unsigned long ok = state.stat_goodcrc, bad = state.stat_badcrc, fix = state.stat_fixed;
+    unsigned long d_ok = ok - s_tick_ok, d_bad = bad - s_tick_bad, d_fix = fix - s_tick_fix;
+    s_tick_ok = ok; s_tick_bad = bad; s_tick_fix = fix;
+    if (d_ok + d_bad) {
+        float dec = 100.0f * (float)d_ok / (float)(d_ok + d_bad);
+        float fx  = d_ok ? 100.0f * (float)d_fix / (float)d_ok : 0.0f;
+        s_dec_pct += (dec - s_dec_pct) * 0.3f;
+        s_fix_pct += (fx  - s_fix_pct) * 0.3f;
+    }
+
+    for (int i = 0; i < MAX_TRACKED; i++) {
+        aircraft_t *a = &s_aircraft[i];
+        if (!a->active || now - a->last_seen_us <= CONTACT_TTL_US) continue;
+        air_log(4, "LOST     %06lX  (%s)", (unsigned long)a->icao,
+                a->callsign[0] ? a->callsign : "--------");
+        a->active = false;
+        audio_play(AUDIO_EVT_LOST_CONTACT);
+    }
+}
+
+void adsb_tick(void)
+{
+    if (!s_rx_running) tracker_tick(esp_timer_get_time());
+}
+
+const aircraft_t *adsb_aircraft(void) { return s_aircraft; }
+
+void adsb_stats_get(adsb_stats_t *s)
+{
+    s->msg_rate     = s_msg_rate;
+    s->msg_total    = s_msg_count;
+    s->dec_pct      = s_dec_pct;
+    s->fix_pct      = s_fix_pct;
+    s->max_range_km = s_max_range_km;
+}
+
+int  adsb_volume(void)          { return s_volume; }
+bool adsb_muted(void)           { return s_muted; }
+void adsb_set_muted(bool muted) { s_muted = muted; }
+void adsb_set_volume(int pct)   { s_volume = pct < 0 ? 0 : pct > 100 ? 100 : pct; }
 
 /* ── JSON snapshot export (feed_json.c) ──────────────────────────────────────
  * Periodic full-table export, not one line per decode -- feed_json.c pushes
  * this same buffer to every client on a timer, so there is no per-client
  * queue and a slow client just misses ticks instead of needing backpressure
- * handling. Staleness window matches active_count()'s, but read-only: this
+ * handling. Staleness window matches tracker_tick()'s, but read-only: this
  * runs from feed_json's own task (core0), a second reader of s_aircraft[]
- * alongside tui_task, so it must never be the one to flip `active` off. */
+ * alongside the draw task, so it must never be the one to flip `active` off. */
 /* Returns the new length, or `bufsize` to mean "full, and what you asked for
  * did not fit". That sentinel is why the clamp matters: vsnprintf() returns
  * what it WOULD have written, so the old `n + w` ran past the end of the
@@ -726,746 +709,6 @@ size_t aircraft_export_ndjson(char *buf, size_t bufsize)
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * TUI LAYOUT CONFIG
- * TERM_W = visible chars INSIDE the two border │ characters.
- * Your terminal window should be at least TERM_W+2 columns wide.
- * ═══════════════════════════════════════════════════════════════════════════ */
-#define TERM_W      154
-#define RADAR_COLS   41   /* must be odd; right panel visible width          */
-#define RADAR_ROWS   20
-#define TABLE_ROWS   20
-#define LOG_SHOW      7
-/* inner border │ takes 1 char, space before panel takes 1 char = 2 overhead */
-#define LEFT_W       (TERM_W - RADAR_COLS - 2)
-#define EL           "\033[K"
-
-/* ── draw helpers ─────────────────────────────────────────────────────────*/
-
-static void print_bar(const char *color, float value, float max, int width)
-{
-    int filled = (max > 0.0f) ? (int)(value * width / max) : 0;
-    if (filled > width) filled = width;
-    if (filled < 0)     filled = 0;
-    fb_puts(color);
-    for (int i = 0; i < width; i++)
-        fb_puts(i < filled ? BLK : BBLK);
-    fb_puts(RESET);
-}
-
-static void hline(int w)
-{
-    fb_puts(PH_GRID);
-    for (int i = 0; i < w; i++) fb_puts(HL);
-    fb_puts(RESET);
-}
-
-/* Every content row is:  │  <LEFT_W chars>  │  <RADAR_COLS chars>  │  \n
- * row_begin/end wrap the outer borders only.
- * The inner │ is printed manually between the two panels.               */
-static void row_begin(void) { fb_puts(PH_GRID VL RESET); }
-static void row_end(void)   { fb_puts(PH_GRID VL EL "\n" RESET); }
-
-static void sep_full(void)
-{
-    /* ├────────────────────────────────────────────────┤ */
-    fb_puts(PH_GRID TR_); hline(TERM_W); fb_puts(TL_ EL "\n" RESET);
-}
-
-static void sep_split(void)
-{
-    /* ├─── left ───┼─── right ───┤ */
-    fb_puts(PH_GRID TR_);
-    hline(LEFT_W);
-    fb_puts(CROSS);
-    hline(RADAR_COLS);
-    fb_puts(TL_ EL "\n" RESET);
-}
-
-static void sp(int n) { fb_rep(' ', n); }
-
-static void fmt_uptime(char *buf, size_t len)
-{
-    int64_t s = (esp_timer_get_time() - s_start_us) / 1000000LL;
-    snprintf(buf, len, "%02d:%02d:%02d",
-             (int)(s/3600), (int)((s%3600)/60), (int)(s%60));
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * RADAR — real aircraft positions, tight sweep line, two range rings
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-#define RADAR_RANGE_KM  400.0f
-
-/* Terminal cells are roughly this much taller than wide; rings, sweep and blip
- * placement all have to use the same figure or a blip lands off the ring that
- * marks its own range. */
-#define RADAR_ASPECT    2.2f
-#define RADAR_CX        (RADAR_COLS / 2)
-#define RADAR_CY        (RADAR_ROWS / 2)
-
-static int  s_sweep_angle = 0;
-
-/* panel mode: 0 = radar, 1 = waterfall */
-static int  s_panel_mode  = 0;
-
-/* waterfall: store last RADAR_ROWS signal-strength rows */
-#define WF_BINS  RADAR_COLS
-static uint8_t s_wf[RADAR_ROWS][WF_BINS];   /* 0-255 intensity per bin     */
-static int     s_wf_row = 0;                 /* next row to write (ring buf)*/
-
-static void latlon_to_xy(float clat, float clon,
-                          float alat, float alon,
-                          int *ox, int *oy)
-{
-    float dlat  = alat - clat;
-    float dlon  = (alon - clon) * cosf(clat * (float)M_PI / 180.0f);
-    float dx_km =  dlon * 111.0f;
-    float dy_km = -dlat * 111.0f;
-    float rx = (float)RADAR_CX * 0.90f;
-    float ry = rx / RADAR_ASPECT;
-    *ox = RADAR_CX + (int)(dx_km / RADAR_RANGE_KM * rx);
-    *oy = RADAR_CY + (int)(dy_km / RADAR_RANGE_KM * ry);
-}
-
-static void render_radar(char panel[RADAR_ROWS][RADAR_COLS + 1])
-{
-    for (int r = 0; r < RADAR_ROWS; r++) {
-        memset(panel[r], ' ', RADAR_COLS);
-        panel[r][RADAR_COLS] = '\0';
-    }
-
-    /* three range rings — keep outermost inside the panel boundary */
-    for (int r = 0; r < RADAR_ROWS; r++) {
-        for (int c = 0; c < RADAR_COLS; c++) {
-            float dx = (float)(c - RADAR_CX);
-            float dy = (float)(r - RADAR_CY) * RADAR_ASPECT;
-            float d  = sqrtf(dx*dx + dy*dy);
-            float r1 = (float)RADAR_CX * 0.30f;
-            float r2 = (float)RADAR_CX * 0.60f;
-            float r3 = (float)RADAR_CX * 0.90f;  /* pulled in from border */
-            if (fabsf(d - r1) < 0.55f) panel[r][c] = '.';
-            if (fabsf(d - r2) < 0.55f) panel[r][c] = '.';
-            if (fabsf(d - r3) < 0.55f) panel[r][c] = ':';
-        }
-    }
-
-    /* crosshair */
-    panel[RADAR_CY][RADAR_CX] = '+';
-    if (RADAR_CY > 0)             panel[RADAR_CY-1][RADAR_CX] = '|';
-    if (RADAR_CY+1 < RADAR_ROWS)  panel[RADAR_CY+1][RADAR_CX] = '|';
-    if (RADAR_CX > 1)             panel[RADAR_CY][RADAR_CX-1] = '-';
-    if (RADAR_CX+1 < RADAR_COLS)  panel[RADAR_CY][RADAR_CX+1] = '-';
-
-    /* cardinals */
-    panel[0][RADAR_CX]            = 'N';
-    panel[RADAR_ROWS-1][RADAR_CX] = 'S';
-    panel[RADAR_CY][0]            = 'W';
-    panel[RADAR_CY][RADAR_COLS-1] = 'E';
-
-    /* tight sweep line — threshold 0.07 rad ≈ 4° */
-    float sa = s_sweep_angle * (float)M_PI / 180.0f;
-    float sweep_limit = (float)RADAR_CX * 0.90f;
-    for (int r = 0; r < RADAR_ROWS; r++) {
-        for (int c = 0; c < RADAR_COLS; c++) {
-            float dx = (float)(c - RADAR_CX);
-            float dy = (float)(r - RADAR_CY) * RADAR_ASPECT;
-            float d  = sqrtf(dx*dx + dy*dy);
-            if (d > sweep_limit || d < 1.0f) continue;
-            float angle = atan2f(dy, dx);
-            float diff  = angle - sa;
-            while (diff >  (float)M_PI) diff -= 2.0f * (float)M_PI;
-            while (diff < -(float)M_PI) diff += 2.0f * (float)M_PI;
-            if (fabsf(diff) < 0.07f)
-                panel[r][c] = '/';          /* tight bright line */
-            else if (fabsf(diff) < 0.18f && panel[r][c] == ' ')
-                panel[r][c] = ',';          /* narrow fade */
-        }
-    }
-
-    /* Aircraft blips, plotted relative to the antenna (menuconfig -> ADS-B
-     * Receiver). Kconfig has no float type, so the position arrives as
-     * strings. */
-    float clat = strtof(CONFIG_ADSB_RX_LAT, NULL);
-    float clon = strtof(CONFIG_ADSB_RX_LON, NULL);
-
-    for (int i = 0; i < MAX_TRACKED; i++) {
-        if (!s_aircraft[i].active || !s_aircraft[i].pos_valid) continue;
-        int px, py;
-        latlon_to_xy(clat, clon, s_aircraft[i].lat, s_aircraft[i].lon, &px, &py);
-        if (px < 0 || px >= RADAR_COLS || py < 0 || py >= RADAR_ROWS) continue;
-        panel[py][px] = '*';
-        /* show up to 3 callsign chars after blip */
-        if (s_aircraft[i].callsign[0]) {
-            for (int ci = 0; ci < 3 && (px + 1 + ci) < RADAR_COLS; ci++) {
-                if (!s_aircraft[i].callsign[ci]) break;
-                panel[py][px + 1 + ci] = s_aircraft[i].callsign[ci];
-            }
-        }
-    }
-}
-
-/* ── waterfall ─────────────────────────────────────────────────────────────
- * Updated from the IQ magnitude data each demodulate() call.
- * We bucket the magnitude vector into WF_BINS bins and push a new row.
- * Uses running peak tracking for auto-gain so narrow signals are visible. */
-static uint32_t s_wf_peak = 256;  /* running peak for auto-scale */
-
-void waterfall_push(const uint16_t *mag, int mag_len)
-{
-    if (!mag || mag_len <= 0) return;
-
-    /* demodulate() runs ~122x/s but the panel only repaints every
-     * TUI_REFRESH_MS, so all but one push per frame went straight back out
-     * unseen -- and the RADAR_ROWS visible rows spanned 0.16s, which is not a
-     * history. One row per repaint costs ~1/60th as much and makes the panel
-     * span RADAR_ROWS frames of real time. Kept running even when the
-     * waterfall is not the visible panel so switching to it shows data. */
-    static int64_t last_push;
-    int64_t now = esp_timer_get_time();
-    if (now - last_push < TUI_REFRESH_MS * 1000LL) return;
-    last_push = now;
-
-    int bin_size = mag_len / WF_BINS;
-    if (bin_size < 1) bin_size = 1;
-    int row = s_wf_row % RADAR_ROWS;
-
-    /* first pass: compute bins and track peak */
-    uint32_t bins[WF_BINS];
-    uint32_t frame_peak = 1;
-    for (int b = 0; b < WF_BINS; b++) {
-        int start = b * bin_size;
-        int end   = start + bin_size;
-        if (end > mag_len) end = mag_len;
-        uint32_t sum = 0;
-        for (int j = start; j < end; j++) sum += mag[j];
-        bins[b] = sum / (uint32_t)(end - start);
-        if (bins[b] > frame_peak) frame_peak = bins[b];
-    }
-
-    /* IIR track peak with slow decay so display stays responsive */
-    if (frame_peak > s_wf_peak)
-        s_wf_peak = frame_peak;
-    else
-        s_wf_peak = s_wf_peak - (s_wf_peak >> 6) + (frame_peak >> 6);
-    if (s_wf_peak < 256) s_wf_peak = 256;
-
-    /* second pass: normalize to 0-255 using tracked peak */
-    for (int b = 0; b < WF_BINS; b++) {
-        uint32_t v = bins[b] * 255 / s_wf_peak;
-        if (v > 255) v = 255;
-        s_wf[row][b] = (uint8_t)v;
-    }
-    s_wf_row++;
-}
-
-static void render_waterfall(char panel[RADAR_ROWS][RADAR_COLS + 1])
-{
-    /* We still fill the text panel with density chars for the non-coloured path,
-     * but the real display comes from the coloured render in tui_draw().       */
-    static const char dens[] = " .,:;=+*#%@";
-    for (int r = 0; r < RADAR_ROWS; r++) {
-        int src = ((s_wf_row - 1 - r) % RADAR_ROWS + RADAR_ROWS) % RADAR_ROWS;
-        panel[r][RADAR_COLS] = '\0';
-        for (int c = 0; c < RADAR_COLS; c++) {
-            int v = s_wf[src][c];
-            int idx = v * (int)(sizeof(dens) - 2) / 255;
-            if (idx < 0) idx = 0;
-            if (idx > (int)(sizeof(dens) - 2)) idx = (int)(sizeof(dens) - 2);
-            panel[r][c] = dens[idx];
-        }
-    }
-}
-
-/* Right-hand panel, mode 2: who is actually eating each core.
- * STACK is the unused-stack high-water margin, in bytes (ESP-IDF's
- * usStackHighWaterMark is bytes, unlike upstream FreeRTOS's words). */
-static void render_tasks(char panel[RADAR_ROWS][RADAR_COLS + 1])
-{
-    for (int r = 0; r < RADAR_ROWS; r++) {
-        memset(panel[r], ' ', RADAR_COLS);
-        panel[r][RADAR_COLS] = '\0';
-    }
-    snprintf(panel[0], RADAR_COLS + 1, " %-11s %4s %4s %8s", "TASK", "CPU", "CORE", "STACK");
-
-    /* last 2 rows belong to the frame-render probe below. USB drop and the
-     * FEED counters used to live here too, but that made them invisible
-     * whenever RADAR or WFALL was the selected panel; they moved to
-     * render_net_panel() beside the EVENT LOG instead, which is on screen
-     * regardless of the R selection -- freeing these two rows back to the
-     * task list. */
-    const top_stats_t *ts = top_stats();
-    for (int r = 1; r < RADAR_ROWS - 2 && r - 1 < ts->ntasks; r++) {
-        const top_task_t *t = &ts->task[r - 1];
-        char core[4];
-        if (t->core < 0) snprintf(core, sizeof(core), "-");
-        else             snprintf(core, sizeof(core), "%d", t->core);
-        snprintf(panel[r], RADAR_COLS + 1, " %-11.11s %3u%% %4s %8lu",
-                 t->name, (unsigned)(t->pct10 / 10), core, (unsigned long)t->stack_hwm);
-    }
-
-    screen_probe_t pr;
-    screen_probe_get(&pr);
-    snprintf(panel[RADAR_ROWS - 2], RADAR_COLS + 1, " FRAME %5luB  %2lu/s",
-             (unsigned long)pr.bytes, (unsigned long)pr.fps);
-    snprintf(panel[RADAR_ROWS - 1], RADAR_COLS + 1, " asm %3lums/s   out %3lums/s",
-             (unsigned long)pr.asm_ms, (unsigned long)pr.out_ms);
-
-    /* snprintf NUL-terminates early; repaint the tail as spaces so the panel
-     * stays a fixed-width block (the TUI never clears, it overwrites). */
-    for (int r = 0; r < RADAR_ROWS; r++) {
-        int len = (int)strlen(panel[r]);
-        for (int c = len; c < RADAR_COLS; c++) panel[r][c] = ' ';
-        panel[r][RADAR_COLS] = '\0';
-    }
-}
-
-/* Right side of the EVENT LOG panel, otherwise blank -- see tui_draw() below.
- * Unlike RADAR/WFALL/TASKS this is not one of the R-cycled modes, it is
- * always on screen, which is the whole reason USB drop and the FEED
- * counters moved here from render_tasks(): those numbers matter continuously
- * and used to be visible only while TASKS happened to be selected. */
-static void render_net_panel(char panel[LOG_SHOW][RADAR_COLS + 1])
-{
-    for (int r = 0; r < LOG_SHOW; r++) {
-        memset(panel[r], ' ', RADAR_COLS);
-        panel[r][RADAR_COLS] = '\0';
-    }
-
-    char ip[24], ssid[36];
-
-    net_eth_ip_str(ip, sizeof(ip));
-    snprintf(panel[0], RADAR_COLS + 1, " ETH   %s", ip);
-
-    snprintf(panel[1], RADAR_COLS + 1, " AP    %-3s  %d client(s)",
-             net_wifi_ap_enabled() ? "on" : "off", net_wifi_ap_clients());
-
-    net_wifi_sta_ssid(ssid, sizeof(ssid));
-    /* Precision on %s, not just width: an SSID can run to 32 bytes, longer
-     * than this row has room for once the prefix is in, and an unbounded %s
-     * trips -Werror=format-truncation since gcc can't prove the row buffer
-     * is big enough. Truncating is fine here -- the row is display-only. */
-    snprintf(panel[2], RADAR_COLS + 1, " STA   %-3s  ssid %.24s",
-             net_wifi_sta_enabled() ? "on" : "off", ssid[0] ? ssid : "(unset)");
-
-    /* Row 3 is conditional -- blank when there is nothing worth saying (no
-     * upstream configured at all), same as cmd_net()'s retry line in shell.c. */
-    if (net_wifi_state() == NET_WIFI_STA) {
-        net_wifi_sta_ip_str(ip, sizeof(ip));
-        snprintf(panel[3], RADAR_COLS + 1, "       joined %s", ip);
-    } else if (ssid[0] && net_wifi_sta_enabled()) {
-        int tries, next_s;
-        net_wifi_sta_retry(&tries, &next_s);
-        snprintf(panel[3], RADAR_COLS + 1, "       fail %dx  next %ds%s",
-                 tries, next_s, net_wifi_ap_clients() > 0 ? " (held)" : "");
-    } else if (ssid[0]) {
-        snprintf(panel[3], RADAR_COLS + 1, "       disabled (creds kept)");
-    }
-
-    /* Declared here rather than included: esp_libusb.h carries its own,
-     * unrelated struct class_driver_t that clashes with this file's. */
-    extern uint64_t esp_libusb_stream_dropped(void);
-    snprintf(panel[4], RADAR_COLS + 1, " USB   drop %llu",
-             (unsigned long long)esp_libusb_stream_dropped());
-
-    snprintf(panel[5], RADAR_COLS + 1, " FEED  avr%dc:%lu  bst%dc:%lu  json%dc",
-             feed_avr_clients(), (unsigned long)feed_avr_sent(),
-             feed_beast_clients(), (unsigned long)feed_beast_sent(),
-             feed_json_clients());
-
-    for (int r = 0; r < LOG_SHOW; r++) {
-        int len = (int)strlen(panel[r]);
-        for (int c = len; c < RADAR_COLS; c++) panel[r][c] = ' ';
-        panel[r][RADAR_COLS] = '\0';
-    }
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * TUI DRAW
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-/* One frame, assembled with fb_* for screen.c to hand to whoever is watching;
- * called from the draw task only, at most every TUI_REFRESH_MS. */
-static void tui_draw(int64_t now)
-{
-    top_stats_sample(now);
-    const top_stats_t *ts = top_stats();
-
-    if (now - s_rate_ts >= 1000000LL) {
-        s_msg_rate   = s_msg_bucket;
-        s_msg_bucket = 0;
-        s_rate_ts    = now;
-    }
-
-    s_sweep_angle = (s_sweep_angle + 4) % 360;
-
-    int ac = active_count();
-
-    /* Demodulator-side counters, not callback-side: on_msg only ever sees
-     * frames whose CRC already passed, so anything derived there reads 100%
-     * by construction. FIX is the share of good frames that needed single-bit
-     * correction -- it climbs before ERR does as the signal degrades. */
-    unsigned long good  = state.stat_goodcrc;
-    unsigned long total = good + state.stat_badcrc;
-    float dp = total > 0 ? (good * 100.0f / total) : 0.0f;
-    float cp = total > 0 ? (state.stat_badcrc * 100.0f / total) : 0.0f;
-    float fp = good  > 0 ? (state.stat_fixed  * 100.0f / good)  : 0.0f;
-    s_decode_smooth += (dp - s_decode_smooth) * 0.12f;
-    s_crc_smooth    += (cp - s_crc_smooth)    * 0.12f;
-    s_fix_smooth    += (fp - s_fix_smooth)    * 0.12f;
-
-    char uptime[12];
-    fmt_uptime(uptime, sizeof(uptime));
-
-    fb_printf("\033[H");
-
-    /* ┌─────────────────────────────────────────────────┐ */
-    fb_printf(PH_GRID TL); hline(TERM_W); fb_printf(TR EL "\n" RESET);
-
-    /* header — single full-width row */
-    row_begin();
-    {
-        char ip[16];
-        net_eth_state_t est = net_eth_state();
-        net_eth_ip_str(ip, sizeof(ip));
-        const char *net = est == NET_ETH_READY  ? ip
-                        : est == NET_ETH_LINK   ? "dhcp..."
-                        : est == NET_ETH_NOLINK ? "no link"
-                                                : "off";
-        /* WiFi shows both halves of the permanent APSTA at once: how many
-         * phones are on our own SoftAP, and the upstream lease when the STA
-         * side has one. Either can be the useful one depending on whether the
-         * board is in the car or at home. */
-        char wifi[24];
-        net_wifi_state_t wst = net_wifi_state();
-        int  wc  = net_wifi_ap_clients();
-        switch (wst) {
-        case NET_WIFI_STA: {
-            char sip[16];
-            net_wifi_sta_ip_str(sip, sizeof(sip));
-            /* "ap:0" would read as a SoftAP nobody has joined, which is not
-             * the same thing as one that is switched off. */
-            if (net_wifi_ap_enabled())
-                snprintf(wifi, sizeof(wifi), "ap:%d %s", wc, sip);
-            else
-                snprintf(wifi, sizeof(wifi), "sta %s", sip);
-            break;
-        }
-        case NET_WIFI_AP:
-            if (net_wifi_ap_enabled()) snprintf(wifi, sizeof(wifi), "ap:%d", wc);
-            else                       snprintf(wifi, sizeof(wifi), "idle");
-            break;
-        case NET_WIFI_INIT: snprintf(wifi, sizeof(wifi), "init");      break;
-        default:            snprintf(wifi, sizeof(wifi), "off");       break;
-        }
-
-        char feed[8];
-        int  nc = feed_avr_clients();
-        snprintf(feed, sizeof(feed), "%d", nc);
-        int n = (int)strlen("  ATC TERMINAL  //  ESP32-P4 ADS-B RECEIVER"
-                            "  //  1090.000 MHz  //  2 MSPS  //  ETH "
-                            "  //  WIFI   //  FEED ")
-              + (int)strlen(net) + (int)strlen(wifi) + (int)strlen(feed);
-        fb_printf(PH_HI BOLD "  ATC TERMINAL" RESET
-               PH_GRID "  //  " RESET PH_SCAN "ESP32-P4 ADS-B RECEIVER" RESET
-               PH_GRID "  //  " RESET PH_HI "1090.000 MHz" RESET
-               PH_GRID "  //  " RESET PH_MID "2 MSPS" RESET
-               PH_GRID "  //  " RESET PH_DIM "ETH " RESET "%s%s" RESET
-               PH_GRID "  //  " RESET PH_DIM "WIFI " RESET "%s%s" RESET
-               PH_GRID "  //  " RESET PH_DIM "FEED " RESET "%s%s" RESET,
-               est == NET_ETH_READY ? PH_HI : est == NET_ETH_LINK ? PH_MID : PH_DIM,
-               net,
-               (wst == NET_WIFI_STA || wc) ? PH_HI
-                                           : wst == NET_WIFI_AP ? PH_MID : PH_DIM,
-               wifi, nc ? PH_HI : PH_DIM, feed);
-        sp(TERM_W - n);
-    }
-    row_end();
-    sep_full();
-
-    /* status */
-    row_begin();
-    {
-        char vol_str[8];
-        snprintf(vol_str, sizeof(vol_str), "%3d%%", s_muted ? 0 : s_volume);
-        char cpu0[12], cpu1[12];   /* %3d of an int can still be 11 chars */
-        /* Empty when PSRAM is off, so the row keeps its old width. With it on
-         * this is 11 chars against 14 of slack at TERM_W 154 -- see the column
-         * budget note in CLAUDE.md before adding a second field here. */
-        char psram[16] = "";
-#if CONFIG_SPIRAM
-        snprintf(psram, sizeof(psram), "  PSRAM %2luM",
-                 (unsigned long)(ts->psram_free >> 20));
-#endif
-        if (ts->cpu_busy[0] < 0) { strcpy(cpu0, " --"); strcpy(cpu1, " --"); }
-        else {
-            snprintf(cpu0, sizeof(cpu0), "%3d", ts->cpu_busy[0]);
-            snprintf(cpu1, sizeof(cpu1), "%3d", ts->cpu_busy[1]);
-        }
-        /* compute visible width by snprintf to scratch buffer */
-        char scratch[256];
-        int n = snprintf(scratch, sizeof(scratch),
-            "  UP %-9s  ACFT %-3d  MSG/S %-5d  TOTAL %-8d"
-            "  DEC %5.1f%%  ERR %5.1f%%  FIX %5.1f%%  VOL %s"
-            "  CPU0 %s%%  CPU1 %s%%  HEAP %3luK/%3luK%s",
-            uptime, ac, s_msg_rate, s_msg_count,
-            s_decode_smooth, s_crc_smooth, s_fix_smooth, vol_str,
-            cpu0, cpu1,
-            (unsigned long)(ts->heap_free / 1024), (unsigned long)(ts->heap_min / 1024),
-            psram);
-        if (n > TERM_W) n = TERM_W;
-        fb_printf(PH_DIM "  UP " RESET PH_HI "%-9s" RESET
-               PH_DIM "  ACFT " RESET PH_HI BOLD "%-3d" RESET
-               PH_DIM "  MSG/S " RESET PH_SCAN "%-5d" RESET
-               PH_DIM "  TOTAL " RESET PH_MID "%-8d" RESET
-               PH_DIM "  DEC " RESET PH_HI "%5.1f%%" RESET
-               PH_DIM "  ERR " RESET AC_AMBER "%5.1f%%" RESET
-               PH_DIM "  FIX " RESET PH_MID "%5.1f%%" RESET
-               PH_DIM "  VOL " RESET "%s%s" RESET
-               PH_DIM "  CPU0 " RESET "%s%s%%" RESET
-               PH_DIM "  CPU1 " RESET "%s%s%%" RESET
-               PH_DIM "  HEAP " RESET PH_MID "%3luK" RESET
-               PH_DIM "/" RESET "%s%3luK" RESET
-               PH_DIM "%s" RESET,
-               uptime, ac, s_msg_rate, s_msg_count,
-               s_decode_smooth, s_crc_smooth, s_fix_smooth,
-               s_muted ? AC_RED : PH_HI, vol_str,
-               ts->cpu_busy[0] > 80 ? AC_AMBER : PH_HI, cpu0,
-               ts->cpu_busy[1] > 80 ? AC_AMBER : PH_HI, cpu1,
-               (unsigned long)(ts->heap_free / 1024),
-               ts->heap_big < 32768 ? AC_AMBER : PH_DIM,
-               (unsigned long)(ts->heap_min / 1024),
-               psram);
-        sp(TERM_W - n);
-    }
-    row_end();
-
-    /* bars */
-    row_begin();
-    {
-        /* overhead: "  DECODE [" = 10, "] ERR [" = 7, "]" = 1 → 18 total */
-        int bar_w = (TERM_W - 18) / 2;
-        if (bar_w < 10) bar_w = 10;
-        int n = 10 + bar_w + 7 + bar_w + 1;
-        fb_printf(PH_DIM "  DECODE [" RESET);
-        print_bar(PH_HI, s_decode_smooth, 100.0f, bar_w);
-        fb_printf(PH_DIM "] ERR [" RESET);
-        print_bar(AC_AMBER, s_crc_smooth, 100.0f, bar_w);
-        fb_printf(PH_DIM "]" RESET);
-        sp(TERM_W - n);
-    }
-    row_end();
-
-    /* ├─── left ───┼─── right ───┤ */
-    sep_split();
-
-    /* panel header row */
-    row_begin();
-    {
-        /* left: column labels */
-        char hdr[256];
-        int n = snprintf(hdr, sizeof(hdr),
-            "  %-8s  %-9s  %-3s  %8s  %7s  %-5s  %9s  %9s  %5s  %4s ",
-            "ICAO","CALLSIGN","CAT","ALT ft","SPD kt","HDG","LAT","LON","V/S","MSGS");
-        fb_printf(PH_DIM "%s" RESET, hdr);
-        sp(LEFT_W - n);
-        /* inner border */
-        fb_printf(PH_GRID VL RESET);
-        /* right: panel title */
-        const char *title = s_panel_mode == 0 ? " RADAR  [R]"
-                          : s_panel_mode == 1 ? " WFALL  [R]" : " TASKS  [R]";
-        fb_printf(PH_DIM " %-*s" RESET, RADAR_COLS - 1, title);
-    }
-    row_end();
-    sep_split();
-
-    /* render panel */
-    char panel[RADAR_ROWS][RADAR_COLS + 1];
-    if (s_panel_mode == 0)      render_radar(panel);
-    else if (s_panel_mode == 1) render_waterfall(panel);
-    else                        render_tasks(panel);
-
-    /* aircraft rows + panel */
-    int ac_idx = 0;
-    for (int row = 0; row < TABLE_ROWS; row++) {
-        aircraft_t *a = NULL;
-        for (; ac_idx < MAX_TRACKED; ac_idx++) {
-            if (s_aircraft[ac_idx].active) { a = &s_aircraft[ac_idx++]; break; }
-        }
-
-        row_begin();
-
-        if (a) {
-            const char *alt_col = PH_MID;
-            char vs_plain[16] = "  --";
-            char vs_col[64]   = "  --";
-            if (a->vert_rate > 200) {
-                alt_col = PH_HI;
-                snprintf(vs_plain, sizeof(vs_plain), "+%d", a->vert_rate);
-                snprintf(vs_col,   sizeof(vs_col),   PH_HI "+%d" RESET, a->vert_rate);
-            } else if (a->vert_rate < -200) {
-                alt_col = AC_AMBER;
-                snprintf(vs_plain, sizeof(vs_plain), "%d", a->vert_rate);
-                snprintf(vs_col,   sizeof(vs_col),   AC_AMBER "%d" RESET, a->vert_rate);
-            }
-            char lat_s[12] = "   ------";
-            char lon_s[12] = "   ------";
-            if (a->pos_valid) {
-                snprintf(lat_s, sizeof(lat_s), "%+9.4f", a->lat);
-                snprintf(lon_s, sizeof(lon_s), "%+9.4f", a->lon);
-            }
-            const char *dirs[] = {"N","NE","E","SE","S","SW","W","NW"};
-            int didx = (int)(((float)a->heading + 22.5f) / 45.0f) % 8;
-            const char *cs = a->callsign[0] ? a->callsign : "--------";
-
-            const char *cat = plane_cat_label(a->category);
-            const char *cat_col = a->category == PLANE_MILITARY   ? AC_RED
-                                : a->category == PLANE_COMMERCIAL ? PH_MID
-                                : a->category == PLANE_GA         ? AC_CYAN
-                                                                  : PH_DIM;
-
-            /* measure visible width of left panel content */
-            int vis = 2+8+2+9+2+3+2+8+2+7+2+(int)strlen(dirs[didx])+1+3
-                      +2+9+2+9+2+(int)strlen(vs_plain)+2+4+1;
-
-            fb_printf("  " AC_CYAN "%-8lX" RESET
-                   "  " PH_HI   "%-9s" RESET
-                   "  " "%s%-3s" RESET
-                   "  " "%s%8d" RESET
-                   "  " PH_MID  "%7d" RESET
-                   "  " PH_MID  "%s" RESET PH_DIM "-" RESET PH_HI "%03d" RESET
-                   "  " PH_DIM  "%9s" RESET
-                   "  " PH_DIM  "%9s" RESET
-                   "  " "%s"
-                   "  " PH_DIM  "%4d" RESET " ",
-                   (unsigned long)a->icao, cs,
-                   cat_col, cat,
-                   alt_col, a->altitude,
-                   a->velocity,
-                   dirs[didx], a->heading,
-                   lat_s, lon_s,
-                   vs_col,
-                   a->msg_count);
-            sp(LEFT_W - vis);
-        } else {
-            fb_printf(PH_DIM "  ---" RESET);
-            sp(LEFT_W - 5);
-        }
-
-        /* inner border + panel line */
-        fb_printf(PH_GRID VL RESET);
-        if (row < RADAR_ROWS) {
-            if (s_panel_mode == 0) {
-                /* radar: colour each char individually */
-                for (int c = 0; c < RADAR_COLS; c++) {
-                    char ch = panel[row][c];
-                    if      (ch == '*')                                        fb_printf(PH_HI BOLD "%c" RESET, ch);
-                    else if (ch == '/')                                        fb_printf(PH_SCAN "%c" RESET, ch);
-                    else if (ch == ',')                                        fb_printf(PH_DIM "%c" RESET, ch);
-                    else if (ch=='N'||ch=='S'||ch=='E'||ch=='W'||ch=='+'||ch=='|') fb_printf(PH_MID "%c" RESET, ch);
-                    else if (ch == ':')                                        fb_printf(PH_GRID "%c" RESET, ch);
-                    else if (ch == '-' || ch == '.')                           fb_printf(PH_DIM "%c" RESET, ch);
-                    else if (ch != ' ')                                        fb_printf(PH_MID "%c" RESET, ch);
-                    else fb_putc(' ');
-                }
-            } else if (s_panel_mode == 2) {
-                /* tasks: plain fixed-width text, one write for the whole row */
-                fb_printf("%s%s" RESET, row == 0 ? PH_DIM : PH_MID, panel[row]);
-            } else {
-                /* waterfall: heat-map colour gradient green→amber→white */
-                int src = ((s_wf_row - 1 - row) % RADAR_ROWS + RADAR_ROWS) % RADAR_ROWS;
-                for (int c = 0; c < RADAR_COLS; c++) {
-                    int v = s_wf[src][c];
-                    int rr, gg, bb;
-                    if (v < 85) {
-                        /* black → dark green */
-                        rr = 0; gg = 20 + v * 2; bb = 0;
-                    } else if (v < 170) {
-                        /* dark green → bright green/amber */
-                        int t = v - 85;
-                        rr = t * 2; gg = 190 + t; bb = 0;
-                    } else {
-                        /* amber → white-hot */
-                        int t = v - 170;
-                        rr = 170 + t; gg = 255; bb = t * 3;
-                        if (bb > 255) bb = 255;
-                        if (rr > 255) rr = 255;
-                    }
-                    /* use block char for filled look */
-                    char ch = panel[row][c];
-                    if (ch == ' ' || ch == '.') ch = ' ';
-                    fb_printf("\033[38;2;%d;%d;%dm%c" RESET, rr, gg, bb, ch);
-                }
-            }
-        } else {
-            sp(RADAR_COLS);
-        }
-        row_end();
-    }
-
-    sep_split();
-
-    /* event log */
-    static const char hdr[] = "  EVENT LOG   aircraft only -- the board logs to the console";
-    row_begin();
-    fb_printf(PH_DIM "%s", hdr); sp(LEFT_W - (int)sizeof(hdr) + 1);
-    fb_printf(PH_GRID VL RESET);
-    fb_printf(PH_DIM " %-*s" RESET, RADAR_COLS - 1, " NET");
-    row_end();
-
-    /* Seven lines for the sky and for whatever the display said back to a
-     * keystroke -- LOG_SYS is deliberately not among them. The header row
-     * already carries ETH, WIFI and FEED and the radar panel carries USB drop,
-     * so the board's state is on screen continuously; what a board line adds
-     * here is a link retrying on a timer pushing the aircraft off the panel
-     * every 30 s. They go to the console instead, and `log tail` still shows
-     * everything in one stream. */
-    int shown[LOG_SHOW];
-    int nshown = 0;
-    for (int back = 0; back < LOG_LINES && nshown < LOG_SHOW; back++) {
-        int idx = (s_log_head - 1 - back + LOG_LINES * 2) % LOG_LINES;
-        if (!s_log[idx].text[0] || s_log[idx].facility == LOG_SYS) continue;
-        shown[nshown++] = idx;       /* newest first; drawn bottom-up below */
-    }
-
-    static const char *log_cols[] = { PH_DIM, PH_HI, AC_AMBER, AC_CYAN, AC_RED };
-    char net_panel[LOG_SHOW][RADAR_COLS + 1];
-    render_net_panel(net_panel);
-    for (int row = LOG_SHOW - 1; row >= 0; row--) {
-        row_begin();
-        fb_printf("  ");
-        if (row < nshown) {
-            const log_entry_t *e = &s_log[shown[row]];
-            int tlen = (int)strnlen(e->text, sizeof(e->text));
-            fb_printf("%s%s" RESET, log_cols[e->color], e->text);
-            sp(LEFT_W - 2 - tlen);
-        } else {
-            fb_printf(PH_DIM "~" RESET); sp(LEFT_W - 3);
-        }
-        /* right side of log rows: the NET panel, top row first as `row`
-         * counts down from LOG_SHOW-1 to 0 */
-        fb_printf(PH_GRID VL RESET);
-        fb_printf(PH_MID "%s" RESET, net_panel[LOG_SHOW - 1 - row]);
-        row_end();
-    }
-
-    /* └─────────────────────────────────────────────────┘ */
-    fb_printf(PH_GRID BL); hline(LEFT_W); fb_printf(T_UP); hline(RADAR_COLS);
-    fb_printf(BR EL "\n" RESET);
-    fb_printf(PH_DIM "  R828D  " PH_GRID "|" RESET
-           PH_DIM "  RAFAEL MICRO  " PH_GRID "|" RESET
-           PH_DIM "  [Q] SHELL  " PH_GRID "|" RESET
-           PH_DIM "  [M]UTE  " PH_GRID "|" RESET
-           PH_DIM "  [+/-] VOL  " PH_GRID "|" RESET
-           PH_DIM "  [R] RADAR/WFALL/TASKS  " PH_GRID "|" RESET
-           PH_DIM "  [T] TEST PLANE" EL "\n" RESET);
-}
-
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * DEMODULATE  (also feeds waterfall)
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-/* ═══════════════════════════════════════════════════════════════════════════
  * ON_MSG CALLBACK
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -1492,6 +735,7 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
 
     a->last_seen_us = esp_timer_get_time();
     a->msg_count++;
+    a->sig = (uint8_t)mm->signal_level;
 
     if (mm->flight[0]) {
         strncpy(a->callsign, mm->flight, 8);
@@ -1501,6 +745,15 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
         a->category = plane_classify(icao, a->callsign);
         air_log(2, "IDENT    %06lX  %s  %s", (unsigned long)icao, a->callsign,
                 plane_cat_label(a->category));
+    }
+
+    /* mode-s.c fills `identity` for every frame; it is the squawk only in the
+     * two identity replies. */
+    if ((mm->msgtype == 5 || mm->msgtype == 21) && mm->identity) {
+        if (a->squawk != mm->identity)
+            air_log(mm->identity == 7500 || mm->identity == 7600 || mm->identity == 7700 ? 4 : 2,
+                    "SQUAWK   %06lX  %04d", (unsigned long)icao, mm->identity);
+        a->squawk = mm->identity;
     }
 
     if (mm->altitude)         a->altitude  = mm->altitude;
@@ -1528,10 +781,17 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
         else
             a->cpr_odd  = (cpr_frame_t){ mm->raw_latitude, mm->raw_longitude, ts, true };
         bool was_valid = a->pos_valid;
-        if (cpr_decode(a) && !was_valid) {
-            air_log(3, "FIX      %06lX  %+.4f  %+.4f",
-                    (unsigned long)icao, a->lat, a->lon);
-            audio_play(AUDIO_EVT_POSITION);
+        if (cpr_decode(a)) {
+            update_range(a);
+            /* A CPR pair straddling a zone boundary decodes to somewhere
+             * absurd; no real 1090 MHz reception reaches this far. */
+            if (a->dist_km > s_max_range_km && a->dist_km < 600.0f)
+                s_max_range_km = a->dist_km;
+            if (!was_valid) {
+                air_log(3, "FIX      %06lX  %+.4f  %+.4f  %.0f km",
+                        (unsigned long)icao, a->lat, a->lon, a->dist_km);
+                audio_play(AUDIO_EVT_POSITION);
+            }
         }
     }
 
@@ -1548,8 +808,8 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
  * Drives the table, the radar and the log with no antenna and no dongle, so
  * display and feed work can be tested indoors. s_aircraft[] has no lock, so
  * this must run in adsb_rx_task -- the task on_msg() runs in -- whenever that
- * task exists; tui_key() defers to it through s_inject_req for exactly
- * that reason. */
+ * task exists; adsb_inject_test() defers to it through s_inject_req for
+ * exactly that reason. */
 static void inject_fake_aircraft(void)
 {
     /* One entry per plane_classify() bucket, so four presses put one of each
@@ -1578,25 +838,38 @@ static void inject_fake_aircraft(void)
     a->category = plane_classify(a->icao, a->callsign);
 
     /* Placed around the configured antenna, not a fixed lat/lon, so the blips
-     * land inside RADAR_RANGE_KM whatever CONFIG_ADSB_RX_* is set to. */
-    float clat = strtof(CONFIG_ADSB_RX_LAT, NULL);
-    float clon = strtof(CONFIG_ADSB_RX_LON, NULL);
+     * land on the radar whatever CONFIG_ADSB_RX_* is set to; 20..190 km spans
+     * the three range settings. Not counted towards max range. */
+    float clat, clon;
+    antenna_pos(&clat, &clon);
     float ang  = (float)(n * 90 + rev * 17) * (float)M_PI / 180.0f;
-    float km   = 60.0f + (float)((rev * 37) % 240);
-    a->lat = clat + km * cosf(ang) / 111.0f;
-    a->lon = clon + km * sinf(ang) / (111.0f * cosf(clat * (float)M_PI / 180.0f));
+    float km   = 20.0f + (float)((rev * 37) % 170);
+    a->lat = clat + km * cosf(ang) / 111.32f;
+    a->lon = clon + km * sinf(ang) / (111.32f * cosf(clat * (float)M_PI / 180.0f));
     a->pos_valid = true;
+    update_range(a);
 
     a->altitude  = 3000 + ((seq * 2500) % 36000);
     a->velocity  = 180  + ((seq *   37) % 320);
     a->heading   =        ((seq *   53) % 360);
     a->vert_rate = -1600 + ((seq *  448) % 3200);
+    int oct = (seq * 2467) % 4096;      /* four octal digits, as a real squawk */
+    a->squawk    = n == 1 && rev == 1 ? 7700
+                 : ((oct >> 9) & 7) * 1000 + ((oct >> 6) & 7) * 100 + ((oct >> 3) & 7) * 10 + (oct & 7);
+    a->sig       = (uint8_t)(40 + (seq * 61) % 200);
 
     air_log(3, "FAKE     %06lX  %s  %s", (unsigned long)a->icao,
             a->callsign[0] ? a->callsign : "--------",
             plane_cat_label(a->category));
 
     seq++;
+}
+
+void adsb_inject_test(void)
+{
+    /* With no dongle there is no rx task and no writer to race, so inline. */
+    if (s_rx_running) s_inject_req = true;
+    else              inject_fake_aircraft();
 }
 
 /* Sized for the one caller's fixed DEFAULT_BUF_LENGTH chunk. Static rather than
@@ -1610,7 +883,6 @@ void demodulate(uint8_t *source, int length)
     if (length > DEFAULT_BUF_LENGTH) length = DEFAULT_BUF_LENGTH;
     int mag_len = length / 2;
     mode_s_compute_magnitude_vector(source, s_mag, length);
-    waterfall_push(s_mag, mag_len);     /* feed real IQ energy into wfall  */
 
     /* mag_len samples at the fixed 2 MSPS rate span mag_len/2 us; the clock
      * read here lands at the *last* sample, so back it up by that span to get
@@ -1622,64 +894,12 @@ void demodulate(uint8_t *source, int length)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * TUI KEYS / REGISTRATION
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-/* One keystroke, from whichever console task read it, on core0. The keys that
- * leave the display never reach here. Everything below either writes a scalar
- * the draw task only reads, or defers to the demod task -- see s_inject_req. */
-static void tui_key(uint8_t key)
-{
-    switch (key) {
-        case 'r': case 'R':
-            s_panel_mode = (s_panel_mode + 1) % 3;
-            ui_log(3, "PANEL    switched to %s",
-                    s_panel_mode == 0 ? "RADAR"
-                  : s_panel_mode == 1 ? "WATERFALL" : "TASKS");
-            screen_wake(SCREEN_TUI);
-            break;
-        case 'm': case 'M':
-            s_muted = !s_muted;
-            ui_log(2, "AUDIO    %s", s_muted ? "muted" : "unmuted");
-            screen_wake(SCREEN_TUI);
-            break;
-        case '+': case '=':
-            s_volume += 10;
-            if (s_volume > 100) s_volume = 100;
-            screen_wake(SCREEN_TUI);
-            break;
-        case '-':
-            s_volume -= 10;
-            if (s_volume < 0) s_volume = 0;
-            screen_wake(SCREEN_TUI);
-            break;
-        case 't': case 'T':
-            /* Hand it to adsb_rx_task, which is where on_msg() writes the same
-             * table. With no dongle that task does not exist and there is no
-             * writer to race, so do it here instead. */
-            if (s_rx_running) s_inject_req = true;
-            else              inject_fake_aircraft();
-            break;
-        default:
-            break;
-    }
-}
-
-/* Nothing in tui_draw() touches rtldev, so the display works with no dongle
- * enumerated; screen.c paints it only while `tui` has a viewer on it. */
-void adsb_tui_start(void)
-{
-    screen_register(SCREEN_TUI, "the display", TERM_W + 2, TUI_REFRESH_MS, tui_draw, tui_key);
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * ADSB RX TASK  — also polls UART0 for keystrokes
+ * ADSB RX TASK
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 void adsb_rx_task(void *arg)
 {
-    s_start_us = esp_timer_get_time();
-    s_rate_ts  = s_start_us;
+    s_tick_us = esp_timer_get_time();
 
     sys_log(1, "INIT     adsb_rx running on CPU1");
 
@@ -1751,6 +971,7 @@ void adsb_rx_task(void *arg)
          * is handed back deliberately. One tick per half second is ~2% of the
          * IQ budget; taskYIELD() would not do, IDLE is lower priority. */
         int64_t now = esp_timer_get_time();
+        tracker_tick(now);
         if (now - last_yield >= 500000LL) {
             last_yield = now;
             vTaskDelay(1);
@@ -1799,8 +1020,8 @@ void adsb_request_recover(void)
  * these three commands are registered from this file rather than shell.c.
  * They run on the shell task on core0.
  *
- * s_aircraft is read without a lock, exactly as tui_draw() already reads it
- * from tui_task while adsb_rx_task writes it on core1 -- a torn field shows a
+ * s_aircraft is read without a lock, exactly as the display reads it from
+ * the draw task while adsb_rx_task writes it on core1 -- a torn field shows a
  * wrong number for one listing and nothing worse.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -1809,25 +1030,29 @@ static int cmd_ac(int argc, char **argv)
     int64_t now = esp_timer_get_time();
     int     n   = 0;
 
-    printf("%-6s %-8s %-4s %6s %5s %4s %10s %10s %5s %4s\n",
-           "ICAO", "CALLSIGN", "CAT", "ALT", "SPD", "HDG", "LAT", "LON", "MSGS", "AGE");
+    printf("%-6s %-8s %-4s %4s %6s %5s %4s %10s %10s %4s %3s %3s %5s %4s\n",
+           "ICAO", "CALLSIGN", "CAT", "SQK", "ALT", "SPD", "HDG", "LAT", "LON",
+           "DIST", "BRG", "SIG", "MSGS", "AGE");
 
     for (int i = 0; i < MAX_TRACKED; i++) {
         const aircraft_t *a = &s_aircraft[i];
         if (!a->active) continue;
         n++;
 
-        char lat[12] = "---", lon[12] = "---";
+        char lat[12] = "---", lon[12] = "---", dist[8] = "---", brg[8] = "---", sqk[8] = "----";
         if (a->pos_valid) {
-            snprintf(lat, sizeof(lat), "%.4f", a->lat);
-            snprintf(lon, sizeof(lon), "%.4f", a->lon);
+            snprintf(lat,  sizeof(lat),  "%.4f", a->lat);
+            snprintf(lon,  sizeof(lon),  "%.4f", a->lon);
+            snprintf(dist, sizeof(dist), "%.0f", a->dist_km);
+            snprintf(brg,  sizeof(brg),  "%03.0f", a->brg_deg);
         }
-        printf("%06lX %-8s %-4s %6d %5d %4d %10s %10s %5d %3llds\n",
+        if (a->squawk) snprintf(sqk, sizeof(sqk), "%04d", a->squawk);
+        printf("%06lX %-8s %-4s %4s %6d %5d %4d %10s %10s %4s %3s %3u %5d %3llds\n",
                (unsigned long)a->icao,
                a->callsign[0] ? a->callsign : "-",
-               plane_cat_label(a->category),
+               plane_cat_label(a->category), sqk,
                a->altitude, a->velocity, a->heading,
-               lat, lon, a->msg_count,
+               lat, lon, dist, brg, a->sig, a->msg_count,
                (long long)((now - a->last_seen_us) / 1000000));
     }
     printf("%d of %d slots active\n", n, MAX_TRACKED);
@@ -1836,8 +1061,8 @@ static int cmd_ac(int argc, char **argv)
 
 static int cmd_usb(int argc, char **argv)
 {
-    /* Declared here rather than included, for the same reason as in
-     * tui_draw(): esp_libusb.h carries its own unrelated class_driver_t. */
+    /* Declared here rather than included: esp_libusb.h carries its own
+     * unrelated class_driver_t. */
     extern uint32_t esp_libusb_stream_avail(void);
     extern uint64_t esp_libusb_stream_dropped(void);
     extern int      esp_libusb_stream_slots(void);

@@ -2,7 +2,8 @@
 
 `main/shell.c` owns the command line, `main/net_ssh.c` puts the same REPL on a socket,
 `main/screen.c` is the display service both full-screen commands paint through,
-`main/class_driver.c` owns the radar frame and the event ring, `main/top.c` the system monitor.
+`main/tui.c` is the aircraft display, `main/top.c` the system monitor, and `main/class_driver.c`
+owns what they show: the tracker and the event ring, read through `adsb.h`.
 This is the design and the list of things that break if changed.
 
 ## Model
@@ -35,7 +36,7 @@ history, no completion.
 **Commands split by what they can reach**: generic ones (`free`, `tasks`, `net`, `wifi`, `log`,
 `sys`, `tui`, `top`, `ota`, `ssh`, `restart`, `exit`) in `shell.c`; `ac`, `usb`, `sdr` registered
 from `class_driver.c` because they read its statics (`s_aircraft`, `rtldev`). `tasks` is
-`top_batch()`: the sampler in `top.c` is shared by `top`, the TUI's gauges and this command, and
+`top_batch()`: the sampler in `top.c` is shared by `top` and this command, and
 `tasks` forces a fresh 1 s window (sample, sleep, sample) because the sampler only runs while
 something asks — it is frozen whenever no screen is up. esp_hosted registers `mem-dump`,
 `task-dump`, `cpu-dump`, `heap-trace`, `sock-dump`, `host-power-save` into the same console.
@@ -43,8 +44,8 @@ something asks — it is frozen whenever no screen is up. esp_hosted registers `
 ## Screens as a service (`screen.c`)
 
 A *screen* registers a draw callback, a key callback, a period and a width
-(`screen_register()`); `class_driver.c` registers `SCREEN_TUI` from `adsb_tui_start()`, `top.c`
-registers `SCREEN_TOP` from `top_init()`. One draw task (`screen`, core0 prio 2) polls every
+(`screen_register()`); `tui.c` registers `SCREEN_TUI` from `tui_init()`, `top.c` registers
+`SCREEN_TOP` from `top_init()`. One draw task (`screen`, core0 prio 2) polls every
 100 ms and, for each screen that has a viewer and is due, calls its draw with the `fb_*` assembler
 and hands each run of the frame to that screen's *sinks* (`screen_attach(id, fn, ctx)` /
 `screen_detach(fn, ctx)`). Neither screen includes `driver/uart.h` or `net_ssh.h`; `shell.c`
@@ -53,9 +54,10 @@ below stdio for the per-call cost). A third viewer is an adapter plus a `SCREEN_
 
 **Each sink names its screen**, so the two transports can watch different screens at once; a
 screen with no viewer costs nothing but the poll. **Within a screen, state is shared, not
-per-viewer** — one radar panel for everyone, `R` from either viewer switches both, fixed `TERM_W`
-(154) rather than each client's width; `top`'s interval and row cut are likewise the last
-`top` invocation's. Per-client state would multiply core0's per-byte cost by the viewer count.
+per-viewer** — one radar range and one sort order for everyone, a fixed 120 columns rather than
+each client's width, and the height from the last `tui` invocation; `top`'s interval and row cut
+are likewise the last `top` invocation's. Per-client state would multiply core0's per-byte cost
+by the viewer count.
 `enter_screen()` compares `screen_cols(id)` against the client's PTY width and warns on a narrow
 window (a wrapped frame looks like a broken build).
 
@@ -84,7 +86,7 @@ Rules of the attach path:
   key just does nothing).
 
 **The paint lock interlocks the frame and the prompt.** The draw task is prio 2, the console task
-3; leaving a screen would otherwise print the banner into a ~13 KB repaint. `screen_hold()` from
+3; leaving a screen would otherwise print the banner into a ~8 KB repaint. `screen_hold()` from
 `leave_screen()` waits the frame out. Anything else that writes UART0 in response to a keystroke
 needs the same.
 
@@ -100,10 +102,31 @@ SSH the table is cut to the PTY height, over serial every task is printed. The s
 at 1 Hz whoever asks, so with the radar also up the percentages cover 1 s windows, not the `top`
 interval. Note `+`/`-` mean volume in the radar and interval here.
 
+**`tui`** (`tui.c`) is the sky and nothing else — no CPU, heap, network or feed fields; those are
+`top` and `net`. 120 columns: a title line (uptime, contacts and how many fit, frames/s, total,
+DEC % = frames passing CRC over the last second, FIX % = the share that needed a single-bit
+repair, MAX = farthest position decoded since boot, volume), then an 85-column table beside a
+33-column radar, then the event log, then the key legend. The table has ICAO, callsign, category,
+squawk (7500/7600/7700 turn the row red and are logged), altitude, speed, heading, vertical rate,
+distance and bearing from `CONFIG_ADSB_RX_LAT/LON`, the last frame's signal level, message count
+and seconds since the last frame; a row dims past 15 s and is dropped at 60. Sorted by distance
+(no position last, then freshest), `s` cycles distance / altitude / messages / freshness. The
+radar is north-up with rings at half and full range; `<`/`>` (also `,`/`.`, `[`/`]`) step the
+range through 50/100/200 km, blips take the category colour and carry three callsign letters.
+Height follows the terminal, but the table is sized to its contents — never shorter than the
+radar's 15 rows, growing in steps of five so the log does not hop on every contact — and the
+event log takes everything else, newest first under the table, so a tall window buys history
+rather than blank table rows. When even the radar does not fit, the log gives way first (six
+lines minimum, two on a very short terminal). SSH reports the PTY height; serial assumes 40,
+`tui <rows>` overrides. Repaints in place like `top`.
+
 **The `t` hotkey defers to the demod loop.** `inject_fake_aircraft()` writes `s_aircraft[]`, which
-has no lock; the key is read on core0, so `tui_key()` sets `s_inject_req` and `adsb_rx_task`
-does the work. With no dongle that task does not exist, so it runs inline. Same for anything else
-in a key handler that touches the aircraft table.
+has no lock; the key is read on core0, so `tui_key()` calls `adsb_inject_test()`, which sets
+`s_inject_req` for `adsb_rx_task` to act on. With no dongle that task does not exist, so it runs
+inline. Expiry follows the same rule: it used to live in the draw loop, so with nobody watching
+the table never emptied; now `tracker_tick()` runs from the demod loop once a second and
+`adsb_tick()` from the draw task covers the no-dongle case only. Same for anything else in a key
+handler that touches the aircraft table.
 
 ## SSH preempts the serial shell
 
@@ -120,23 +143,26 @@ into the dying channel.
 
 ## Event log
 
-One ring (32 entries; the panel shows `LOG_SHOW` = 7), three entry points declared in `shell.h`
-over a common `log_put()`:
+One ring (`ADSB_LOG_LINES` = 64; the panel shows as many as the terminal has room for), three
+entry points declared in `shell.h` over a common `log_put()`:
 
 | | covers | LOG panel | reaches a prompt at |
 |---|---|---|---|
 | `sys_log()` | the board — USB, IQ stream, WiFi, Ethernet, OTA, web server, console | **no** | `sys` and above |
-| `air_log()` | the sky — CONTACT / IDENT / FIX / ALT / VEL / LOST | yes | `brief` (colours 1 and 4 only) and `all` |
-| `ui_log()` | the display answering a key — PANEL, AUDIO, `leave_screen()`'s refusal | yes | `all` only |
+| `air_log()` | the sky — CONTACT / IDENT / SQUAWK / FIX / LOST; ALT / VEL in colour 0 are **measurements**, echoed at `all` but never stored | yes | `brief` (colours 1 and 4 only) and `all` |
+| `ui_log()` | the display answering a key — `leave_screen()`'s refusal | yes | `all` only |
 
 The split is on both ends: the panel is aircraft-only, the prompt board-only by default. A board
-line in a seven-line panel (a link retrying every 30 s) wipes the aircraft out, and the header row
-already carries ETH/WIFI/FEED and the radar panel `USB drop`. `tui_draw()` walks the ring backwards
-collecting the last `LOG_SHOW` non-`LOG_SYS` entries. The console default is `sys` (ALT/VEL lines
-arrive several a second with traffic); it starts at `all` so a boot failure is not silent, and
-`shell_console_start()` drops it once the prompt is up. `ui_log()` exists because `PANEL switched
-to WFALL` is feedback for whoever pressed `R` — through `sys_log()` it would print into the *other*
-transport's prompt. `log tail` is the one view that shows every facility in one stream.
+line in the panel (a link retrying every 30 s) pushes the aircraft out, and the board's state is
+`top`'s and `net`'s business. Measurements are kept out of the ring for the same reason: at a few
+per second they turned it over in seconds and took the events with them, which is what the panel
+in the first `tui` build showed — six ALT/VEL lines and no contact history. `adsb_log_recent()` walks the ring backwards collecting
+the last non-`LOG_SYS` entries. The console default is `sys` (ALT/VEL lines arrive several a
+second with traffic); it starts at `all` so a boot failure is not silent, and
+`shell_console_start()` drops it once the prompt is up. `ui_log()` exists because a refusal is
+feedback for whoever pressed the key — through `sys_log()` it would print into the *other*
+transport's prompt (sort, range and volume changes show in the frame itself and are not logged).
+`log tail` is the one view that shows every facility in one stream.
 
 **`shell_async_print()`** — asynchronous output (a WiFi event, a USB stall) wipes the prompt line
 (`\r\033[K`), prints, then redraws prompt and buffer through `stdout`, so SSH gets the same
@@ -219,7 +245,7 @@ Not in `README.md` (which stops at the console itself), so kept here.
 
 | command | effect |
 |---|---|
-| `tui` / `q` | enter / leave the radar display (`:`, Ctrl-C, Ctrl-D also leave). Inside: `R` cycles RADAR/WFALL/TASKS, `t` injects a synthetic contact, `m` / `+` / `-` audio |
+| `tui [rows]` / `q` | enter / leave the aircraft display (`:`, Ctrl-C, Ctrl-D also leave); `rows` for a serial terminal that is not 40 lines. Inside: `s` cycles the sort (dist / alt / msgs / seen), `<` `>` step the radar range (50 / 100 / 200 km), `t` injects a synthetic contact, `m` / `+` / `-` audio |
 | `top [seconds]` / `q` | enter / leave the system monitor: per-core busy %, heap, PSRAM, display cost, per-task CPU%/stack/TIME+ busiest first, refreshed every `seconds` (1–60, default 2). Inside: `+` / `-` change the interval |
 | `tasks`, `usb`, `free`, `sys`, `ac`, `sdr`, `net` | `top` once over a fresh 1 s window / USB stream probe / heap / board / aircraft table / tuner / network as text — the way to read numbers that have to be copied. `net` also prints the STA failure count and seconds to the next attempt |
 | `log echo <off\|sys\|brief\|all>`, `log tail` | move the console end of the event split; dump every facility in one stream |

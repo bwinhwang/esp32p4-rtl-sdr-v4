@@ -89,9 +89,6 @@ void shell_remote_close(void);
  * registered there. shell_init() calls this after esp_console_init(). */
 void adsb_register_shell_cmds(void);
 
-/* Registers the radar display with screen.c. Call after screen_start(). */
-void adsb_tui_start(void);
-
 /* ── the event log (class_driver.c) ──────────────────────────────────────────
  * One ring, three kinds of line, and separating them is the whole point:
  *

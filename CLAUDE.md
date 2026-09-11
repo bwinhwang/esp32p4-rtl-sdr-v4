@@ -130,17 +130,17 @@ ssh_srv             core0 prio 3   accept loop; runs the line editor and the com
   `usb_host_client_handle_events()`, which is only ever `class_driver_task`. That copy is ~1% of
   core0.
 - **Core0 load is console bytes/second and nothing else** (~8 µs CPU per byte out of UART0, a
-  repaint ~13 KB). `TUI_REFRESH_MS` is the throttle: 150 → 63% of core0, 500 → 16%. `-O2`,
+  repaint 6–8 KB depending on how many rows are filled; the old 156-column frame was 13 KB).
+  `TUI_REFRESH_MS` is the throttle: at 13 KB, 150 → 63% of core0, 500 → 16%. `-O2`,
   `setvbuf` and bypassing the stdio lock were all measured and do not help. Never route the frame
   through `printf`: `uart_vfs`'s `write()` calls `uart_write_bytes(&c, 1)` **per character** for
   the CRLF translation, one mutex per byte. `fb_flush()` writes `uart_write_bytes()` directly.
 - Measure with `top` (`top [seconds]`; per-core busy %, internal heap / PSRAM, per-task CPU%, stack
   headroom, TIME+, and the `display` line = the console-bytes cost of whatever screens are up),
-  or `tasks` / `usb` when numbers have to be copied. The TUI's `CPU0`/`CPU1` gauges and TASKS
-  panel read the same sampler (`top.c`) until the TUI rewrite drops them. Needs
-  `CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS`; the counter is `..._COUNTER_TYPE_U64` so TIME+ does
-  not wrap every 71 min.
-- **`heap internal` in `top` (and `HEAP` on the TUI status row) is internal RAM only**
+  or `tasks` / `usb` when numbers have to be copied. The aircraft display shows nothing about the
+  board — that split is deliberate. Needs `CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS`; the counter
+  is `..._COUNTER_TYPE_U64` so TIME+ does not wrap every 71 min.
+- **`heap internal` in `top` is internal RAM only**
   (`heap_caps_get_free_size(MALLOC_CAP_INTERNAL)`) — `esp_get_free_heap_size()` folds in 32 MB of
   PSRAM and hides the number that actually runs out. PSRAM is the separate line/field. A min-ever
   below the 32 KB `SPIRAM_MALLOC_RESERVE_INTERNAL` line means task stacks/DMA callers are eating
@@ -150,7 +150,7 @@ ssh_srv             core0 prio 3   accept loop; runs the line editor and the com
 - **Priority vs the demod loop.** lwIP's tcpip task (prio 18) is pinned by
   `CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0`. esp_hosted's `sdio_*`/`rpc_*` tasks are **prio 23 with
   no affinity**, hardcoded in `port_esp_hosted_host_os.h` with plain `xTaskCreate`; no Kconfig or
-  runtime API can pin them (they show `-` in the TASKS panel's CORE column). Measured under a
+  runtime API can pin them (they show `-` in `top`'s CORE column). Measured under a
   10 Mbit/s flood they land mostly on core0 and cost no IQ samples — scheduler behaviour, not a
   guarantee. If `USB drop` ever climbs, the fix is vendoring the component to pin them to core0.
   **Do not raise `adsb_rx_task` above 23** — it would starve the SDIO link it depends on. And
@@ -190,16 +190,21 @@ CRC clean, ADS-B v2, consecutive squawks 3631/3632, coherent moving fixes NE ove
 — most likely UAVs or a test flight with unset identity. All-digit callsigns exist in the wild;
 `plane_cat.c` leaves them `UNK`.
 
-The **`t` key** (`inject_fake_aircraft()`) pushes one synthetic contact per press, cycling the
-four categories, positioned relative to `CONFIG_ADSB_RX_LAT/LON`. `s_aircraft[]` has no lock and
-is safe only because `on_msg()` runs in `adsb_rx_task` — so the key handler (core0) sets
-`s_inject_req` and the demod loop does the write; with no dongle there is no writer to race and it
-runs inline. Same rule for anything else added to a key handler that touches the aircraft table:
-defer it.
+**`s_aircraft[]` has no lock; `adsb_rx_task` is its only writer.** `on_msg()` runs there, and so
+does `tracker_tick()` — expiry (60 s), the message rate, the DEC/FIX window — from the demod loop
+once a second. Everything else reads through `adsb.h` (`tui.c`, `feed_json.c`, `ac`) and takes a
+torn field as one wrong number. The **`t` key** (`adsb_inject_test()`) pushes one synthetic
+contact per press, cycling the four categories, positioned relative to `CONFIG_ADSB_RX_LAT/LON`:
+the key handler (core0) sets `s_inject_req` and the demod loop does the write. With no dongle
+there is no writer to race, so it runs inline, and `adsb_tick()` from the draw task runs the
+expiry the same way. Same rule for anything else that touches the table: defer it.
 
-**TUI column budget**: header and rows are 88 visible chars against `LEFT_W` = 111. Each row also
-hand-computes its `vis` width to pad the coloured line — a new column means updating that too, or
-the right panel shifts.
+**TUI column budget** (`tui.c`): 120 columns = 85-column table + `│` + space + 33-column radar.
+Every table row is exactly `TABLE_W` wide because every field is fixed width and clamped (`dist`
+9999, `msgs` 99999, `vs` ±9999); a new column changes `TABLE_W`, the header format and `ROW_FMT`
+together or the divider shifts. Height follows the terminal (`tui_set_rows()`; SSH reports it,
+serial assumes 40 unless `tui <rows>`), but the table is sized to its contents and the log takes
+the rest — a taller window is more history, not more empty rows.
 
 ## Console REPL and SSH — invariants only
 
@@ -212,7 +217,7 @@ Full design in `docs/console.md`. What breaks if dropped:
   TUI/TOP`, one per transport) are independent axes. SSH **preempts** the serial shell. Handover
   order is fixed: **claim → swap stdout → print banner**, and on exit **restore stdout → close**.
 - Screens are a service (`screen.c`: `screen_attach/screen_detach`, one draw task); neither
-  `class_driver.c` nor `top.c` knows a transport. Each sink names its screen, so the radar on
+  `tui.c` nor `top.c` knows a transport. Each sink names its screen, so the radar on
   serial and `top` over SSH coexist; within a screen, state and width are shared across viewers.
   `screen_attach()` clears the terminal itself before publishing the slot — never clear after.
 - `screen.c`'s paint lock interlocks the frame and the prompt; anything that writes UART0 in

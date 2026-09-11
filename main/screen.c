@@ -206,7 +206,7 @@ void fb_printf(const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    fb_room(256);
+    fb_room(512);       /* a fully coloured 120-column line is ~300 bytes */
     int room = (int)sizeof(s_fb) - s_fb_len;
     int n = vsnprintf(s_fb + s_fb_len, (size_t)room, fmt, ap);
     va_end(ap);

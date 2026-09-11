@@ -81,12 +81,11 @@ growing those numbers back up is a reasonable follow-up if throughput ever
 needs it.
 
 ### Added
-*TUI is a rough Draft and will be expanded
 - **ADS-B decoder** using the mode-s library, decoding DF17 extended squitter messages
 - **Console REPL** on the serial port (and over SSH) — aircraft table, USB/tuner state, task CPU, heap, network and WiFi setup, all without a host tool
-- **Live TUI** rendered via ANSI escape codes — no host software required; opened with the `tui` command in the ESP-IDF serial monitor, over SSH, or both at once
+- **Live TUI** rendered via ANSI escape codes — no host software required; opened with the `tui` command in the ESP-IDF serial monitor, over SSH, or both at once. 120 columns, height follows the terminal; aircraft only — the board's own numbers live in `top`
 - **`top`** — a Linux-`top`-shaped system monitor in the same console: per-core load, internal heap and PSRAM, the display's own console-bytes cost, and every FreeRTOS task with CPU%, stack headroom and run time, refreshing in place; runs alongside the TUI on the other transport
-- **Aircraft tracking table** showing ICAO address, callsign, altitude, ground speed, heading, EW/NS velocity components, vertical rate, and message count
+- **Aircraft tracking table** showing ICAO address, callsign, category, squawk (emergency codes in red), altitude, ground speed, heading, vertical rate, distance and bearing from the antenna, signal level, message count and age; sorted by distance, altitude, messages or freshness (`s`), beside a north-up radar with a 50 / 100 / 200 km range (`<` `>`)
 - **Event log** showing new contacts, lost contacts, identification, altitude, and velocity events
   — split by facility, so a console prompt gets the board's events (USB, WiFi, Ethernet, OTA) while
   the aircraft traffic stays in the display; `log echo <off|sys|brief|all>` moves the line
@@ -126,7 +125,7 @@ SSH server serves — so the board is usable with no dongle, no antenna and no
 network. `help` lists the commands; `tui` opens the live display once the
 dongle enumerates and the tuner locks, `top [seconds]` the system monitor, and
 `q` in either returns to the prompt. Both work the same way in an SSH session —
-the display needs a 156-column window, `top` an 80-column one.
+the display needs a 120-column window, `top` an 80-column one.
 Press `ctrl+]` to exit the monitor itself.
 
 ---

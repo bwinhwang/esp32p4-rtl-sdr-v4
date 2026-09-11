@@ -46,6 +46,7 @@
 #include "shell.h"
 #include "screen.h"
 #include "top.h"
+#include "tui.h"
 #include "net_eth.h"
 #include "net_ssh.h"
 #include "net_wifi.h"
@@ -564,6 +565,15 @@ full:
 
 static int cmd_tui(int argc, char **argv)
 {
+    int rows = (s_owner == OWNER_SSH) ? net_ssh_pty_rows() : 0;
+    if (argc > 1) {
+        rows = atoi(argv[1]);
+        if (rows < 24 || rows > 200) {
+            printf("usage: tui [rows]   -- terminal height, 24..200 (serial assumes 40)\n");
+            return ESP_ERR_INVALID_ARG;
+        }
+    }
+    tui_set_rows(rows);
     return enter_screen(SCREEN_TUI);
 }
 
@@ -896,7 +906,7 @@ void shell_init(void)
     reg("log",     "recent receiver events, echo control, esp_log levels",         cmd_log);
     reg("sys",     "firmware build, IDF version, uptime, reset reason",            cmd_sys);
     reg("ota",     "OTA slot/version status, or 'ota rollback' to revert",         cmd_ota);
-    reg("tui",     "open the radar display on this console; 'q' returns",          cmd_tui);
+    reg("tui",     "the aircraft display, 'tui [rows]'; 'q' returns",             cmd_tui);
     reg("top",     "live CPU/heap/task monitor, 'top [seconds]'; 'q' returns",      cmd_top);
     reg("restart", "reboot the board",                                             cmd_restart);
     reg("exit",    "close this session (SSH); the serial console is top level",    cmd_exit);
