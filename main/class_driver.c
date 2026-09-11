@@ -40,7 +40,11 @@
 #define CLIENT_NUM_EVENT_MSG  5
 #define MAX_PACKET_SIZE       16384
 #define DEFAULT_BUF_LENGTH    (MAX_PACKET_SIZE * 2)
-#define MAX_TRACKED           16
+/* Table depth, not screen depth: the TUI paints TABLE_ROWS of these and the
+ * header's ACFT count says how many there really are. A full table drops
+ * new contacts on the floor (find_or_create() returns NULL) rather than
+ * evicting, so size it for the busiest sky, not the screen. ~100 B each. */
+#define MAX_TRACKED           64
 /* Ring depth, not screen depth: the TUI shows the last LOG_SHOW of these, and
  * `log tail` -- the only way to see receiver events while the display is in
  * the background -- reads the rest. 32 x 81 B of internal RAM. */

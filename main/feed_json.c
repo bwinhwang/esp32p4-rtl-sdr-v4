@@ -32,7 +32,15 @@ extern size_t aircraft_export_ndjson(char *buf, size_t bufsize);
 #define FEED_PORT     8888
 #define MAX_CLIENTS   4
 #define TICK_MS       750   /* ~1.3 Hz, inside the plan's 1-2 Hz target */
-#define SNAPSHOT_MAX  4096  /* MAX_TRACKED=16 aircraft, ~200B each, generous */
+/* MAX_TRACKED=64 aircraft at <=~180 B each plus the header, ~11.6 KB worst
+ * case; json_append() truncates silently past this, which is a broken line. */
+#define SNAPSHOT_MAX  16384
+/* A snapshot is now ~2x CONFIG_LWIP_TCP_SND_BUF_DEFAULT (5760), so a
+ * non-blocking send() would short-write on EVERY tick, not just for a client
+ * that has stalled. Blocking send with this cap instead: lwIP pushes the rest
+ * as the window drains (milliseconds on a LAN), and a client that really has
+ * stalled costs the tick at most this long before it is skipped. */
+#define SEND_TIMEOUT_MS  250
 
 static const char *TAG = "json";
 
@@ -86,7 +94,9 @@ static void accept_new(void)
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     setsockopt(fd, SOL_SOCKET,  SO_KEEPALIVE, &one, sizeof(one));
-    fcntl(fd, F_SETFL, O_NONBLOCK);
+    struct timeval tv = { .tv_sec = 0, .tv_usec = SEND_TIMEOUT_MS * 1000 };
+    setsockopt(fd, SOL_SOCKET,  SO_SNDTIMEO, &tv, sizeof(tv));
+    fcntl(fd, F_SETFL, 0);   /* blocking: see SEND_TIMEOUT_MS; poll_closed() uses MSG_DONTWAIT */
 
     s_cli[slot] = fd;
     s_nclients++;
@@ -110,8 +120,9 @@ static void broadcast(const char *buf, size_t n)
         if (s_cli[i] < 0) continue;
         /* No retry and no partial-write bookkeeping: this is the whole
          * point of the one-shared-snapshot design (see file header) -- a
-         * short write or EWOULDBLOCK here just costs that client one tick,
-         * never a queue to catch up on. Only a hard error drops it. */
+         * short write or EWOULDBLOCK (lwIP's send timeout) here just costs
+         * that client one tick, never a queue to catch up on. Only a hard
+         * error drops it. */
         int r = send(s_cli[i], buf, n, 0);
         if (r < 0 && errno != EWOULDBLOCK && errno != EAGAIN)
             client_close(i);
