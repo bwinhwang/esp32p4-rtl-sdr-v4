@@ -61,6 +61,16 @@ int net_ssh_pty_cols(void);
  * ring is full instead of dropping. No-op when no session is up. */
 void net_ssh_tui_write(const char *data, size_t n);
 
+/* Like net_ssh_tui_write(), but for the one caller that runs on the ssh_srv
+ * task itself (shell.c's leave_tui_ssh(), via shell_remote_byte()) rather
+ * than on tui_task. net_ssh_tui_write() only *waits* for room, trusting this
+ * task's own run_shell() loop to open some up by draining the ring -- which
+ * cannot happen while this task is still inside the call that's waiting.
+ * This drains inline instead of waiting, so it is safe to call from here (and
+ * wrong to call from anywhere else -- it touches libssh). No-op with no
+ * session up. */
+void net_ssh_write_now(const char *data, size_t n);
+
 /* Username the server will accept ("---" when no credentials are stored). */
 void net_ssh_user_str(char *dst, size_t n);
 

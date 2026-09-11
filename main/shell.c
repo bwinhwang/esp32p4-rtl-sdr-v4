@@ -756,8 +756,21 @@ static void leave_tui_ssh(void)
     s_tui_ssh = false;
     adsb_tui_hold();            /* let the run in flight finish first */
     s_len = 0;
-    printf(CLS PROMPT);
-    fflush(stdout);
+
+    /* printf() would push this through stdout -> log_push(), which -- unlike
+     * ssh_sink()'s net_ssh_tui_write() -- drops rather than waits when the
+     * ring has no room, and right after the last frame push it usually has
+     * none: the frame itself just filled it on a slow link. net_ssh_tui_write()
+     * itself is also wrong here even though it waits, for a subtler reason:
+     * this function runs *on the ssh_srv task*, and that wait is for the same
+     * task's own run_shell() loop to drain the ring -- which cannot happen
+     * while this task is still in here waiting. net_ssh_write_now() drains
+     * the ring itself instead of hoping someone else does, which is also what
+     * makes it correct rather than just non-blocking: the stale frame
+     * content already committed to the ring has to actually leave before a
+     * clear-screen behind it means anything. */
+    static const char leave_msg[] = CLS PROMPT;
+    net_ssh_write_now(leave_msg, sizeof(leave_msg) - 1);
 }
 
 static void console_task(void *arg)

@@ -54,6 +54,7 @@
 #include "esp_log.h"
 #include "esp_console.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 
@@ -80,7 +81,11 @@ static const char *TAG = "ssh";
  * esp_console_run() synchronously and nothing drains the ring until it
  * returns -- so this is sized for that, not for steady-state traffic. */
 #define OUT_RING_SZ     16384
-#define READ_TIMEOUT_MS 20              /* how often the ring gets flushed */
+#define READ_TIMEOUT_MS 20              /* poll interval while the ring is empty */
+/* While the ring has backlog, run_shell() polls for input at this cadence
+ * instead of READ_TIMEOUT_MS -- see the comment there for why. */
+#define BUSY_POLL_MS    2
+#define FLUSH_BUDGET_US (60 * 1000)     /* max ms flush_ring() writes before yielding to a read */
 #define AUTH_TRIES      3
 
 /* ═════════════════════════════════════════════════════════════════════════════
@@ -470,14 +475,55 @@ static ssh_channel cb_channel_open(ssh_session session, void *ud)
  * The shell session
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+/* Draining the whole backlog before returning to ssh_channel_read_timeout()
+ * is fine on a healthy link -- each write is sub-ms and the loop is back
+ * reading within READ_TIMEOUT_MS regardless. Over a slow/lossy link (a phone
+ * hotspot) each ssh_channel_write() can itself take tens to hundreds of ms,
+ * and a full 16KB backlog is up to 32 of them: the read side starves for as
+ * long as that takes, which is what makes keystrokes feel dead. Capping by
+ * wall-clock time rather than chunk count costs nothing on the healthy path
+ * (the budget is never hit) and bounds the stall on the slow one -- the rest
+ * of the ring just waits for the next pass through the loop.
+ *
+ * The bound only helps if the loop actually comes back promptly -- see
+ * run_shell()'s BUSY_POLL_MS for the other half of this. */
 static bool flush_ring(ssh_channel ch)
 {
     uint8_t buf[512];
     size_t  n;
+    int64_t t0 = esp_timer_get_time();
     while ((n = ring_pop(buf, sizeof(buf))) > 0) {
         if (ssh_channel_write(ch, buf, (uint32_t)n) == SSH_ERROR) return false;
+        if (esp_timer_get_time() - t0 >= FLUSH_BUDGET_US) break;
     }
     return true;
+}
+
+/* The channel of the session run_shell() is currently serving -- valid only
+ * for the duration of that call, which is this task's. net_ssh_write_now()
+ * needs it to drain the ring itself rather than wait on the loop below. */
+static ssh_channel s_active_channel;
+
+/* See the declaration in net_ssh.h for why this exists instead of reusing
+ * net_ssh_tui_write(). Draining first and pushing as room opens up, rather
+ * than pushing once and then draining, means it also works through whatever
+ * backlog the display already left in the ring before this call's own bytes
+ * can even be queued -- which is correct, not just a side effect: content
+ * already committed to the wire has to leave before a clear-screen means
+ * anything. Bounded the same way everything else touching this ring is, so a
+ * client that has stopped reading cannot wedge this task here forever. */
+void net_ssh_write_now(const char *data, size_t n)
+{
+    if (!s_ring || !s_active_channel) return;
+
+    int64_t t0 = esp_timer_get_time();
+    while ((n > 0 || ring_used() > 0) && esp_timer_get_time() - t0 < 3000000) {
+        size_t did = ring_push((const uint8_t *)data, n);
+        data += did;
+        n    -= did;
+        if (!flush_ring(s_active_channel)) return;
+        if (did == 0 && n > 0) vTaskDelay(pdMS_TO_TICKS(5));  /* ring stayed full; give the peer a beat */
+    }
 }
 
 /* This task is single-threaded, so while it is serving a session it is not in
@@ -539,26 +585,44 @@ static void run_shell(ssh_channel ch)
     stdio_save_t saved;
     stdio_redirect(s_out, &saved);   /* see the file header for why this is global */
 
+    s_active_channel = ch;      /* net_ssh_write_now() needs this for the duration */
+
     shell_remote_open();
 
     s_state = NET_SSH_SESSION;
     flush_ring(ch);             /* the banner shell_remote_open() just printed */
 
     uint8_t buf[256];
-    bool    live  = true;
-    int     ticks = 0;
+    bool    live         = true;
+    int64_t next_reject  = esp_timer_get_time() + 500000;
 
     while (live && ssh_channel_is_open(ch) && !ssh_channel_is_eof(ch)) {
-        int n = ssh_channel_read_timeout(ch, buf, sizeof(buf), 0, READ_TIMEOUT_MS);
+        /* Waiting the full READ_TIMEOUT_MS here for a keystroke that never
+         * comes is free when the ring is empty -- there is nothing else this
+         * task could be doing. It is not free when the ring has backlog: that
+         * wait runs *between* every FLUSH_BUDGET_US-sized write burst, so on a
+         * slow link it was costing as much dead time as the write itself,
+         * roughly halving throughput (this is what made the TUI's SSH refresh
+         * visibly slower after flush_ring() got bounded). Polling fast instead
+         * while there is something to drain gets almost all of that back,
+         * without reopening the starvation the bound exists to prevent --
+         * ring_used() is read without the mutex, which is fine for a
+         * poll-interval heuristic. */
+        int wait_ms = ring_used() ? BUSY_POLL_MS : READ_TIMEOUT_MS;
+        int n = ssh_channel_read_timeout(ch, buf, sizeof(buf), 0, wait_ms);
         if (n == SSH_ERROR) break;
 
         for (int i = 0; i < n && live; i++) live = shell_remote_byte(buf[i]);
 
         if (!flush_ring(ch)) break;
 
-        if (++ticks >= 500 / READ_TIMEOUT_MS) { ticks = 0; reject_extra(); }
+        /* Wall-clock rather than a loop-iteration count: wait_ms now varies,
+         * so a fixed tick count no longer means a fixed elapsed time. */
+        int64_t now = esp_timer_get_time();
+        if (now >= next_reject) { next_reject = now + 500000; reject_extra(); }
     }
 
+    s_active_channel = NULL;
     stdio_restore(&saved);      /* before anything else can printf */
 
     shell_remote_close();
