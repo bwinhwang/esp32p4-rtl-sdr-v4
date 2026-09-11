@@ -767,6 +767,20 @@ static void ssh_task(void *arg)
         struct sockaddr_storage sa;
         socklen_t               salen = sizeof(sa);
         socket_t                fd    = ssh_get_fd(session);
+
+        /* A client killed or carried out of range (broken pipe, no clean
+         * channel close) leaves libssh's channel "open" forever: run_shell()'s
+         * ssh_channel_read_timeout() keeps timing out, the loop never breaks,
+         * and reject_extra() then refuses every new connection until a reboot.
+         * Keepalive is the only thing that turns a vanished peer into a socket
+         * error the read can see -- ~30 s (15 + 5*3) here. */
+        if (fd >= 0) {
+            int on = 1, idle = 15, intvl = 5, cnt = 3;
+            setsockopt(fd, SOL_SOCKET,  SO_KEEPALIVE,  &on,    sizeof(on));
+            setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,  &idle,  sizeof(idle));
+            setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+            setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt));
+        }
         if (fd >= 0 && getpeername(fd, (struct sockaddr *)&sa, &salen) == 0) {
             char ip[INET6_ADDRSTRLEN] = "?";
             if (sa.ss_family == AF_INET) {
