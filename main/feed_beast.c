@@ -96,13 +96,17 @@ void feed_beast_push(const unsigned char *msg, int msgbits,
     __atomic_store_n(&s_head, h + 1, __ATOMIC_RELEASE);
 }
 
-static void client_close(int i)
+/* `why` distinguishes "the peer hung up" from "we gave up on it" -- without
+ * it every close looks identical in the log, and there is no way to tell a
+ * client that reconnects on its own from one this board is dropping for
+ * falling behind. */
+static void client_close(int i, const char *why)
 {
     close(s_cli[i].fd);
     s_cli[i].fd    = -1;
     s_cli[i].stall = 0;
     s_nclients--;
-    ESP_LOGI(TAG, "client gone, %d left", s_nclients);
+    ESP_LOGI(TAG, "client gone, %d left (%s)", s_nclients, why);
 }
 
 static void listen_open(void)
@@ -179,9 +183,9 @@ static void broadcast(const uint8_t *buf, size_t n)
         } else if (r < 0 && (errno == EWOULDBLOCK || errno == EAGAIN)) {
             /* Reader can't keep up. Dropping its batch is the whole point of
              * not blocking here; only a client that never recovers is closed. */
-            if (++s_cli[i].stall > STALL_LIMIT) client_close(i);
+            if (++s_cli[i].stall > STALL_LIMIT) client_close(i, "write stalled");
         } else if (r < 0) {
-            client_close(i);
+            client_close(i, strerror(errno));
         }
         /* A short write truncates one frame mid-stream. The next lone 0x1A
          * followed by a valid type byte resyncs both dump1090 and readsb. */
@@ -195,8 +199,10 @@ static void poll_closed(void)
         if (s_cli[i].fd < 0) continue;
         /* An idle feed would otherwise not notice a FIN until the next frame. */
         int r = recv(s_cli[i].fd, scratch, sizeof(scratch), MSG_DONTWAIT);
-        if (r == 0 || (r < 0 && errno != EWOULDBLOCK && errno != EAGAIN))
-            client_close(i);
+        if (r == 0)
+            client_close(i, "peer closed");
+        else if (r < 0 && errno != EWOULDBLOCK && errno != EAGAIN)
+            client_close(i, strerror(errno));
     }
 }
 
