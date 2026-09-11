@@ -13,6 +13,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "lwip/sockets.h"
 
@@ -34,7 +35,7 @@ typedef struct {
     char    s[AVR_LINE_MAX];
 } line_t;
 
-static line_t s_ring[RING_SLOTS];
+static EXT_RAM_BSS_ATTR line_t s_ring[RING_SLOTS];   /* task-context only, see class_driver.c */
 
 /* Single producer (adsb_rx_task) writes s_head, single consumer (feed_task)
  * writes s_tail. The release/acquire pair is load-bearing on the P4's two
@@ -47,7 +48,7 @@ static struct { int fd; uint16_t stall; } s_cli[MAX_CLIENTS];
 static volatile int s_nclients;
 
 static uint32_t s_sent, s_drop;
-static char     s_batch[BATCH_MAX];
+static EXT_RAM_BSS_ATTR char s_batch[BATCH_MAX];
 
 int      feed_avr_clients(void) { return s_nclients; }
 uint32_t feed_avr_sent(void)    { return s_sent; }

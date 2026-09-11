@@ -17,6 +17,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "lwip/sockets.h"
 
@@ -38,7 +39,7 @@ static const char *TAG = "json";
 static int  s_listen = -1;
 static int  s_cli[MAX_CLIENTS];
 static volatile int s_nclients;
-static char s_snapshot[SNAPSHOT_MAX];
+static EXT_RAM_BSS_ATTR char s_snapshot[SNAPSHOT_MAX];   /* task-context only, see class_driver.c */
 
 int feed_json_clients(void) { return s_nclients; }
 

@@ -15,6 +15,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "lwip/sockets.h"
 
@@ -38,7 +39,7 @@ typedef struct {
     uint8_t s[BEAST_LINE_MAX];
 } line_t;
 
-static line_t s_ring[RING_SLOTS];
+static EXT_RAM_BSS_ATTR line_t s_ring[RING_SLOTS];   /* task-context only, see class_driver.c */
 
 /* Single producer (adsb_rx_task) writes s_head, single consumer (feed_task)
  * writes s_tail -- see feed_avr.c's identical comment on why the
@@ -50,7 +51,7 @@ static struct { int fd; uint16_t stall; } s_cli[MAX_CLIENTS];
 static volatile int s_nclients;
 
 static uint32_t s_sent, s_drop;
-static uint8_t  s_batch[BATCH_MAX];
+static EXT_RAM_BSS_ATTR uint8_t s_batch[BATCH_MAX];
 
 int      feed_beast_clients(void) { return s_nclients; }
 uint32_t feed_beast_sent(void)    { return s_sent; }

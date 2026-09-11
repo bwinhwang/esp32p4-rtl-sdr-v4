@@ -113,6 +113,13 @@ CONFIG_SPIRAM_SPEED_200M=y
 # stay internal, which is why enabling this does not disturb the C6 link.
 CONFIG_SPIRAM_USE_MALLOC=y
 
+# Lets EXT_RAM_BSS_ATTR put a static array in PSRAM (zeroed at startup like
+# any .bss). This project's own big task-context buffers -- the aircraft
+# table, the decoder's ICAO cache, the magnitude vector, the feed rings, the
+# TUI frame buffer -- are tagged with it; see the note above s_aircraft[] in
+# class_driver.c for what qualifies and what deliberately does not.
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+
 # NOT enabled, on purpose:
 #   SPIRAM_TRY_ALLOCATE_WIFI_LWIP -- with esp_wifi_remote the WiFi buffers live
 #     on the C6; only lwIP's are local, and they are handed to the SDIO DMA.

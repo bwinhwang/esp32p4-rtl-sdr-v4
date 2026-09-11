@@ -17,6 +17,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "esp_attr.h"
 #include "usb/usb_host.h"
 #include "driver/i2s_std.h"
 #include "driver/i2c_master.h"
@@ -157,9 +158,17 @@ typedef enum {
 static const char *TAG = "CLASS";
 static rtlsdr_dev_t   *rtldev       = NULL;
 static class_driver_t *s_driver_obj;
-static mode_s_t        state;
+static EXT_RAM_BSS_ATTR mode_s_t state;   /* 8 KB, mostly the ICAO cache */
 
-static aircraft_t  s_aircraft[MAX_TRACKED];
+/* EXT_RAM_BSS_ATTR here and on the other big statics in main/: PSRAM is
+ * cache-backed and therefore unreachable from an ISR and while the cache is
+ * off for a flash write, so the rule is task-context-only, CPU-only (no DMA
+ * source/sink) buffers. Everything tagged is written and read by plain tasks
+ * -- s_mag is the one on the demod hot path, but its access is sequential and
+ * the IQ ring it is computed from already lives in PSRAM. Left internal on
+ * purpose: s_log (any path may log, including ones that must stay IRAM-safe)
+ * and mode-s.c's maglut (2M random lookups/s; untested from PSRAM). */
+static EXT_RAM_BSS_ATTR aircraft_t s_aircraft[MAX_TRACKED];
 static log_entry_t s_log[LOG_LINES];
 static int         s_log_head    = 0;
 static int         s_msg_count   = 0;
@@ -736,7 +745,7 @@ size_t aircraft_export_ndjson(char *buf, size_t bufsize)
  * elsewhere (ESP_LOG, boot) still goes the normal way.
  * ───────────────────────────────────────────────────────────────────────── */
 
-static char s_fb[4096];
+static EXT_RAM_BSS_ATTR char s_fb[4096];
 static int  s_fb_len;
 
 /* Frame-cost probe. Reasoning about where the frame time goes has been wrong
@@ -1151,12 +1160,12 @@ static uint32_t    s_heap_free, s_heap_min, s_heap_big;
 #if CONFIG_SPIRAM
 static uint32_t    s_psram_free;
 #endif
-static task_stat_t s_tstat[CPU_STAT_MAX_TASKS];
+static EXT_RAM_BSS_ATTR task_stat_t s_tstat[CPU_STAT_MAX_TASKS];
 static int         s_tstat_n;
 
 static void stats_sample(int64_t now)
 {
-    static TaskStatus_t st[CPU_STAT_MAX_TASKS];
+    static EXT_RAM_BSS_ATTR TaskStatus_t st[CPU_STAT_MAX_TASKS];
     static TaskHandle_t idle_hdl[2];
     static uint32_t     last_idle[2];
     static int64_t      last_us;
@@ -1900,7 +1909,7 @@ static void inject_fake_aircraft(void)
 /* Sized for the one caller's fixed DEFAULT_BUF_LENGTH chunk. Static rather than
  * malloc'd because this sits on the 4 MB/s IQ hot path, and safe only because
  * adsb_rx_task is the sole caller -- a second demodulating task needs its own. */
-static uint16_t s_mag[DEFAULT_BUF_LENGTH / 2];
+static EXT_RAM_BSS_ATTR uint16_t s_mag[DEFAULT_BUF_LENGTH / 2];
 
 void demodulate(uint8_t *source, int length)
 {

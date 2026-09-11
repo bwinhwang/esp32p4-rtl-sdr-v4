@@ -40,6 +40,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_app_desc.h"
+#include "esp_attr.h"
 #include "esp_idf_version.h"
 #include "esp_ota_ops.h"
 
@@ -243,7 +244,7 @@ static int cmd_free(int argc, char **argv)
 
 /* Static because the shell task's stack should not carry ~3 KB of snapshots,
  * and there is only ever one shell. */
-static TaskStatus_t s_snap_a[SHELL_MAX_TASKS], s_snap_b[SHELL_MAX_TASKS];
+static EXT_RAM_BSS_ATTR TaskStatus_t s_snap_a[SHELL_MAX_TASKS], s_snap_b[SHELL_MAX_TASKS];
 
 static int cmd_tasks(int argc, char **argv)
 {
