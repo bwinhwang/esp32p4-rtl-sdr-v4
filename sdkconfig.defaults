@@ -19,13 +19,17 @@ CONFIG_ESP_CONSOLE_UART_BAUDRATE=921600
 # most on. Assertions are a separate knob and stay on.
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 
-# Backs the TUI's CPU0/CPU1 gauges. Selects USE_TRACE_FACILITY and
+# Backs `top` and the TUI's CPU0/CPU1 gauges. Selects USE_TRACE_FACILITY and
 # USE_STATS_FORMATTING_FUNCTIONS on its own; the counter is esp_timer, so
 # enabling it costs a 64->32-bit read per context switch and ~1KB of .bss.
 CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
-# Adds TaskStatus_t.xCoreID, which the TASKS panel needs to attribute each
-# task to a core.
+# Adds TaskStatus_t.xCoreID, which `top` needs to attribute each task to a
+# core.
 CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID=y
+# 64-bit run-time counter: the 32-bit default wraps every ~71 min, which makes
+# `top`'s TIME+ column meaningless past the first hour. Costs one 64-bit store
+# per context switch.
+CONFIG_FREERTOS_RUN_TIME_COUNTER_TYPE_U64=y
 
 # The board carries 16 MB (esptool "Detected flash size: 16MB") but the project
 # was configured for 2 MB, so 7/8 of it was unreachable and the single-app

@@ -862,6 +862,7 @@ net_ssh_state_t net_ssh_state(void) { return s_state; }
 void net_ssh_peer_str(char *dst, size_t n) { strlcpy(dst, s_peer, n); }
 
 int net_ssh_pty_cols(void) { return s_cols; }
+int net_ssh_pty_rows(void) { return s_rows; }
 
 void net_ssh_user_str(char *dst, size_t n)
 {

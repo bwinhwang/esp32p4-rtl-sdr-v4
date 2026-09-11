@@ -34,6 +34,8 @@
 #include "feed_json.h"
 #include "plane_cat.h"
 #include "shell.h"
+#include "screen.h"
+#include "top.h"
 #include "esp_console.h"
 
 /* ── build config ────────────────────────────────────────────────────────── */
@@ -180,14 +182,6 @@ static int         s_msg_rate    = 0;
 static int         s_msg_bucket  = 0;
 static int64_t     s_rate_ts     = 0;
 static int64_t     s_start_us    = 0;
-static int64_t     s_last_draw   = 0;
-static bool        s_dirty       = false;
-/* Held for the duration of one frame. The shell's console task takes it when
- * the display leaves the foreground, so a repaint already in flight finishes
- * before the prompt is drawn over it -- otherwise the ~13 KB frame and the
- * banner interleave on UART0 (the draw task is priority 2, the console task 3,
- * so the console does preempt it mid-frame). */
-static SemaphoreHandle_t s_paint_lock = NULL;
 static volatile bool s_rx_running  = false;  /* adsb_rx_task is up          */
 static volatile bool s_inject_req  = false;  /* the 't' hotkey, see below   */
 static float       s_decode_smooth = 0.0f;
@@ -201,7 +195,6 @@ static volatile bool      s_muted   = false;
 static QueueHandle_t      s_audio_q = NULL;
 
 /* ── ANSI / phosphor-green ATC palette ───────────────────────────────────── */
-#define CLS      "\033[2J\033[H"
 #define RESET    "\033[0m"
 #define BOLD     "\033[1m"
 #define DIM      "\033[2m"
@@ -593,12 +586,11 @@ static void log_put(uint8_t facility, uint8_t color, const char *fmt, va_list ap
     e->color    = color;
     e->facility = facility;
     s_log_head++;
-    s_dirty = true;
 
-    /* Not echoed while the display owns stdout: the line would land inside a
+    /* Not echoed while a screen owns stdout: the line would land inside a
      * half-painted frame, and the viewer is already looking at the panel it
      * went into. */
-    if (echo_wanted(facility, color) && !shell_tui_foreground())
+    if (echo_wanted(facility, color) && !shell_screen_foreground())
         shell_async_print(e->text);
 }
 
@@ -746,175 +738,6 @@ size_t aircraft_export_ndjson(char *buf, size_t bufsize)
 /* inner border │ takes 1 char, space before panel takes 1 char = 2 overhead */
 #define LEFT_W       (TERM_W - RADAR_COLS - 2)
 #define EL           "\033[K"
-
-/* ── frame buffer ─────────────────────────────────────────────────────────
- *
- * A frame is ~20 KB, and both costs sitting on top of the bytes are per-call,
- * not per-byte: stdio's stream lock (taken ~4000x per frame, bottoming out in
- * a cross-core spinlock core1's demod loop contends for), and uart_vfs's
- * write(), which loops PER CHARACTER to do the \n -> \r\n translation and
- * calls uart_write_bytes(&c, 1) for each -- a mutex take/give and a ringbuf
- * send per byte, ~20000 per frame.
- *
- * So the frame is assembled here with memcpy and handed to the sinks in whole
- * runs, CRLF expanded by hand: stdio and the VFS are both out of the path.
- * This is why neither -O2 nor setvbuf ever moved the number -- the cost was
- * inside prebuilt libc and IDF, and it was never the write count. printf()
- * elsewhere (ESP_LOG, boot) still goes the normal way.
- * ───────────────────────────────────────────────────────────────────────── */
-
-static EXT_RAM_BSS_ATTR char s_fb[4096];
-static int  s_fb_len;
-
-/* Frame-cost probe. Reasoning about where the frame time goes has been wrong
- * three times running, so these numbers get measured and shown instead:
- * per-second totals of frames, bytes, time assembling and time writing. */
-static uint32_t s_pf_bytes, s_pf_out_us;                        /* this frame */
-static uint32_t s_pr_fps, s_pr_bytes, s_pr_out_ms, s_pr_asm_ms; /* last second*/
-
-/* ── frame sinks ──────────────────────────────────────────────────────────
- * Who is watching, and nothing about what they are. shell.c attaches the
- * transport whose `tui` ran; see the service contract in shell.h.
- *
- * No lock, by the same discipline the rest of the display uses: `fn` is the
- * slot's published flag, so attach writes it last and detach clears it first,
- * and detach is followed by adsb_tui_hold() to wait out a run already in
- * flight. Reading it per run rather than once per frame is what bounds that
- * wait -- for the SSH sink the task calling detach is also the one draining
- * the ring the sink would otherwise sit waiting for room in, so it has to stop
- * being called at the next run and not at the end of the repaint. Whatever it
- * was already sent is wiped by the clear-screen the leaver prints anyway. */
-#define TUI_MAX_SINKS  2
-
-static struct {
-    tui_sink_fn volatile fn;    /* NULL = free slot */
-    void                *ctx;
-} s_sinks[TUI_MAX_SINKS];
-
-static bool sinks_attached(void)
-{
-    for (int i = 0; i < TUI_MAX_SINKS; i++)
-        if (s_sinks[i].fn) return true;
-    return false;
-}
-
-/* Not thread-safe against a concurrent attach, and does not need to be: the
- * only callers are the two `tui` commands, and shell.c's exclusive console
- * ownership means at most one of them is ever running. A viewer attached from
- * some other task would have to bring its own serialisation. */
-bool tui_attach(tui_sink_fn fn, void *ctx)
-{
-    for (int i = 0; i < TUI_MAX_SINKS; i++) {
-        if (s_sinks[i].fn) continue;
-        s_sinks[i].ctx = ctx;
-        s_sinks[i].fn  = fn;    /* last: this is what publishes the slot */
-        return true;
-    }
-    return false;
-}
-
-void tui_detach(tui_sink_fn fn, void *ctx)
-{
-    for (int i = 0; i < TUI_MAX_SINKS; i++)
-        if (s_sinks[i].fn == fn && s_sinks[i].ctx == ctx) s_sinks[i].fn = NULL;
-}
-
-static void fb_out(const char *p, size_t n)
-{
-    for (int i = 0; i < TUI_MAX_SINKS; i++) {
-        tui_sink_fn fn = s_sinks[i].fn;
-        if (fn) fn(s_sinks[i].ctx, p, n);
-    }
-}
-
-static void fb_flush(void)
-{
-    if (s_fb_len <= 0) return;
-
-    int64_t     t0  = esp_timer_get_time();
-    const char *p   = s_fb;
-    int         rem = s_fb_len;
-    s_pf_bytes += (uint32_t)s_fb_len;
-    s_fb_len = 0;
-
-    while (rem > 0) {
-        const char *nl  = memchr(p, '\n', (size_t)rem);
-        int         run = nl ? (int)(nl - p) : rem;
-        if (run > 0) fb_out(p, (size_t)run);
-        if (!nl) break;
-        fb_out("\r\n", 2);
-        p    = nl + 1;
-        rem -= run + 1;
-    }
-    s_pf_out_us += (uint32_t)(esp_timer_get_time() - t0);
-}
-
-static void probe_frame(int64_t now, uint32_t frame_us)
-{
-    static int64_t  win;
-    static uint32_t n, bytes, out_us, tot_us;
-
-    n++;
-    bytes  += s_pf_bytes;
-    out_us += s_pf_out_us;
-    tot_us += frame_us;
-
-    if (!win) { win = now; return; }
-    if (now - win < 1000000LL) return;
-
-    s_pr_fps    = n;
-    s_pr_bytes  = bytes / n;
-    s_pr_out_ms = out_us / 1000;
-    s_pr_asm_ms = (tot_us - out_us) / 1000;
-    win = now;
-    n = bytes = out_us = tot_us = 0;
-}
-
-/* Flushing mid-frame when full keeps the buffer small without ever
- * truncating a row -- the flush count was never what cost anything. */
-static void fb_room(int need)
-{
-    if (s_fb_len + need > (int)sizeof(s_fb)) fb_flush();
-}
-
-static void fb_puts(const char *s)
-{
-    int n = (int)strlen(s);
-    fb_room(n);
-    if (n > (int)sizeof(s_fb)) n = (int)sizeof(s_fb);
-    memcpy(s_fb + s_fb_len, s, (size_t)n);
-    s_fb_len += n;
-}
-
-static void fb_putc(char c)
-{
-    fb_room(1);
-    s_fb[s_fb_len++] = c;
-}
-
-static void fb_rep(char c, int n)
-{
-    while (n > 0) {
-        fb_room(1);
-        int chunk = (int)sizeof(s_fb) - s_fb_len;
-        if (chunk > n) chunk = n;
-        memset(s_fb + s_fb_len, c, (size_t)chunk);
-        s_fb_len += chunk;
-        n        -= chunk;
-    }
-}
-
-__attribute__((format(printf, 1, 2)))
-static void fb_printf(const char *fmt, ...)
-{
-    va_list ap;
-    va_start(ap, fmt);
-    fb_room(256);
-    int room = (int)sizeof(s_fb) - s_fb_len;
-    int n = vsnprintf(s_fb + s_fb_len, (size_t)room, fmt, ap);
-    va_end(ap);
-    if (n > 0) s_fb_len += (n < room ? n : room - 1);
-}
 
 /* ── draw helpers ─────────────────────────────────────────────────────────*/
 
@@ -1153,130 +976,6 @@ static void render_waterfall(char panel[RADAR_ROWS][RADAR_COLS + 1])
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * CPU LOAD / HEAP
- *
- * Per-core busy percentage, from how much of each interval that core's IDLE
- * task got. IDF's FreeRTOS has no per-task run-time getter, so the whole task
- * list has to be walked, and uxTaskGetSystemState() holds a cross-core
- * spinlock for the walk -- hence 1 Hz rather than once per frame.
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-#define CPU_STAT_MAX_TASKS  32
-
-typedef struct {
-    TaskHandle_t hdl;
-    char         name[12];
-    int8_t       core;          /* -1 = no affinity */
-    uint32_t     last_rt;
-    int          pct;           /* share of ONE core, not of both */
-    uint32_t     stack_hwm;
-} task_stat_t;
-
-static int         s_cpu_busy[2] = { -1, -1 };  /* -1 until first interval */
-static uint32_t    s_heap_free, s_heap_min, s_heap_big;
-#if CONFIG_SPIRAM
-static uint32_t    s_psram_free;
-#endif
-static EXT_RAM_BSS_ATTR task_stat_t s_tstat[CPU_STAT_MAX_TASKS];
-static int         s_tstat_n;
-
-static void stats_sample(int64_t now)
-{
-    static EXT_RAM_BSS_ATTR TaskStatus_t st[CPU_STAT_MAX_TASKS];
-    static TaskHandle_t idle_hdl[2];
-    static uint32_t     last_idle[2];
-    static int64_t      last_us;
-
-    if (last_us && (now - last_us) < 1000000LL) return;
-
-    if (!idle_hdl[0]) {
-        idle_hdl[0] = xTaskGetIdleTaskHandleForCore(0);
-        idle_hdl[1] = xTaskGetIdleTaskHandleForCore(1);
-    }
-
-    uint32_t    total;
-    UBaseType_t n = uxTaskGetSystemState(st, CPU_STAT_MAX_TASKS, &total);
-    if (n == 0) return;     /* array too small -- raise CPU_STAT_MAX_TASKS */
-
-    int64_t span = now - last_us;
-
-    uint32_t idle[2] = { 0, 0 };
-    for (UBaseType_t i = 0; i < n; i++)
-        for (int c = 0; c < 2; c++)
-            if (st[i].xHandle == idle_hdl[c])
-                idle[c] = st[i].ulRunTimeCounter;
-
-    if (last_us && span > 0) {
-        for (int c = 0; c < 2; c++) {
-            /* The counter is esp_timer microseconds truncated to 32 bits, so
-             * elapsed wall time is exactly one core's budget and the unsigned
-             * delta stays correct across the ~71 min wrap. */
-            int64_t busy = span - (int64_t)(idle[c] - last_idle[c]);
-            if (busy < 0)    busy = 0;
-            if (busy > span) busy = span;
-            s_cpu_busy[c] = (int)(busy * 100 / span);
-        }
-    }
-    last_idle[0] = idle[0];
-    last_idle[1] = idle[1];
-
-    /* Per-task deltas. Matching on the handle rather than the slot index --
-     * uxTaskGetSystemState() gives no stable ordering, and tasks come and go
-     * (rtlsdr_setup_task is transient). An unmatched handle just reads 0% for
-     * one interval. */
-    task_stat_t prev[CPU_STAT_MAX_TASKS];
-    int         prev_n = s_tstat_n;
-    memcpy(prev, s_tstat, sizeof(prev));
-
-    for (UBaseType_t i = 0; i < n; i++) {
-        task_stat_t *t = &s_tstat[i];
-        t->hdl = st[i].xHandle;
-        snprintf(t->name, sizeof(t->name), "%s",
-                 st[i].pcTaskName ? st[i].pcTaskName : "?");
-#if ( configTASKLIST_INCLUDE_COREID == 1 )
-        t->core = (st[i].xCoreID == tskNO_AFFINITY) ? -1 : (int8_t)st[i].xCoreID;
-#else
-        t->core = -1;
-#endif
-        t->stack_hwm = st[i].usStackHighWaterMark;
-        t->pct       = 0;
-        for (int p = 0; p < prev_n; p++) {
-            if (prev[p].hdl != t->hdl) continue;
-            if (last_us && span > 0) {
-                uint32_t d = st[i].ulRunTimeCounter - prev[p].last_rt;
-                t->pct = (int)((int64_t)d * 100 / span);
-                if (t->pct > 100) t->pct = 100;
-            }
-            break;
-        }
-        t->last_rt = st[i].ulRunTimeCounter;
-    }
-    s_tstat_n = (int)n;
-
-    /* insertion sort, busiest first -- n is ~16 */
-    for (int i = 1; i < s_tstat_n; i++) {
-        task_stat_t k = s_tstat[i];
-        int j = i - 1;
-        while (j >= 0 && s_tstat[j].pct < k.pct) { s_tstat[j + 1] = s_tstat[j]; j--; }
-        s_tstat[j + 1] = k;
-    }
-
-    last_us = now;
-
-    /* Explicitly MALLOC_CAP_INTERNAL, not esp_get_free_heap_size()/CAP_DEFAULT:
-     * once CONFIG_SPIRAM_USE_MALLOC is on, those fold 32 MB of PSRAM into the
-     * same figure and the internal-RAM number -- the one that actually runs
-     * out, and the one every earlier measurement in the notes refers to --
-     * vanishes behind it. This way HEAP means the same thing either way. */
-    s_heap_free = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-    s_heap_min  = (uint32_t)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
-    s_heap_big  = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
-#if CONFIG_SPIRAM
-    s_psram_free = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-#endif
-}
-
 /* Right-hand panel, mode 2: who is actually eating each core.
  * STACK is the unused-stack high-water margin, in bytes (ESP-IDF's
  * usStackHighWaterMark is bytes, unlike upstream FreeRTOS's words). */
@@ -1294,19 +993,22 @@ static void render_tasks(char panel[RADAR_ROWS][RADAR_COLS + 1])
      * render_net_panel() beside the EVENT LOG instead, which is on screen
      * regardless of the R selection -- freeing these two rows back to the
      * task list. */
-    for (int r = 1; r < RADAR_ROWS - 2 && r - 1 < s_tstat_n; r++) {
-        task_stat_t *t = &s_tstat[r - 1];
+    const top_stats_t *ts = top_stats();
+    for (int r = 1; r < RADAR_ROWS - 2 && r - 1 < ts->ntasks; r++) {
+        const top_task_t *t = &ts->task[r - 1];
         char core[4];
         if (t->core < 0) snprintf(core, sizeof(core), "-");
         else             snprintf(core, sizeof(core), "%d", t->core);
-        snprintf(panel[r], RADAR_COLS + 1, " %-11s %3d%% %4s %8lu",
-                 t->name, t->pct, core, (unsigned long)t->stack_hwm);
+        snprintf(panel[r], RADAR_COLS + 1, " %-11.11s %3u%% %4s %8lu",
+                 t->name, (unsigned)(t->pct10 / 10), core, (unsigned long)t->stack_hwm);
     }
 
+    screen_probe_t pr;
+    screen_probe_get(&pr);
     snprintf(panel[RADAR_ROWS - 2], RADAR_COLS + 1, " FRAME %5luB  %2lu/s",
-             (unsigned long)s_pr_bytes, (unsigned long)s_pr_fps);
+             (unsigned long)pr.bytes, (unsigned long)pr.fps);
     snprintf(panel[RADAR_ROWS - 1], RADAR_COLS + 1, " asm %3lums/s   out %3lums/s",
-             (unsigned long)s_pr_asm_ms, (unsigned long)s_pr_out_ms);
+             (unsigned long)pr.asm_ms, (unsigned long)pr.out_ms);
 
     /* snprintf NUL-terminates early; repaint the tail as spaces so the panel
      * stays a fixed-width block (the TUI never clears, it overwrites). */
@@ -1381,33 +1083,12 @@ static void render_net_panel(char panel[LOG_SHOW][RADAR_COLS + 1])
  * TUI DRAW
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-static void tui_draw(void)
+/* One frame, assembled with fb_* for screen.c to hand to whoever is watching;
+ * called from the draw task only, at most every TUI_REFRESH_MS. */
+static void tui_draw(int64_t now)
 {
-    /* The display is a foreground application on each transport: with a shell
-     * in front instead, a repaint would land on top of whatever that user is
-     * typing. One frame is assembled here and fb_flush() hands it to every
-     * sink that asked for it. */
-    if (!sinks_attached()) return;
-
-    int64_t now = esp_timer_get_time();
-    if ((now - s_last_draw) < (TUI_REFRESH_MS * 1000LL)) return;
-    s_last_draw = now;
-
-    if (s_paint_lock) {
-        xSemaphoreTake(s_paint_lock, portMAX_DELAY);
-        /* The foreground can have changed while this waited -- adsb_tui_hold()
-         * is the other side of this lock and gives it back straight away. */
-        if (!sinks_attached()) { xSemaphoreGive(s_paint_lock); return; }
-    }
-
-    /* The frame goes straight to the UART, so anything another task left in
-     * stdout's buffer has to get out first or it lands mid-frame. */
-    fflush(stdout);
-
-    s_pf_bytes = s_pf_out_us = 0;
-
-    stats_sample(now);
-    s_dirty     = false;
+    top_stats_sample(now);
+    const top_stats_t *ts = top_stats();
 
     if (now - s_rate_ts >= 1000000LL) {
         s_msg_rate   = s_msg_bucket;
@@ -1513,12 +1194,12 @@ static void tui_draw(void)
         char psram[16] = "";
 #if CONFIG_SPIRAM
         snprintf(psram, sizeof(psram), "  PSRAM %2luM",
-                 (unsigned long)(s_psram_free >> 20));
+                 (unsigned long)(ts->psram_free >> 20));
 #endif
-        if (s_cpu_busy[0] < 0) { strcpy(cpu0, " --"); strcpy(cpu1, " --"); }
+        if (ts->cpu_busy[0] < 0) { strcpy(cpu0, " --"); strcpy(cpu1, " --"); }
         else {
-            snprintf(cpu0, sizeof(cpu0), "%3d", s_cpu_busy[0]);
-            snprintf(cpu1, sizeof(cpu1), "%3d", s_cpu_busy[1]);
+            snprintf(cpu0, sizeof(cpu0), "%3d", ts->cpu_busy[0]);
+            snprintf(cpu1, sizeof(cpu1), "%3d", ts->cpu_busy[1]);
         }
         /* compute visible width by snprintf to scratch buffer */
         char scratch[256];
@@ -1529,7 +1210,7 @@ static void tui_draw(void)
             uptime, ac, s_msg_rate, s_msg_count,
             s_decode_smooth, s_crc_smooth, s_fix_smooth, vol_str,
             cpu0, cpu1,
-            (unsigned long)(s_heap_free / 1024), (unsigned long)(s_heap_min / 1024),
+            (unsigned long)(ts->heap_free / 1024), (unsigned long)(ts->heap_min / 1024),
             psram);
         if (n > TERM_W) n = TERM_W;
         fb_printf(PH_DIM "  UP " RESET PH_HI "%-9s" RESET
@@ -1548,11 +1229,11 @@ static void tui_draw(void)
                uptime, ac, s_msg_rate, s_msg_count,
                s_decode_smooth, s_crc_smooth, s_fix_smooth,
                s_muted ? AC_RED : PH_HI, vol_str,
-               s_cpu_busy[0] > 80 ? AC_AMBER : PH_HI, cpu0,
-               s_cpu_busy[1] > 80 ? AC_AMBER : PH_HI, cpu1,
-               (unsigned long)(s_heap_free / 1024),
-               s_heap_big < 32768 ? AC_AMBER : PH_DIM,
-               (unsigned long)(s_heap_min / 1024),
+               ts->cpu_busy[0] > 80 ? AC_AMBER : PH_HI, cpu0,
+               ts->cpu_busy[1] > 80 ? AC_AMBER : PH_HI, cpu1,
+               (unsigned long)(ts->heap_free / 1024),
+               ts->heap_big < 32768 ? AC_AMBER : PH_DIM,
+               (unsigned long)(ts->heap_min / 1024),
                psram);
         sp(TERM_W - n);
     }
@@ -1777,11 +1458,6 @@ static void tui_draw(void)
            PH_DIM "  [+/-] VOL  " PH_GRID "|" RESET
            PH_DIM "  [R] RADAR/WFALL/TASKS  " PH_GRID "|" RESET
            PH_DIM "  [T] TEST PLANE" EL "\n" RESET);
-
-    fb_flush();
-    probe_frame(now, (uint32_t)(esp_timer_get_time() - now));
-
-    if (s_paint_lock) xSemaphoreGive(s_paint_lock);
 }
 
 
@@ -1797,7 +1473,6 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
 {
     s_msg_count++;
     s_msg_bucket++;
-    s_dirty = true;
 
     uint32_t icao = ((uint32_t)mm->aa1 << 16) |
                     ((uint32_t)mm->aa2 <<  8) |
@@ -1873,7 +1548,7 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
  * Drives the table, the radar and the log with no antenna and no dongle, so
  * display and feed work can be tested indoors. s_aircraft[] has no lock, so
  * this must run in adsb_rx_task -- the task on_msg() runs in -- whenever that
- * task exists; adsb_tui_key() defers to it through s_inject_req for exactly
+ * task exists; tui_key() defers to it through s_inject_req for exactly
  * that reason. */
 static void inject_fake_aircraft(void)
 {
@@ -1947,49 +1622,13 @@ void demodulate(uint8_t *source, int length)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * TUI TASK
- *
- * tui_draw() blocks in printf until the entire frame has clocked out of the
- * console UART -- a full 154-column frame is ~20 KB of UTF-8 box drawing and
- * ANSI colour. Drawing it from adsb_rx_task meant the IQ ring overflowed for
- * the whole duration of every frame, which at the old hardcoded 115200 baud
- * was over a second. It reads the aircraft table without a lock: a torn frame
- * is cosmetic, a starved demod loop is not.
+ * TUI KEYS / REGISTRATION
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-static void tui_task(void *arg)
-{
-    for (;;) {
-        tui_draw();     /* self-rate-limits to TUI_REFRESH_MS */
-        vTaskDelay(pdMS_TO_TICKS(TUI_REFRESH_MS / 3));
-    }
-}
-
-/* Waits for any frame in flight to finish. shell.c calls this after clearing
- * the foreground flag, so by the time it returns the display is guaranteed to
- * have stopped writing UART0 and the prompt can be drawn safely. */
-void adsb_tui_hold(void)
-{
-    if (!s_paint_lock) return;
-    xSemaphoreTake(s_paint_lock, portMAX_DELAY);
-    xSemaphoreGive(s_paint_lock);
-}
-
-void adsb_tui_start(void)
-{
-    s_paint_lock = xSemaphoreCreateMutex();
-
-    /* Created once, from app_main, and never destroyed: tui_draw() returns
-     * immediately while the display is in the background, so `tui` is a state
-     * change rather than a task lifecycle. It also means the display works
-     * with no dongle enumerated -- nothing in tui_draw() touches rtldev. */
-    xTaskCreatePinnedToCore(tui_task, "tui", 6144, NULL, 2, NULL, 0);
-}
-
-/* One keystroke, from shell.c's console task on core0. The keys that leave the
- * display never reach here. Everything below either writes a scalar the draw
- * task only reads, or defers to the demod task -- see s_inject_req. */
-void adsb_tui_key(uint8_t key)
+/* One keystroke, from whichever console task read it, on core0. The keys that
+ * leave the display never reach here. Everything below either writes a scalar
+ * the draw task only reads, or defers to the demod task -- see s_inject_req. */
+static void tui_key(uint8_t key)
 {
     switch (key) {
         case 'r': case 'R':
@@ -1997,22 +1636,22 @@ void adsb_tui_key(uint8_t key)
             ui_log(3, "PANEL    switched to %s",
                     s_panel_mode == 0 ? "RADAR"
                   : s_panel_mode == 1 ? "WATERFALL" : "TASKS");
-            s_dirty = true;
+            screen_wake(SCREEN_TUI);
             break;
         case 'm': case 'M':
             s_muted = !s_muted;
             ui_log(2, "AUDIO    %s", s_muted ? "muted" : "unmuted");
-            s_dirty = true;
+            screen_wake(SCREEN_TUI);
             break;
         case '+': case '=':
             s_volume += 10;
             if (s_volume > 100) s_volume = 100;
-            s_dirty = true;
+            screen_wake(SCREEN_TUI);
             break;
         case '-':
             s_volume -= 10;
             if (s_volume < 0) s_volume = 0;
-            s_dirty = true;
+            screen_wake(SCREEN_TUI);
             break;
         case 't': case 'T':
             /* Hand it to adsb_rx_task, which is where on_msg() writes the same
@@ -2024,6 +1663,13 @@ void adsb_tui_key(uint8_t key)
         default:
             break;
     }
+}
+
+/* Nothing in tui_draw() touches rtldev, so the display works with no dongle
+ * enumerated; screen.c paints it only while `tui` has a viewer on it. */
+void adsb_tui_start(void)
+{
+    screen_register(SCREEN_TUI, "the display", TERM_W + 2, TUI_REFRESH_MS, tui_draw, tui_key);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -2287,18 +1933,6 @@ void adsb_register_shell_cmds(void)
     };
     for (int i = 0; i < (int)(sizeof(cmds) / sizeof(cmds[0])); i++)
         ESP_ERROR_CHECK(esp_console_cmd_register(&cmds[i]));
-}
-
-int adsb_tui_cols(void) { return TERM_W + 2; }
-
-/* Called when the display comes to the foreground: wipe whatever the shell
- * left on screen and put a frame up now rather than one refresh period later. */
-void adsb_tui_resume(void)
-{
-    printf(CLS);
-    fflush(stdout);
-    s_dirty     = true;
-    s_last_draw = 0;    /* draw the next frame immediately, not one period on */
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════

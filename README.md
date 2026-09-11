@@ -85,6 +85,7 @@ needs it.
 - **ADS-B decoder** using the mode-s library, decoding DF17 extended squitter messages
 - **Console REPL** on the serial port (and over SSH) — aircraft table, USB/tuner state, task CPU, heap, network and WiFi setup, all without a host tool
 - **Live TUI** rendered via ANSI escape codes — no host software required; opened with the `tui` command in the ESP-IDF serial monitor, over SSH, or both at once
+- **`top`** — a Linux-`top`-shaped system monitor in the same console: per-core load, internal heap and PSRAM, the display's own console-bytes cost, and every FreeRTOS task with CPU%, stack headroom and run time, refreshing in place; runs alongside the TUI on the other transport
 - **Aircraft tracking table** showing ICAO address, callsign, altitude, ground speed, heading, EW/NS velocity components, vertical rate, and message count
 - **Event log** showing new contacts, lost contacts, identification, altitude, and velocity events
   — split by facility, so a console prompt gets the board's events (USB, WiFi, Ethernet, OTA) while
@@ -123,8 +124,9 @@ step needed anymore.
 The serial monitor comes up at a `p4> ` command prompt — the same console the
 SSH server serves — so the board is usable with no dongle, no antenna and no
 network. `help` lists the commands; `tui` opens the live display once the
-dongle enumerates and the tuner locks, and `q` there returns to the prompt. It
-works the same way in an SSH session — the display needs a 156-column window.
+dongle enumerates and the tuner locks, `top [seconds]` the system monitor, and
+`q` in either returns to the prompt. Both work the same way in an SSH session —
+the display needs a 156-column window, `top` an 80-column one.
 Press `ctrl+]` to exit the monitor itself.
 
 ---

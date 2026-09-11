@@ -8,11 +8,12 @@
  * Console REPL (esp_console) -- the serial console's normal, top-level face.
  *
  * The serial port behaves like the SSH session does: it comes up at a `p4> `
- * prompt and the ADS-B display is one command among the others (`tui`). The
- * TUI is therefore a *foreground application* on a transport rather than the
- * thing that owns it, which is what lets the console be useful with no dongle
- * enumerated, no antenna and no network -- and what lets `tui` work over SSH
- * as well, on either transport or both at once (see the sink API below).
+ * prompt and the full-screen displays are commands among the others (`tui`,
+ * `top`). A screen is therefore a *foreground application* on a transport
+ * rather than the thing that owns it, which is what lets the console be useful
+ * with no dongle enumerated, no antenna and no network -- and what lets either
+ * screen work over SSH as well, on either transport or both at once (see
+ * screen.h).
  *
  * esp_console_new_repl_uart() is still not used, and for the original reason:
  * it installs its own UART driver and its own blocking reader, while the TUI's
@@ -39,12 +40,12 @@ void shell_init(void);
  * part of boot is over, so the prompt is not immediately scrolled away. */
 void shell_console_start(void);
 
-/* True when the display is in front on whichever transport currently owns
- * stdout -- the question sys_log() has to answer before echoing an event line
- * into it. Deliberately not the same as "somebody is watching the display":
- * with the radar up on the serial monitor and an SSH session sitting at a
- * prompt, the session is exactly where those lines should go. */
-bool shell_tui_foreground(void);
+/* True when a screen (`tui` or `top`) is in front on whichever transport
+ * currently owns stdout -- the question sys_log() has to answer before echoing
+ * an event line into it. Deliberately not the same as "somebody is watching a
+ * screen": with the radar up on the serial monitor and an SSH session sitting
+ * at a prompt, the session is exactly where those lines should go. */
+bool shell_screen_foreground(void);
 
 /* ── remote sessions (net_ssh.c) ─────────────────────────────────────────────
  * The transport drives the line editor directly, in its own task, rather than
@@ -64,7 +65,7 @@ bool shell_tui_foreground(void);
  *                             why the swap has to be in place first.
  *   shell_remote_byte()    -- run one input byte to completion; returns false
  *                             once the user has left ('exit', 'quit', Ctrl-D).
- *                             While the session has the display in front the
+ *                             While the session has a screen in front the
  *                             byte drives its hotkeys instead of the line
  *                             editor, exactly as the console task does for the
  *                             serial side.
@@ -72,7 +73,7 @@ bool shell_tui_foreground(void);
  *   shell_remote_close()   -- hand the console back to the serial shell, which
  *                             reprints its prompt. Restore stdout FIRST or its
  *                             banner follows the closing session out. Also
- *                             drops the display if the session still had it
+ *                             drops the screen if the session still had one
  *                             up, so no frame is written into a dead ring.
  *
  * shell_remote_claim() returns false only if another SSH session already holds
@@ -88,52 +89,8 @@ void shell_remote_close(void);
  * registered there. shell_init() calls this after esp_console_init(). */
 void adsb_register_shell_cmds(void);
 
-/* Starts the TUI's own draw task. It runs from boot and paints only while at
- * least one sink is attached, so `tui` is a state change and not a task that
- * gets created and destroyed. */
+/* Registers the radar display with screen.c. Call after screen_start(). */
 void adsb_tui_start(void);
-
-/* ── the display as a service ────────────────────────────────────────────────
- * One draw task, one assembled frame, and any number of viewers. A transport
- * attaches when its `tui` runs and detaches when the user leaves; the display
- * itself knows nothing about UART ports, sockets, or how many of either exist,
- * so a third kind of viewer never touches class_driver.c.
- *
- * A sink is handed one *run* of the frame -- already CRLF-expanded, neither a
- * whole line nor a whole frame, since the assembler flushes a fixed buffer
- * whenever it fills. It is called from the draw task (priority 2, core0) and
- * may block briefly; the SSH one does, waiting for room in its ring.
- *
- * State is shared, not per-viewer: two people watching see the same panel, and
- * `R` from either switches it for both. That is the deliberate limit of this
- * being one frame rather than one render per client. */
-typedef void (*tui_sink_fn)(void *ctx, const char *data, size_t n);
-
-/* False if the table is full. Attach *after* adsb_tui_resume(), so the screen
- * is cleared before a frame can start. */
-bool tui_attach(tui_sink_fn fn, void *ctx);
-
-/* Stops the frame reaching this sink. Follow it with adsb_tui_hold() before
- * writing anything of your own -- a run may already be in flight. */
-void tui_detach(tui_sink_fn fn, void *ctx);
-
-/* Terminal width the display needs, borders included. `tui` compares it
- * against the size an SSH client reported for its PTY. */
-int adsb_tui_cols(void);
-
-/* Clears the screen and forces the next frame out immediately -- called when
- * the TUI comes to the foreground. */
-void adsb_tui_resume(void);
-
-/* Returns once any frame in flight has finished. Called after a transport has
- * dropped out of the sink mask, before it writes anything of its own: the draw
- * task sits at priority 2 and both readers above it, so without this the
- * prompt lands in the middle of a ~13 KB repaint. */
-void adsb_tui_hold(void);
-
-/* One keystroke for the TUI, from whichever task read it. The keys that leave
- * the TUI are handled in shell.c and never reach this. */
-void adsb_tui_key(uint8_t key);
 
 /* ── the event log (class_driver.c) ──────────────────────────────────────────
  * One ring, three kinds of line, and separating them is the whole point:

@@ -51,19 +51,21 @@ net_ssh_state_t net_ssh_state(void);
 /* Peer address of the current session, or "---". */
 void net_ssh_peer_str(char *dst, size_t n);
 
-/* Terminal width the client asked for, 0 if it never requested a PTY or no
+/* Terminal size the client asked for, 0 if it never requested a PTY or no
  * session is up. The radar wants a wide window, so `tui` warns on a narrow
- * one rather than letting the frame wrap into nonsense. */
+ * one rather than letting the frame wrap into nonsense; `top` cuts its task
+ * table to the height. */
 int net_ssh_pty_cols(void);
+int net_ssh_pty_rows(void);
 
-/* One already-CRLF-expanded run of the display's frame, from fb_flush(). Not
+/* One already-CRLF-expanded run of a screen's frame, from fb_flush(). Not
  * a general output path: it bypasses stdout, and it blocks briefly when the
  * ring is full instead of dropping. No-op when no session is up. */
 void net_ssh_tui_write(const char *data, size_t n);
 
 /* Like net_ssh_tui_write(), but for the one caller that runs on the ssh_srv
- * task itself (shell.c's leave_tui_ssh(), via shell_remote_byte()) rather
- * than on tui_task. net_ssh_tui_write() only *waits* for room, trusting this
+ * task itself (shell.c's leave_screen_ssh(), via shell_remote_byte()) rather
+ * than on the draw task. net_ssh_tui_write() only *waits* for room, trusting this
  * task's own run_shell() loop to open some up by draining the ring -- which
  * cannot happen while this task is still inside the call that's waiting.
  * This drains inline instead of waiting, so it is safe to call from here (and

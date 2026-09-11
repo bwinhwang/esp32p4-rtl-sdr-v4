@@ -1,16 +1,17 @@
 # CLAUDE.md
 
 Headless USB-Host RTL-SDR receiver on the Waveshare ESP32-P4-WIFI6-DEV-KIT: 1090 MHz ADS-B/Mode-S
-decoded on-chip, a console REPL on the serial port and over SSH (the TUI is the `tui` command
-inside it), decoded frames fed out over Ethernet/WiFi as AVR raw (:30001), Beast (:30005) and a
+decoded on-chip, a console REPL on the serial port and over SSH (the radar TUI is the `tui` command
+inside it, the system monitor `top`), decoded frames fed out over Ethernet/WiFi as AVR raw (:30001), Beast (:30005) and a
 JSON aircraft snapshot (:8888). No display. Raw IQ (~4 MB/s) never leaves the chip — that is the
 point of decoding locally.
 
 This file holds only what is not derivable from the code: schematic facts, build gotchas and the
 cross-file invariants. Where the rest lives:
 
-- `docs/console.md` — console REPL + SSH console: ownership and sink model, the bugs found on
-  hardware, the command reference. **Read before touching `shell.c` or `net_ssh.c`.**
+- `docs/console.md` — console REPL + SSH console: ownership and the screen/sink model, the bugs
+  found on hardware, the command reference. **Read before touching `shell.c`, `screen.c` or
+  `net_ssh.c`.**
 - `../c6-notes.md` — single source of truth for the ESP32-C6 co-processor (pinout, host
   `sdkconfig` block, SDIO reflash runbook, P2 brick recovery). Read before anything C6-related.
 - `../wsl-readsb-notes.md` — the readsb/tar1090 host in WSL and the link it reaches the board
@@ -115,7 +116,7 @@ rtlsdr_setup_task   core0 prio 4   transient, spawned on NEW_DEV
 rtl_pump            core1 prio 12  only re-submits the 8x16KB transfers (~244/s); nearly idle
 adsb_rx_task        core1 prio 5   the real load: ring -> demodulate() -> mode_s_detect() -> on_msg()
                                    (ICAO/CRC/callsign/alt/vel/heading/vrate + CPR lat/lon)
-tui_task            core0 prio 2   the only caller of tui_draw(); paints only while a viewer is attached
+screen              core0 prio 2   the draw task (screen.c): paints `tui` / `top` only while a viewer is on it
 audio_task          core1 prio 6   ES8311 tones — ABOVE adsb_rx_task on the same core
 usb_recover_task    core0 prio 4
 wifi_mgr            core0 prio 3   C6 bring-up, then STA join attempts with backoff
@@ -124,7 +125,7 @@ ssh_srv             core0 prio 3   accept loop; runs the line editor and the com
                                    `tasks` over SSH is measuring this task
 ```
 
-- **Core placement is not what the priorities suggest.** Demod is on core1; enumeration, the TUI
+- **Core placement is not what the priorities suggest.** Demod is on core1; enumeration, the screens
   and the USB data copy are on core0 — transfer callbacks run in whoever called
   `usb_host_client_handle_events()`, which is only ever `class_driver_task`. That copy is ~1% of
   core0.
@@ -133,13 +134,17 @@ ssh_srv             core0 prio 3   accept loop; runs the line editor and the com
   `setvbuf` and bypassing the stdio lock were all measured and do not help. Never route the frame
   through `printf`: `uart_vfs`'s `write()` calls `uart_write_bytes(&c, 1)` **per character** for
   the CRLF translation, one mutex per byte. `fb_flush()` writes `uart_write_bytes()` directly.
-- Measure with the TUI's `CPU0`/`CPU1` gauges and TASKS panel (`R` cycles RADAR/WFALL/TASKS), or
-  `tasks` and `usb` on the console when numbers have to be copied. Needs
-  `CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS`.
-- **`HEAP` on the status row is internal RAM only** (`heap_caps_get_free_size(MALLOC_CAP_INTERNAL)`)
-  — `esp_get_free_heap_size()` folds in 32 MB of PSRAM and hides the number that actually runs
-  out. PSRAM free is the separate `PSRAM nnM` field. A min-ever below the 32 KB
-  `SPIRAM_MALLOC_RESERVE_INTERNAL` line means task stacks/DMA callers are eating the reserve.
+- Measure with `top` (`top [seconds]`; per-core busy %, internal heap / PSRAM, per-task CPU%, stack
+  headroom, TIME+, and the `display` line = the console-bytes cost of whatever screens are up),
+  or `tasks` / `usb` when numbers have to be copied. The TUI's `CPU0`/`CPU1` gauges and TASKS
+  panel read the same sampler (`top.c`) until the TUI rewrite drops them. Needs
+  `CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS`; the counter is `..._COUNTER_TYPE_U64` so TIME+ does
+  not wrap every 71 min.
+- **`heap internal` in `top` (and `HEAP` on the TUI status row) is internal RAM only**
+  (`heap_caps_get_free_size(MALLOC_CAP_INTERNAL)`) — `esp_get_free_heap_size()` folds in 32 MB of
+  PSRAM and hides the number that actually runs out. PSRAM is the separate line/field. A min-ever
+  below the 32 KB `SPIRAM_MALLOC_RESERVE_INTERNAL` line means task stacks/DMA callers are eating
+  the reserve.
   Runtime heap (task stacks, USB host, lwIP, esp_hosted, libssh) is the bigger consumer than
   static data; `SPIRAM_TRY_ALLOCATE_WIFI_LWIP` (see `sdkconfig.defaults`) is the next lever.
 - **Priority vs the demod loop.** lwIP's tcpip task (prio 18) is pinned by
@@ -203,14 +208,15 @@ Full design in `docs/console.md`. What breaks if dropped:
 - `shell_init()` installs the UART driver at the top of `app_main`; the console task is UART0's
   only reader for the life of the board. Only `esp_console_run()` (the Eval half of esp_console)
   is used — the Read half is `shell.c`'s own line editor, shared by both transports.
-- Console ownership (`OWNER_NONE/UART/SSH`) and "TUI in front here" flags are independent axes.
-  SSH **preempts** the serial shell. Handover order is fixed: **claim → swap stdout → print
-  banner**, and on exit **restore stdout → close**.
-- The TUI is a service with sinks (`tui_attach/tui_detach`); `class_driver.c` knows no transport.
-  Clear the screen **before** attaching, never after. Panel state and width are shared across
-  viewers.
-- `s_paint_lock` interlocks the frame and the prompt; anything that writes UART0 in response to a
-  keystroke needs `adsb_tui_hold()`.
+- Console ownership (`OWNER_NONE/UART/SSH`) and "which screen is in front here" (`SCREEN_NONE/
+  TUI/TOP`, one per transport) are independent axes. SSH **preempts** the serial shell. Handover
+  order is fixed: **claim → swap stdout → print banner**, and on exit **restore stdout → close**.
+- Screens are a service (`screen.c`: `screen_attach/screen_detach`, one draw task); neither
+  `class_driver.c` nor `top.c` knows a transport. Each sink names its screen, so the radar on
+  serial and `top` over SSH coexist; within a screen, state and width are shared across viewers.
+  `screen_attach()` clears the terminal itself before publishing the slot — never clear after.
+- `screen.c`'s paint lock interlocks the frame and the prompt; anything that writes UART0 in
+  response to a keystroke needs `screen_hold()`.
 - `net_ssh.c` swaps the **global** `stdout` *and* `tls_stdout`/`tls_stderr` (the console component
   force-includes a header that redirects `printf` to the thread-local one). The `funopen()` stream
   does its own `\n → \r\n`. The write callback never touches libssh — it feeds a ring the SSH task

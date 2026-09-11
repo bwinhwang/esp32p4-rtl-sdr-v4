@@ -20,6 +20,8 @@
 #include "ota.h"
 #include "web_config.h"
 #include "shell.h"
+#include "screen.h"
+#include "top.h"
 #include "net_ssh.h"
 #include "feed_avr.h"
 #include "feed_beast.h"
@@ -109,6 +111,13 @@ void app_main(void)
      * shell_console_start() at the end of this function. */
     shell_init();
 
+    /* The display service next: one draw task that idles until `tui` or `top`
+     * attaches a viewer, so both work with no dongle enumerated. Registered
+     * here, before the SSH server can run a command that wants them. */
+    screen_start();
+    adsb_tui_start();
+    top_init();
+
     ESP_LOGI(TAG, "ESP32-P4 ADS-B Receiver starting");
 
 #if CONFIG_SPIRAM
@@ -194,12 +203,8 @@ void app_main(void)
     assert(task_created == pdTRUE);
     vTaskDelay(10);
 
-    /* ── 3.5. Console and display ──
-     * The draw task runs from here rather than from the receiver so the
-     * display is available with no dongle enumerated; it paints only while
-     * `tui` has put it in the foreground. The prompt comes last, after the
-     * loudest part of boot, so it is not immediately scrolled away. */
-    adsb_tui_start();
+    /* ── 3.5. Console prompt ── last, after the loudest part of boot, so it
+     * is not immediately scrolled away. */
     shell_console_start();
 
     /* ── 4. Event loop ── */

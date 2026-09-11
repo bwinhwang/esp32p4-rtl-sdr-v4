@@ -1,14 +1,16 @@
 # Console REPL and SSH console
 
 `main/shell.c` owns the command line, `main/net_ssh.c` puts the same REPL on a socket,
-`main/class_driver.c` owns the TUI frame and the event ring. This is the design and the list of
-things that break if changed.
+`main/screen.c` is the display service both full-screen commands paint through,
+`main/class_driver.c` owns the radar frame and the event ring, `main/top.c` the system monitor.
+This is the design and the list of things that break if changed.
 
 ## Model
 
-**The serial port is a command line, and the TUI is one command in it.** The board boots to a
+**The serial port is a command line, and the screens are commands in it.** The board boots to a
 `p4> ` prompt — same console, same commands, same line editor the SSH server serves — and `tui`
-puts the radar display in the foreground; `q`, `:`, Ctrl-C or Ctrl-D returns to the prompt.
+puts the radar display in the foreground, `top` the system monitor; `q`, `:`, Ctrl-C or Ctrl-D
+returns to the prompt.
 `shell_init()` installs the UART driver at the top of `app_main`, before anything logs, and the
 console task is UART0's only reader for the life of the board — so the shell exists with no
 dongle, which is exactly when `usb` and `wifi sta` are wanted. The display is opt-in, so
@@ -16,8 +18,11 @@ dongle, which is exactly when `usb` and `wifi sta` are wanted. The display is op
 
 **Ownership and display are two independent axes.** Ownership is an enum
 (`OWNER_NONE`/`OWNER_UART`/`OWNER_SSH`): who may use the *one* line buffer, command context and
-global stdout. "The TUI is in front here" is a separate flag per transport. So the serial shell and
-an SSH session can never both be at a prompt, while `tui` on either or both at once is fine.
+global stdout. "Which screen is in front here" is a separate `screen_id_t` per transport
+(`s_fg_uart`/`s_fg_ssh`, `SCREEN_NONE` at a prompt). So the serial shell and an SSH session can
+never both be at a prompt, while a screen on either or both at once is fine — and they need not
+be the same screen: radar on the serial monitor, `top` over SSH is the intended way to watch the
+board's load while the display is up.
 
 **esp_console is used for Eval only.** `esp_console_new_repl_uart()` is not used: the stock REPL
 installs its own UART driver and blocking reader, and this project needs the driver installed with
@@ -28,34 +33,41 @@ linenoise (it wants to own stdin and block in it): editing is backspace, Ctrl-C,
 history, no completion.
 
 **Commands split by what they can reach**: generic ones (`free`, `tasks`, `net`, `wifi`, `log`,
-`sys`, `tui`, `ota`, `ssh`, `restart`, `exit`) in `shell.c`; `ac`, `usb`, `sdr` registered from
-`class_driver.c` because they read its statics (`s_aircraft`, `rtldev`). `tasks` samples
-`uxTaskGetSystemState()` twice a second apart rather than reusing the TUI's cached `s_tstat`, which
-is frozen whenever the display is in the background. esp_hosted registers `mem-dump`, `task-dump`,
-`cpu-dump`, `heap-trace`, `sock-dump`, `host-power-save` into the same console.
+`sys`, `tui`, `top`, `ota`, `ssh`, `restart`, `exit`) in `shell.c`; `ac`, `usb`, `sdr` registered
+from `class_driver.c` because they read its statics (`s_aircraft`, `rtldev`). `tasks` is
+`top_batch()`: the sampler in `top.c` is shared by `top`, the TUI's gauges and this command, and
+`tasks` forces a fresh 1 s window (sample, sleep, sample) because the sampler only runs while
+something asks — it is frozen whenever no screen is up. esp_hosted registers `mem-dump`,
+`task-dump`, `cpu-dump`, `heap-trace`, `sock-dump`, `host-power-save` into the same console.
 
-## The TUI as a service
+## Screens as a service (`screen.c`)
 
-`tui_draw()` assembles **one** frame; `fb_flush()` hands each run to every attached *sink*
-(`tui_attach(fn, ctx)` / `tui_detach(fn, ctx)` in `shell.h`, implemented in `class_driver.c`).
-`class_driver.c` includes neither `driver/uart.h` nor `net_ssh.h`; `shell.c` owns the two adapters
-(`uart_sink` → `uart_write_bytes`, `ssh_sink` → `net_ssh_tui_write`, both below stdio for the
-per-call cost). A third viewer is an adapter plus a `TUI_MAX_SINKS` bump.
+A *screen* registers a draw callback, a key callback, a period and a width
+(`screen_register()`); `class_driver.c` registers `SCREEN_TUI` from `adsb_tui_start()`, `top.c`
+registers `SCREEN_TOP` from `top_init()`. One draw task (`screen`, core0 prio 2) polls every
+100 ms and, for each screen that has a viewer and is due, calls its draw with the `fb_*` assembler
+and hands each run of the frame to that screen's *sinks* (`screen_attach(id, fn, ctx)` /
+`screen_detach(fn, ctx)`). Neither screen includes `driver/uart.h` or `net_ssh.h`; `shell.c`
+owns the two adapters (`uart_sink` → `uart_write_bytes`, `ssh_sink` → `net_ssh_tui_write`, both
+below stdio for the per-call cost). A third viewer is an adapter plus a `SCREEN_MAX_SINKS` bump.
 
-**State is shared, not per-viewer** — one panel for everyone, `R` from either viewer switches
-both, fixed `TERM_W` (154) rather than each client's width. Per-client state would multiply
-core0's per-byte cost by the viewer count. `tui` compares `adsb_tui_cols()` against the client's
-PTY width and refuses a narrow window (a wrapped frame looks like a broken build).
+**Each sink names its screen**, so the two transports can watch different screens at once; a
+screen with no viewer costs nothing but the poll. **Within a screen, state is shared, not
+per-viewer** — one radar panel for everyone, `R` from either viewer switches both, fixed `TERM_W`
+(154) rather than each client's width; `top`'s interval and row cut are likewise the last
+`top` invocation's. Per-client state would multiply core0's per-byte cost by the viewer count.
+`enter_screen()` compares `screen_cols(id)` against the client's PTY width and warns on a narrow
+window (a wrapped frame looks like a broken build).
 
 Rules of the attach path:
 
 - **No lock on the sink table.** `fn` is the slot's published flag: attach writes it last, detach
-  clears it first and then calls `adsb_tui_hold()` to wait out a run in flight. Not safe against
+  clears it first and then calls `screen_hold()` to wait out a run in flight. Not safe against
   two *concurrent* attaches — doesn't need to be, console ownership is exclusive and the only
-  callers are the two `tui` commands. Any other task attaching must bring its own serialisation.
-- **Clear the screen before attaching, never after.** The draw task starts the moment a slot is
-  published.
-- **Over SSH the command keeps the console; over serial it gives it up.** Serial `cmd_tui()`
+  callers are the `tui`/`top` commands. Any other task attaching must bring its own serialisation.
+- **`screen_attach()` clears the terminal (through stdout) before publishing the slot.** The draw
+  task starts the moment a slot is published; never clear after.
+- **Over SSH the command keeps the console; over serial it gives it up.** Serial `enter_screen()`
   releases ownership so `run_line()` does not print a prompt over the first frame. Doing that in a
   session would let the serial shell `settle()` in behind and send its banner down the wire
   (stdout still points there), so the SSH path stays `OWNER_SSH` and `shell_remote_byte()` routes
@@ -64,19 +76,32 @@ Rules of the attach path:
   escape leaves the screen wrong, and a frame (~20 KB) exceeds the ring (16 KB). Bounded because
   the task draining that ring is the one that processes the key leaving the display. `fb_out()`
   re-reads the slot per run so a detached sink stops being called immediately.
-- **`shell_tui_foreground()` means "on whichever transport owns stdout"** — the only question the
-  event echo needs answered.
+- **`shell_screen_foreground()` means "on whichever transport owns stdout"** — the only question
+  the event echo needs answered.
 - **`q` on serial is refused while an SSH session holds the console** (no prompt to return to,
   and keys from an owner-less transport are dropped, so the port would be stranded blank).
-  `leave_tui()` stays put and says so through the LOG panel.
+  `leave_screen()` stays put and says so through the LOG panel (in `top`, which has no panel, the
+  key just does nothing).
 
-**`s_paint_lock` interlocks the frame and the prompt.** The draw task is prio 2, the console task
-3; leaving the TUI would otherwise print the banner into a ~13 KB repaint. `adsb_tui_hold()` from
-`leave_tui()` waits the frame out. Anything else that writes UART0 in response to a keystroke
+**The paint lock interlocks the frame and the prompt.** The draw task is prio 2, the console task
+3; leaving a screen would otherwise print the banner into a ~13 KB repaint. `screen_hold()` from
+`leave_screen()` waits the frame out. Anything else that writes UART0 in response to a keystroke
 needs the same.
 
+**`top`** (`top.c`) is the Linux tool's shape on FreeRTOS: a title line with uptime, interval and
+task count; per-core busy % (100 − the IDLE task's share of the interval); internal heap and
+PSRAM free/min/largest; a `display` line with the frame probe (frames/s, bytes/frame, ms/s spent
+assembling and writing — the cost of whatever screens are up, which is core0's main consumer);
+then the tasks busiest first with CORE, PRIO, ST (`R` running, `r` ready, `B` blocked, `S`
+suspended), CPU% in tenths of one core, STACK headroom in bytes, TIME+. `top [seconds]` sets the
+interval (1–60, default 2), `+`/`-` change it live. It is 80 columns and repaints in place (home,
+erase-to-EOL per line, erase-below at the end) rather than clearing, so it does not flicker; over
+SSH the table is cut to the PTY height, over serial every task is printed. The sampler is capped
+at 1 Hz whoever asks, so with the radar also up the percentages cover 1 s windows, not the `top`
+interval. Note `+`/`-` mean volume in the radar and interval here.
+
 **The `t` hotkey defers to the demod loop.** `inject_fake_aircraft()` writes `s_aircraft[]`, which
-has no lock; the key is read on core0, so `adsb_tui_key()` sets `s_inject_req` and `adsb_rx_task`
+has no lock; the key is read on core0, so `tui_key()` sets `s_inject_req` and `adsb_rx_task`
 does the work. With no dongle that task does not exist, so it runs inline. Same for anything else
 in a key handler that touches the aircraft table.
 
@@ -102,7 +127,7 @@ over a common `log_put()`:
 |---|---|---|---|
 | `sys_log()` | the board — USB, IQ stream, WiFi, Ethernet, OTA, web server, console | **no** | `sys` and above |
 | `air_log()` | the sky — CONTACT / IDENT / FIX / ALT / VEL / LOST | yes | `brief` (colours 1 and 4 only) and `all` |
-| `ui_log()` | the display answering a key — PANEL, AUDIO, `leave_tui()`'s refusal | yes | `all` only |
+| `ui_log()` | the display answering a key — PANEL, AUDIO, `leave_screen()`'s refusal | yes | `all` only |
 
 The split is on both ends: the panel is aircraft-only, the prompt board-only by default. A board
 line in a seven-line panel (a link retrying every 30 s) wipes the aircraft out, and the header row
@@ -194,8 +219,9 @@ Not in `README.md` (which stops at the console itself), so kept here.
 
 | command | effect |
 |---|---|
-| `tui` / `q` | enter / leave the display (`:`, Ctrl-C, Ctrl-D also leave). Inside: `R` cycles RADAR/WFALL/TASKS, `t` injects a synthetic contact |
-| `tasks`, `usb`, `free`, `sys`, `ac`, `sdr`, `net` | TASKS panel / USB stream probe / heap / board / aircraft table / tuner / network as text — the way to read numbers that have to be copied. `net` also prints the STA failure count and seconds to the next attempt |
+| `tui` / `q` | enter / leave the radar display (`:`, Ctrl-C, Ctrl-D also leave). Inside: `R` cycles RADAR/WFALL/TASKS, `t` injects a synthetic contact, `m` / `+` / `-` audio |
+| `top [seconds]` / `q` | enter / leave the system monitor: per-core busy %, heap, PSRAM, display cost, per-task CPU%/stack/TIME+ busiest first, refreshed every `seconds` (1–60, default 2). Inside: `+` / `-` change the interval |
+| `tasks`, `usb`, `free`, `sys`, `ac`, `sdr`, `net` | `top` once over a fresh 1 s window / USB stream probe / heap / board / aircraft table / tuner / network as text — the way to read numbers that have to be copied. `net` also prints the STA failure count and seconds to the next attempt |
 | `log echo <off\|sys\|brief\|all>`, `log tail` | move the console end of the event split; dump every facility in one stream |
 | `wifi sta <ssid> <pass>` | write upstream credentials to NVS (echoed in clear — fine on a cable, remember it before exposing the shell) |
 | `wifi sta on\|off`, `wifi sta clear` | stop / resume the join loop keeping credentials; forget them |
