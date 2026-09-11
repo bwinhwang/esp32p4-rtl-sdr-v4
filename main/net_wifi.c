@@ -366,7 +366,21 @@ static esp_err_t wifi_bringup(void)
     err = esp_event_loop_create_default();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return err;
 
-    esp_netif_create_default_wifi_ap();
+    esp_netif_t *ap_netif = esp_netif_create_default_wifi_ap();
+    /* AP subnet 192.168.8.0/24, gateway 192.168.8.1 -- esp_netif's own default
+     * for a WiFi AP netif is 192.168.4.0/24, overridden here. Must stop/start
+     * the DHCP server around esp_netif_set_ip_info(): it is rejected outright
+     * while the server is running. */
+    if (ap_netif) {
+        esp_netif_dhcps_stop(ap_netif);
+        esp_netif_ip_info_t ap_ip = {
+            .ip      = { .addr = esp_ip4addr_aton("192.168.8.1") },
+            .gw      = { .addr = esp_ip4addr_aton("192.168.8.1") },
+            .netmask = { .addr = esp_ip4addr_aton("255.255.255.0") },
+        };
+        esp_netif_set_ip_info(ap_netif, &ap_ip);
+        esp_netif_dhcps_start(ap_netif);
+    }
     s_sta_netif = esp_netif_create_default_wifi_sta();
     if (s_sta_netif) esp_netif_set_route_prio(s_sta_netif, STA_ROUTE_PRIO);
 
