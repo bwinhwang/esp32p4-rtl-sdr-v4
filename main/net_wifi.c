@@ -88,6 +88,10 @@
 
 static const char *TAG = "wifi";
 
+/* SoftAP protocol bitmap: 11b/g/n, deliberately without 11AX. The reasoning
+ * is at the esp_wifi_set_protocol() call site in net_wifi_start(). */
+#define AP_PROTO  (WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N)
+
 static volatile net_wifi_state_t s_state;
 static volatile int      s_ap_clients;
 static volatile uint32_t s_sta_ip4;      /* raw, so a reader can't catch a
@@ -261,11 +265,9 @@ esp_err_t net_wifi_set_ap_enabled(bool on)
         s_ap_clients = 0;
     } else {
         /* Re-asserted rather than assumed to survive the mode change, for the
-         * same reason it is set at bring-up: without 11AX the board is sold as
-         * WIFI6 and associates clients at WiFi 4. Non-fatal. */
-        esp_wifi_set_protocol(WIFI_IF_AP,
-                              WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G |
-                              WIFI_PROTOCOL_11N | WIFI_PROTOCOL_11AX);
+         * same reason it is set at bring-up. NOTE: no 11AX here -- see the
+         * bring-up site for why the SoftAP stays 11n. */
+        esp_wifi_set_protocol(WIFI_IF_AP, AP_PROTO);
     }
     return nvs_set_flag(CRED_AP_ON, on);
 }
@@ -470,16 +472,29 @@ static esp_err_t wifi_bringup(void)
     if (serr != ESP_OK)
         ESP_LOGW(TAG, "scan dwell left at defaults: %s", esp_err_to_name(serr));
 
-    /* ESP-IDF's default AP bitmap is 11B|11G|11N, so clients report "WiFi 4"
-     * on a board sold as WIFI6-DEV-KIT. The C6 has HE (SOC_WIFI_HE_SUPPORT),
-     * it is only off by default. Non-fatal: an older slave that does not
-     * implement the call just stays on 11n. */
-    const uint8_t proto = WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G |
-                          WIFI_PROTOCOL_11N | WIFI_PROTOCOL_11AX;
-    esp_err_t perr = s_ap_on ? esp_wifi_set_protocol(WIFI_IF_AP, proto) : ESP_OK;
-    if (perr == ESP_OK) perr = esp_wifi_set_protocol(WIFI_IF_STA, proto);
+    /* The STA half keeps 11AX -- joining an upstream WiFi 6 router at HE rates
+     * is free and was never implicated in anything.
+     *
+     * The SoftAP deliberately does NOT. Advertising HE made an 11ax phone
+     * associate at 286 Mbps and then go unreachable about a second later:
+     * broadcast kept working (it held its DHCP lease) while every unicast
+     * frame to it was lost -- ARP replies, ICMP echo replies, TCP SYN-ACKs --
+     * so :8888, :80 and even ping all timed out while the station still shows
+     * as associated. An 11n Raspberry Pi on the same AP at the same moment was
+     * completely unaffected. That is the shape of a sleeping HE station whose
+     * buffered unicast never gets delivered (TWT / HE power save), and
+     * esp_wifi_set_ps() does not cover it: that knob is about the board's own
+     * STA, not about how the AP serves a dozing client.
+     *
+     * The cost is that clients report WiFi 4 on a board sold as WIFI6-DEV-KIT.
+     * The feeds are hundreds of B/s, so 11n is many times more headroom than
+     * this ever needs, and a link that works beats a number in a settings
+     * screen. */
+    const uint8_t sta_proto = AP_PROTO | WIFI_PROTOCOL_11AX;
+    esp_err_t perr = s_ap_on ? esp_wifi_set_protocol(WIFI_IF_AP, AP_PROTO) : ESP_OK;
+    if (perr == ESP_OK) perr = esp_wifi_set_protocol(WIFI_IF_STA, sta_proto);
     if (perr != ESP_OK)
-        ESP_LOGW(TAG, "11ax not enabled: %s", esp_err_to_name(perr));
+        ESP_LOGW(TAG, "protocol bitmap not applied: %s", esp_err_to_name(perr));
 
     return ESP_OK;
 }
