@@ -107,7 +107,12 @@ static void listen_open(void)
         .sin_port        = htons(FEED_PORT),
         .sin_addr.s_addr = htonl(INADDR_ANY),
     };
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 || listen(fd, 2) < 0) {
+    /* Backlog MAX_CLIENTS rather than 2: lwIP's accept_function() aborts a
+     * pcb outright (the peer sees a RST) once the backlog is full, and the
+     * app's manual mode probes :8888 on every WiFi Network it can see, so
+     * several handshakes can land inside one tick. */
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
+        listen(fd, MAX_CLIENTS) < 0) {
         close(fd);
         return;
     }
@@ -116,29 +121,54 @@ static void listen_open(void)
     ESP_LOGI(TAG, "JSON snapshot listening on :%d", FEED_PORT);
 }
 
+/* Drains the whole accept queue, because the tick is 750 ms: taking one
+ * connection per tick left the rest sitting in the backlog for most of a
+ * second each, and the app's probe gives a candidate 2 s to produce a line.
+ *
+ * Every way this can turn a client away is logged. None of them used to be,
+ * which is what made the wedge invisible: a full slot table and an exhausted
+ * lwIP socket pool (accept() -> ENFILE, after lwip_accept() has already
+ * completed the handshake and deleted the netconn) both look to the peer like
+ * a connection that succeeded and was dropped, and the board said nothing at
+ * all about either. */
 static void accept_new(void)
 {
-    int fd = accept(s_listen, NULL, NULL);
-    if (fd < 0) return;
+    for (;;) {
+        struct sockaddr_in peer;
+        socklen_t          plen = sizeof(peer);
+        int fd = accept(s_listen, (struct sockaddr *)&peer, &plen);
+        if (fd < 0) {
+            if (errno != EWOULDBLOCK && errno != EAGAIN)
+                ESP_LOGW(TAG, "accept failed, errno %d", errno);
+            return;
+        }
 
-    int slot = -1;
-    for (int i = 0; i < MAX_CLIENTS; i++)
-        if (s_cli[i].fd < 0) { slot = i; break; }
-    if (slot < 0) { close(fd); return; }
+        char ip[INET_ADDRSTRLEN] = "?";
+        inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip));
 
-    int one = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY,  &one, sizeof(one));
-    setsockopt(fd, SOL_SOCKET,  SO_KEEPALIVE, &one, sizeof(one));
-    int v = KEEP_IDLE_S;  setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,  &v, sizeof(v));
-    v = KEEP_INTVL_S;     setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &v, sizeof(v));
-    v = KEEP_CNT;         setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &v, sizeof(v));
-    /* Non-blocking, and deliberately NO SO_SNDTIMEO: see send_frame(). */
-    fcntl(fd, F_SETFL, O_NONBLOCK);
+        int slot = -1;
+        for (int i = 0; i < MAX_CLIENTS; i++)
+            if (s_cli[i].fd < 0) { slot = i; break; }
+        if (slot < 0) {
+            ESP_LOGW(TAG, "%s turned away, all %d slots busy", ip, MAX_CLIENTS);
+            close(fd);
+            continue;
+        }
 
-    s_cli[slot].fd    = fd;
-    s_cli[slot].stall = 0;
-    s_nclients++;
-    ESP_LOGI(TAG, "client connected, %d total", s_nclients);
+        int one = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY,  &one, sizeof(one));
+        setsockopt(fd, SOL_SOCKET,  SO_KEEPALIVE, &one, sizeof(one));
+        int v = KEEP_IDLE_S;  setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,  &v, sizeof(v));
+        v = KEEP_INTVL_S;     setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &v, sizeof(v));
+        v = KEEP_CNT;         setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &v, sizeof(v));
+        /* Non-blocking, and deliberately NO SO_SNDTIMEO: see send_frame(). */
+        fcntl(fd, F_SETFL, O_NONBLOCK);
+
+        s_cli[slot].fd    = fd;
+        s_cli[slot].stall = 0;
+        s_nclients++;
+        ESP_LOGI(TAG, "client connected from %s, %d total", ip, s_nclients);
+    }
 }
 
 /* Push one whole snapshot to one client.
