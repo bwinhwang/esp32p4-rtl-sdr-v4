@@ -331,6 +331,13 @@ esp_err_t web_config_start(void)
     cfg.task_priority   = 3;
     cfg.stack_size      = 5120;
     cfg.max_uri_handlers = 6;   /* root, wifi, radio, aircraft.json, ota, +1 */
+    /* Down from esp_http_server's default of 7, because those sockets come out
+     * of the same CONFIG_LWIP_MAX_SOCKETS pool as the three feeds and SSH, and
+     * the arithmetic that makes them all fit is written out in
+     * sdkconfig.defaults. This is a config page a person opens, not a service:
+     * a browser's parallel connections to one page are what 4 is for, and
+     * lru_purge_enable below recycles rather than refuses past that. */
+    cfg.max_open_sockets = 4;
     cfg.lru_purge_enable = true;   /* a phone that walks away must not wedge it */
     /* A handler that only ever reads gives TCP nothing to probe with, so a
      * peer that disappears without a FIN is invisible to it -- and POST /ota

@@ -60,10 +60,27 @@ CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y
 # the component does not build on a stock v6 config without it.
 CONFIG_VFS_SUPPORT_TERMIOS=y
 
-# Socket budget. The default 10 was already tight with three feed listeners
-# (:30001 AVR, :30005 Beast, :8888 JSON) plus their clients and the config
-# page's httpd; net_ssh.c adds a listener and an accepted session on top.
-CONFIG_LWIP_MAX_SOCKETS=16
+# Socket budget, counted rather than guessed at -- 16 was short of what the
+# services on this board can ask for at once, and running out does not fail
+# politely: lwip_accept() completes the handshake and only then discovers it
+# has no socket left, so it deletes the netconn and returns ENFILE, which the
+# peer experiences as a connection that came up and was immediately dropped.
+#
+#   httpd (web_config.c)  listener + ctrl UDP + max_open_sockets 4   =  6
+#   feed_avr   :30001     listener + MAX_CLIENTS 4                   =  5
+#   feed_beast :30005     listener + MAX_CLIENTS 4                   =  5
+#   feed_json  :8888      listener + MAX_CLIENTS 4                   =  5
+#   net_ssh    :22        listener + one session                     =  2
+#                                                                      --
+#                                                                      23
+# web_config.c holds httpd to 4 (esp_http_server's default is 7) so the total
+# stays under this; raising either means revisiting the other.
+CONFIG_LWIP_MAX_SOCKETS=24
+
+# Of those, the TCP pcbs: 4 httpd + 12 feed clients + 1 SSH = 17 at once, and
+# every closed connection holds one more in TIME_WAIT. The listeners come from
+# CONFIG_LWIP_MAX_LISTENING_TCP (16, against 5 used) and are not counted here.
+CONFIG_LWIP_MAX_ACTIVE_TCP=24
 
 # ── WiFi via the ESP32-C6 co-processor ──────────────────────────────────────
 # The P4 has no radio; esp_wifi_remote remotes the ordinary esp_wifi_* API to
