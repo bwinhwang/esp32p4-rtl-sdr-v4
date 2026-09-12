@@ -676,14 +676,24 @@ static int active_count(void)
  * handling. Staleness window matches active_count()'s, but read-only: this
  * runs from feed_json's own task (core0), a second reader of s_aircraft[]
  * alongside tui_task, so it must never be the one to flip `active` off. */
+/* Returns the new length, or `bufsize` to mean "full, and what you asked for
+ * did not fit". That sentinel is why the clamp matters: vsnprintf() returns
+ * what it WOULD have written, so the old `n + w` ran past the end of the
+ * buffer on truncation and handed the caller a length nothing had ever
+ * written to -- a buffer overread the moment it reached send(). It could not
+ * be hit at MAX_TRACKED=64 (~10.7 KB against a 16 KB buffer), but it was one
+ * changed constant or one added field away. */
 static size_t json_append(char *buf, size_t bufsize, size_t n, const char *fmt, ...)
 {
-    if (n >= bufsize) return n;
+    if (n >= bufsize) return bufsize;
     va_list ap;
     va_start(ap, fmt);
     int w = vsnprintf(buf + n, bufsize - n, fmt, ap);
     va_end(ap);
-    return (w > 0) ? n + (size_t)w : n;
+    if (w <= 0) return n;
+    /* >= and not >: vsnprintf() spends one byte on the NUL, so a run that
+     * lands exactly on bufsize lost its last character. */
+    return (n + (size_t)w >= bufsize) ? bufsize : n + (size_t)w;
 }
 
 size_t aircraft_export_ndjson(char *buf, size_t bufsize)
@@ -715,7 +725,11 @@ size_t aircraft_export_ndjson(char *buf, size_t bufsize)
         first = false;
     }
     n = json_append(buf, bufsize, n, "]}\n");
-    return n;
+    /* Nothing downstream can use half a line: :8888's terminating '\n' is the
+     * last byte, so a truncated snapshot costs the peer the line boundary
+     * rather than a few aircraft, and /aircraft.json would serve invalid JSON.
+     * Skipping the tick is the honest answer; feed_json.c logs it. */
+    return (n >= bufsize) ? 0 : n;
 }
 
 

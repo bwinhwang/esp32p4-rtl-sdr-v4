@@ -30,7 +30,11 @@
  * modules already use, to keep a dependency edge out of the TUI internals. */
 extern size_t aircraft_export_ndjson(char *buf, size_t bufsize);
 
-#define SNAPSHOT_MAX  4096
+/* Must match feed_json.c's: MAX_TRACKED=64 aircraft at ~165 B each is
+ * ~10.7 KB, so the 4096 this used to be was already serving a truncated,
+ * invalid-JSON body whenever the table filled. Request-scoped, so it is a
+ * malloc() and not a static like the feed's. */
+#define SNAPSHOT_MAX  16384
 
 static const char *TAG = "web";
 
@@ -289,6 +293,11 @@ static esp_err_t aircraft_get(httpd_req_t *req)
         return ESP_FAIL;
     }
     size_t n = aircraft_export_ndjson(buf, SNAPSHOT_MAX);
+    if (n == 0) {
+        free(buf);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "snapshot too large");
+        return ESP_FAIL;
+    }
 
     httpd_resp_set_type(req, "application/json");
     /* The snapshot is one NDJSON line; strip the newline so this is valid
