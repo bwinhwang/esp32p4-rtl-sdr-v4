@@ -10,7 +10,7 @@ This is the design and the list of things that break if changed.
 
 **The serial port is a command line, and the screens are commands in it.** The board boots to a
 `p4> ` prompt — same console, same commands, same line editor the SSH server serves — and `tui`
-puts the radar display in the foreground, `top` the system monitor; `q`, `:`, Ctrl-C or Ctrl-D
+puts the aircraft display in the foreground, `top` the system monitor; `q`, `:`, Ctrl-C or Ctrl-D
 returns to the prompt.
 `shell_init()` installs the UART driver at the top of `app_main`, before anything logs, and the
 console task is UART0's only reader for the life of the board — so the shell exists with no
@@ -22,7 +22,7 @@ dongle, which is exactly when `usb` and `wifi sta` are wanted. The display is op
 global stdout. "Which screen is in front here" is a separate `screen_id_t` per transport
 (`s_fg_uart`/`s_fg_ssh`, `SCREEN_NONE` at a prompt). So the serial shell and an SSH session can
 never both be at a prompt, while a screen on either or both at once is fine — and they need not
-be the same screen: radar on the serial monitor, `top` over SSH is the intended way to watch the
+be the same screen: the map on the serial monitor, `top` over SSH is the intended way to watch the
 board's load while the display is up.
 
 **esp_console is used for Eval only.** `esp_console_new_repl_uart()` is not used: the stock REPL
@@ -54,7 +54,7 @@ below stdio for the per-call cost). A third viewer is an adapter plus a `SCREEN_
 
 **Each sink names its screen**, so the two transports can watch different screens at once; a
 screen with no viewer costs nothing but the poll. **Within a screen, state is shared, not
-per-viewer** — one radar range and one sort order for everyone, a fixed 120 columns rather than
+per-viewer** — one map range and one sort order for everyone, a fixed 120 columns rather than
 each client's width, and the height from the last `tui` invocation; `top`'s interval and row cut
 are likewise the last `top` invocation's. Per-client state would multiply core0's per-byte cost
 by the viewer count.
@@ -99,26 +99,41 @@ suspended), CPU% in tenths of one core, STACK headroom in bytes, TIME+. `top [se
 interval (1–60, default 2), `+`/`-` change it live. It is 80 columns and repaints in place (home,
 erase-to-EOL per line, erase-below at the end) rather than clearing, so it does not flicker; over
 SSH the table is cut to the PTY height, over serial every task is printed. The sampler is capped
-at 1 Hz whoever asks, so with the radar also up the percentages cover 1 s windows, not the `top`
-interval. Note `+`/`-` mean volume in the radar and interval here.
+at 1 Hz whoever asks, so with the map also up the percentages cover 1 s windows, not the `top`
+interval. Note `+`/`-` mean volume in the aircraft display and interval here.
 
 **`tui`** (`tui.c`) is the sky and nothing else — no CPU, heap, network or feed fields; those are
 `top` and `net`. 120 columns: a title line (uptime, contacts and how many fit, frames/s, total,
 DEC % = frames passing CRC over the last second, FIX % = the share that needed a single-bit
-repair, MAX = farthest position decoded since boot, volume), then an 85-column table beside a
-33-column radar, then the event log, then the key legend. The table has ICAO, callsign, category,
+repair, MAX = farthest position decoded since boot, volume), then an 85-column block with the
+table above and the map below it, a 33-column event log running the full height beside them,
+then the key legend. The table has ICAO, callsign, category,
 squawk (7500/7600/7700 turn the row red and are logged), altitude, speed, heading, vertical rate,
 distance and bearing from `CONFIG_ADSB_RX_LAT/LON`, the last frame's signal level, message count
 and seconds since the last frame; a row dims past 15 s and is dropped at 60. Sorted by distance
 (no position last, then freshest), `s` cycles distance / altitude / messages / freshness. The
-radar is north-up with rings at half and full range; `<`/`>` (also `,`/`.`, `[`/`]`) step the
-range through 50/100/200 km, blips take the category colour and carry three callsign letters.
-Height follows the terminal, but the table is sized to its contents — never shorter than the
-radar's 15 rows, growing in steps of five so the log does not hop on every contact — and the
-event log takes everything else, newest first under the table, so a tall window buys history
-rather than blank table rows. When even the radar does not fit, the log gives way first (six
-lines minimum, two on a very short terminal). SSH reports the PTY height; serial assumes 40,
-`tui <rows>` overrides. Repaints in place like `top`.
+map is north-up around the antenna: land is a dark green background and sea is black (no
+coastline glyphs -- the shape is the fill's edge, sampled at quarter cells and drawn with block
+glyphs `▛▜▙▟▀▄▌▐…` where the coast crosses a cell), scheduled airports are `▪` plus their IATA
+code in the darkest green, the antenna is a `+`, and a `├──┤ 50 km` scale bar sits in the
+bottom-left corner. `<`/`>` (also `,`/`.`, `[`/`]`) zoom through 20/50/100/150 km, the distance
+from the view centre to the top and bottom rows; the whole 85-column width is used, so east and
+west reach about twice as far. The arrow keys (or `hjkl`) pan an eighth of the view per press
+and `c` (or Home) puts the antenna back in the middle; the centre is kept in km, so zooming
+after a pan zooms around the place you moved to, and it stops at the edge of the baked box
+(±450 km E-W, ±300 km N-S). The title shows where the centre is while it is off the antenna. A blip is a heading arrow (`•` with no velocity) in the category
+colour with the first three callsign letters beside it -- to the right, else to the left, else
+none; two blips on one cell become a headcount digit (no label) and the map title says how many
+were folded and how many contacts have no fix yet. An airport that would sit under a blip or a
+label gives way whole. The geography is baked into `main/map_data.h` by `tools/mkmap.py`
+(Natural Earth land with lakes cut out + OurAirports, clipped around the antenna in
+`sdkconfig`); move the antenna and the title asks for a rerun until you do. Height follows the
+terminal, map first: the table is sized to its contents in steps of five so the map does not hop
+on every contact, and the map takes everything else but never under 21 rows, so a crowded table
+loses rows ("(n shown)" on the title) before the map shrinks; past 39 rows the table gets the
+surplus, and on a very short terminal the table keeps five rows. The event log column is as
+tall as both, newest first from the top, lines cut at 33 columns. SSH reports the PTY
+height; serial assumes 40, `tui <rows>` overrides. Repaints in place like `top`.
 
 **The `t` hotkey defers to the demod loop.** `inject_fake_aircraft()` writes `s_aircraft[]`, which
 has no lock; the key is read on core0, so `tui_key()` calls `adsb_inject_test()`, which sets
@@ -245,7 +260,7 @@ Not in `README.md` (which stops at the console itself), so kept here.
 
 | command | effect |
 |---|---|
-| `tui [rows]` / `q` | enter / leave the aircraft display (`:`, Ctrl-C, Ctrl-D also leave); `rows` for a serial terminal that is not 40 lines. Inside: `s` cycles the sort (dist / alt / msgs / seen), `<` `>` step the radar range (50 / 100 / 200 km), `t` injects a synthetic contact, `m` / `+` / `-` audio |
+| `tui [rows]` / `q` | enter / leave the aircraft display (`:`, Ctrl-C, Ctrl-D also leave); `rows` for a serial terminal that is not 40 lines. Inside: `s` cycles the sort (dist / alt / msgs / seen), `<` `>` zoom the map (20 / 50 / 100 / 150 km), arrows / `hjkl` pan it and `c` recentres, `t` injects a synthetic contact, `m` / `+` / `-` audio |
 | `top [seconds]` / `q` | enter / leave the system monitor: per-core busy %, heap, PSRAM, display cost, per-task CPU%/stack/TIME+ busiest first, refreshed every `seconds` (1–60, default 2). Inside: `+` / `-` change the interval |
 | `tasks`, `usb`, `free`, `sys`, `ac`, `sdr`, `net` | `top` once over a fresh 1 s window / USB stream probe / heap / board / aircraft table / tuner / network as text — the way to read numbers that have to be copied. `net` also prints the STA failure count and seconds to the next attempt |
 | `log echo <off\|sys\|brief\|all>`, `log tail` | move the console end of the event split; dump every facility in one stream |

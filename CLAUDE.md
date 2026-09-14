@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 Headless USB-Host RTL-SDR receiver on the Waveshare ESP32-P4-WIFI6-DEV-KIT: 1090 MHz ADS-B/Mode-S
-decoded on-chip, a console REPL on the serial port and over SSH (the radar TUI is the `tui` command
+decoded on-chip, a console REPL on the serial port and over SSH (the map TUI is the `tui` command
 inside it, the system monitor `top`), decoded frames fed out over Ethernet/WiFi as AVR raw (:30001), Beast (:30005) and a
 JSON aircraft snapshot (:8888). No display. Raw IQ (~4 MB/s) never leaves the chip — that is the
 point of decoding locally.
@@ -199,12 +199,48 @@ the key handler (core0) sets `s_inject_req` and the demod loop does the write. W
 there is no writer to race, so it runs inline, and `adsb_tick()` from the draw task runs the
 expiry the same way. Same rule for anything else that touches the table: defer it.
 
-**TUI column budget** (`tui.c`): 120 columns = 85-column table + `│` + space + 33-column radar.
-Every table row is exactly `TABLE_W` wide because every field is fixed width and clamped (`dist`
-9999, `msgs` 99999, `vs` ±9999); a new column changes `TABLE_W`, the header format and `ROW_FMT`
-together or the divider shifts. Height follows the terminal (`tui_set_rows()`; SSH reports it,
-serial assumes 40 unless `tui <rows>`), but the table is sized to its contents and the log takes
-the rest — a taller window is more history, not more empty rows.
+**TUI column budget** (`tui.c`): 120 columns = 85-column left block (table above, map below)
++ `│` + space + 33-column event log running the full height. Every table row is exactly
+`TABLE_W` wide because every field is fixed width and clamped (`dist` 9999, `msgs` 99999, `vs`
+±9999); a new column changes `TABLE_W`, the header format and `ROW_FMT` together or the divider
+shifts. Height follows the terminal (`tui_set_rows()`; SSH reports it, serial assumes 40 unless
+`tui <rows>`), map first: the table is sized to its contents and the map takes the rest, never
+under `MAP_MIN_ROWS` (21) -- a crowded table loses rows before the map shrinks. The map's scale
+is rows: the zoom range spans the centre row to the top row, columns follow at `MAP_ASPECT`.
+Panning is `s_pan_e/n` in km, so the antenna sits at a fractional cell (`cy_a`, `cx_a`) that
+every layer -- land, blips, airports, the `+` -- derives from; nothing else knows about the pan.
+Arrow keys reach `tui_key()` as ESC-sequence bytes and a two-state parser folds them onto
+`hjkl`; `[` is a zoom key, which is why the ESC state has to swallow it.
+
+**The map is baked, not computed** (`map.c`, `map_data.h`): `tools/mkmap.py` clips Natural
+Earth 10m land polygons (lakes as holes) and OurAirports around `CONFIG_ADSB_RX_LAT/LON` from
+`sdkconfig` and writes them as 0.1 km offsets from the antenna -- the same equirectangular
+projection as `update_range()`, so blips and coast agree. Land is an even-odd scanline fill
+per row at draw time (a few thousand edges, well under a millisecond); the rings are
+Sutherland-Hodgman clipped to the box in the generator so parity survives the clip. Moving the
+antenna means rerunning the script and committing the regenerated header (`map_matches()` at
+`tui_init()` flags a mismatch on the map title rather than drawing the wrong coast). The script
+needs the network once; the downloads are cached in `tools/.cache/` (ignored). `map.c` has no
+ESP dependency, so it builds on the host for a look at the raster before flashing.
+
+TODO (map portability, decided 2026-09-14, not started): the header is baked for one antenna,
+and `CONFIG_ADSB_RX_LAT/LON` is compile-time anyway, so another location means a rebuild plus
+a rerun of the script. Steps, cheapest first: (1) a CMake rule that reruns `mkmap.py` when the
+`sdkconfig` position differs from the header's `MAP_LAT/LON`, keeping the stale header with a
+warning when offline; (2) only once the position becomes a runtime setting (console + NVS):
+ship world Natural Earth 10m land + islands (~480k points, ~2 MB int16, 3244 scheduled
+airports ~26 KB) in the unused 12 MB `storage` partition and clip to the +-450 x +-170 km box
+at boot in C, so one image serves any location. A `map.bin` upload over HTTP is the middle
+option if only the data, not the firmware, needs to travel.
+
+**Map cells carry glyph indices, not bytes.** `s_map.ch` values below 0x10 index `GLYPH[]`
+(arrows, `▪`, scale bar) and `emit_map_row()` expands them; land is a separate `land[][]`
+plane holding a 2x2 quadrant mask per cell (`map_land()` is run on a doubled grid with the
+antenna at `cy*2 + 0.5`), emitted as a background colour when the cell is all land or carries
+text (majority of quarters), and as a block glyph from `QUAD[]` in the same shade when it is
+empty and only partly ashore -- so the coast has quarter-cell resolution but text still sits on a
+plain background. `occ[][]` is what labels and airports yield to (blips, labels, the antenna
+cell, the scale bar); `stack[][]` is blips only, for the headcount fold.
 
 ## Console REPL and SSH — invariants only
 
@@ -217,7 +253,7 @@ Full design in `docs/console.md`. What breaks if dropped:
   TUI/TOP`, one per transport) are independent axes. SSH **preempts** the serial shell. Handover
   order is fixed: **claim → swap stdout → print banner**, and on exit **restore stdout → close**.
 - Screens are a service (`screen.c`: `screen_attach/screen_detach`, one draw task); neither
-  `tui.c` nor `top.c` knows a transport. Each sink names its screen, so the radar on
+  `tui.c` nor `top.c` knows a transport. Each sink names its screen, so the map on
   serial and `top` over SSH coexist; within a screen, state and width are shared across viewers.
   `screen_attach()` clears the terminal itself before publishing the slot — never clear after.
 - `screen.c`'s paint lock interlocks the frame and the prompt; anything that writes UART0 in

@@ -85,7 +85,7 @@ needs it.
 - **Console REPL** on the serial port (and over SSH) — aircraft table, USB/tuner state, task CPU, heap, network and WiFi setup, all without a host tool
 - **Live TUI** rendered via ANSI escape codes — no host software required; opened with the `tui` command in the ESP-IDF serial monitor, over SSH, or both at once. 120 columns, height follows the terminal; aircraft only — the board's own numbers live in `top`
 - **`top`** — a Linux-`top`-shaped system monitor in the same console: per-core load, internal heap and PSRAM, the display's own console-bytes cost, and every FreeRTOS task with CPU%, stack headroom and run time, refreshing in place; runs alongside the TUI on the other transport
-- **Aircraft tracking table** showing ICAO address, callsign, category, squawk (emergency codes in red), altitude, ground speed, heading, vertical rate, distance and bearing from the antenna, signal level, message count and age; sorted by distance, altitude, messages or freshness (`s`), beside a north-up radar with a 50 / 100 / 200 km range (`<` `>`)
+- **Aircraft tracking table** showing ICAO address, callsign, category, squawk (emergency codes in red), altitude, ground speed, heading, vertical rate, distance and bearing from the antenna, signal level, message count and age; sorted by distance, altitude, messages or freshness (`s`), above a north-up map — land, lakes and airports around the antenna, baked in from Natural Earth and OurAirports by `tools/mkmap.py`, blips as heading arrows — with 20 / 50 / 100 / 150 km zoom (`<` `>`) that grows with the terminal height and arrow-key panning (`c` recentres)
 - **Event log** showing new contacts, lost contacts, identification, altitude, and velocity events
   — split by facility, so a console prompt gets the board's events (USB, WiFi, Ethernet, OTA) while
   the aircraft traffic stays in the display; `log echo <off|sys|brief|all>` moves the line
@@ -136,6 +136,7 @@ Press `ctrl+]` to exit the monitor itself.
 - Position (lat/lon) is not decoded as I struggled finding how to get this to work from the source.
 - Only one dongle is supported at a time.
 - Tested only with RTL-SDR V4. Other dongles with supported tuners (E4000, FC0012, FC0013, FC2580, R820T) should work but are untested on P4.
+- The map is baked for the antenna position in `sdkconfig`; after changing `ADSB_RX_LAT/LON` run `python tools/mkmap.py` (needs the network once) and rebuild, or the display shows blips over an empty sea. Automating this, and a world map that needs no rebuild, are on the TODO list in `CLAUDE.md`.
 
 ---
 
