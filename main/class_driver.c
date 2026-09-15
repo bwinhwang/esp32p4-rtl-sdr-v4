@@ -25,6 +25,7 @@
 #include "rtl-sdr.h"
 #include "mode-s.h"
 #include "esp_task_wdt.h"
+#include "nvs_flash.h"
 #include "feed_avr.h"
 #include "feed_beast.h"
 #include "feed_json.h"
@@ -119,6 +120,7 @@ static int         s_msg_count   = 0;
 static int         s_msg_bucket  = 0;
 static volatile bool s_rx_running  = false;  /* adsb_rx_task is up          */
 static volatile bool s_inject_req  = false;  /* the 't' hotkey, see below   */
+static volatile bool s_pos_req     = false;  /* antenna moved, see pos_apply */
 
 /* Closed once a second by tracker_tick(); read by adsb_stats_get(). */
 static int           s_msg_rate;
@@ -565,27 +567,119 @@ int adsb_log_recent(const log_entry_t **out, int n)
     return found;
 }
 
-/* Kconfig has no float type, so the antenna position arrives as strings. */
-static void antenna_pos(float *lat, float *lon)
+/* ── antenna position ────────────────────────────────────────────────────────
+ * Two copies: s_pos_cfg is what NVS holds, written by the setters (core0) and
+ * read back by adsb_pos_get(); s_pos is adsb_rx_task's working copy, which
+ * only pos_apply() writes, on that task, so update_range() never sees a torn
+ * pair. NVS has no float: stored as i32 microdegrees, exact to ~0.1 m. */
+typedef struct { float lat, lon; bool valid; } rx_pos_t;
+static rx_pos_t s_pos_cfg;
+static rx_pos_t s_pos;
+
+#define POS_NS   "rxcfg"
+#define POS_LAT  "lat"
+#define POS_LON  "lon"
+
+void adsb_pos_init(void)
 {
-    static float clat, clon;
-    static bool  parsed;
-    if (!parsed) {
-        clat = strtof(CONFIG_ADSB_RX_LAT, NULL);
-        clon = strtof(CONFIG_ADSB_RX_LON, NULL);
-        parsed = true;
+    nvs_handle_t h;
+    int32_t ulat, ulon;
+    s_pos_cfg.valid = false;
+    if (nvs_open(POS_NS, NVS_READONLY, &h) != ESP_OK) return;
+    if (nvs_get_i32(h, POS_LAT, &ulat) == ESP_OK && nvs_get_i32(h, POS_LON, &ulon) == ESP_OK) {
+        s_pos_cfg.lat   = ulat / 1e6f;
+        s_pos_cfg.lon   = ulon / 1e6f;
+        s_pos_cfg.valid = true;
     }
-    *lat = clat;
-    *lon = clon;
+    nvs_close(h);
+    s_pos = s_pos_cfg;      /* before adsb_rx_task exists: no race */
+}
+
+bool adsb_pos_get(float *lat, float *lon)
+{
+    rx_pos_t p = s_pos_cfg;
+    if (lat) *lat = p.lat;
+    if (lon) *lon = p.lon;
+    return p.valid;
+}
+
+static void update_range(aircraft_t *a);
+
+/* On adsb_rx_task (or inline with no dongle): every dist/brg in the table was
+ * derived from the old position, so redo them all and start MAX over. */
+static void pos_apply(void)
+{
+    s_pos = s_pos_cfg;
+    s_max_range_km = 0;
+    for (int i = 0; i < MAX_TRACKED; i++)
+        if (s_aircraft[i].active) update_range(&s_aircraft[i]);
+}
+
+static void pos_request_apply(void)
+{
+    /* Release/acquire pair with the load in adsb_rx_task: unlike s_inject_req
+     * the flag carries a payload (s_pos_cfg), which must be visible on the
+     * other core before the flag is. */
+    if (s_rx_running) __atomic_store_n(&s_pos_req, true, __ATOMIC_RELEASE);
+    else              pos_apply();
+}
+
+static bool pos_in_range(float lat, float lon)
+{
+    /* Written as the negation so NaN fails too. */
+    return !(fabsf(lat) > 90.0f || fabsf(lon) > 180.0f || lat != lat || lon != lon);
+}
+
+/* Whole-string decimal degrees, for the console and the config page. */
+bool adsb_pos_parse(const char *lat_s, const char *lon_s, float *lat, float *lon)
+{
+    char *e1, *e2;
+    float la = strtof(lat_s, &e1), lo = strtof(lon_s, &e2);
+    if (e1 == lat_s || *e1 || e2 == lon_s || *e2 || !pos_in_range(la, lo)) return false;
+    *lat = la;
+    *lon = lo;
+    return true;
+}
+
+esp_err_t adsb_pos_set(float lat, float lon)
+{
+    if (!pos_in_range(lat, lon)) return ESP_ERR_INVALID_ARG;
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(POS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    err = nvs_set_i32(h, POS_LAT, (int32_t)lroundf(lat * 1e6f));
+    if (err == ESP_OK) err = nvs_set_i32(h, POS_LON, (int32_t)lroundf(lon * 1e6f));
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    if (err != ESP_OK) return err;
+    s_pos_cfg = (rx_pos_t){ lat, lon, true };
+    pos_request_apply();
+    sys_log(1, "POS      antenna at %+.6f %+.6f", lat, lon);
+    return ESP_OK;
+}
+
+esp_err_t adsb_pos_clear(void)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(POS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    err = nvs_erase_all(h);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    if (err != ESP_OK) return err;
+    s_pos_cfg = (rx_pos_t){ 0, 0, false };
+    pos_request_apply();
+    sys_log(1, "POS      antenna position cleared");
+    return ESP_OK;
 }
 
 /* Equirectangular is plenty at ADS-B ranges: under 0.5% error at 400 km. */
 static void update_range(aircraft_t *a)
 {
-    float clat, clon;
-    antenna_pos(&clat, &clon);
-    float dy = (a->lat - clat) * 111.32f;
-    float dx = (a->lon - clon) * 111.32f * cosf(clat * (float)M_PI / 180.0f);
+    a->rng_valid = a->pos_valid && s_pos.valid;
+    if (!a->rng_valid) return;
+    float dy = (a->lat - s_pos.lat) * 111.32f;
+    float dx = (a->lon - s_pos.lon) * 111.32f * cosf(s_pos.lat * (float)M_PI / 180.0f);
     a->dist_km = sqrtf(dx * dx + dy * dy);
     float brg  = atan2f(dx, dy) * 180.0f / (float)M_PI;
     a->brg_deg = brg < 0 ? brg + 360.0f : brg;
@@ -785,11 +879,13 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
             update_range(a);
             /* A CPR pair straddling a zone boundary decodes to somewhere
              * absurd; no real 1090 MHz reception reaches this far. */
-            if (a->dist_km > s_max_range_km && a->dist_km < 600.0f)
+            if (a->rng_valid && a->dist_km > s_max_range_km && a->dist_km < 600.0f)
                 s_max_range_km = a->dist_km;
             if (!was_valid) {
-                air_log(3, "FIX      %06lX  %+.4f  %+.4f  %.0f km",
-                        (unsigned long)icao, a->lat, a->lon, a->dist_km);
+                char km[12] = "";
+                if (a->rng_valid) snprintf(km, sizeof(km), "  %.0f km", a->dist_km);
+                air_log(3, "FIX      %06lX  %+.4f  %+.4f%s",
+                        (unsigned long)icao, a->lat, a->lon, km);
                 audio_play(AUDIO_EVT_POSITION);
             }
         }
@@ -837,17 +933,18 @@ static void inject_fake_aircraft(void)
     }
     a->category = plane_classify(a->icao, a->callsign);
 
-    /* Placed around the configured antenna, not a fixed lat/lon, so the blips
-     * land on the radar whatever CONFIG_ADSB_RX_* is set to; 20..190 km spans
-     * the three range settings. Not counted towards max range. */
-    float clat, clon;
-    antenna_pos(&clat, &clon);
-    float ang  = (float)(n * 90 + rev * 17) * (float)M_PI / 180.0f;
-    float km   = 20.0f + (float)((rev * 37) % 170);
-    a->lat = clat + km * cosf(ang) / 111.32f;
-    a->lon = clon + km * sinf(ang) / (111.32f * cosf(clat * (float)M_PI / 180.0f));
-    a->pos_valid = true;
-    update_range(a);
+    /* Placed around the antenna, not a fixed lat/lon, so the blips land on
+     * the map wherever the receiver is; 20..190 km spans the three range
+     * settings. Not counted towards max range. With no antenna position there
+     * is nothing to be relative to, so the contact stays a no-fix row. */
+    if (s_pos.valid) {
+        float ang  = (float)(n * 90 + rev * 17) * (float)M_PI / 180.0f;
+        float km   = 20.0f + (float)((rev * 37) % 170);
+        a->lat = s_pos.lat + km * cosf(ang) / 111.32f;
+        a->lon = s_pos.lon + km * sinf(ang) / (111.32f * cosf(s_pos.lat * (float)M_PI / 180.0f));
+        a->pos_valid = true;
+        update_range(a);
+    }
 
     a->altitude  = 3000 + ((seq * 2500) % 36000);
     a->velocity  = 180  + ((seq *   37) % 320);
@@ -942,6 +1039,7 @@ void adsb_rx_task(void *arg)
          * on_msg() runs in, which is the only thing that makes the synthetic
          * contacts race-free (there is no lock on that table). */
         if (s_inject_req) { s_inject_req = false; inject_fake_aircraft(); }
+        if (__atomic_load_n(&s_pos_req, __ATOMIC_ACQUIRE)) { s_pos_req = false; pos_apply(); }
 
         if (!stream_started) {
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -1043,6 +1141,8 @@ static int cmd_ac(int argc, char **argv)
         if (a->pos_valid) {
             snprintf(lat,  sizeof(lat),  "%.4f", a->lat);
             snprintf(lon,  sizeof(lon),  "%.4f", a->lon);
+        }
+        if (a->rng_valid) {
             snprintf(dist, sizeof(dist), "%.0f", a->dist_km);
             snprintf(brg,  sizeof(brg),  "%03.0f", a->brg_deg);
         }

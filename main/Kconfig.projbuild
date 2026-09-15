@@ -11,26 +11,11 @@ menu "Example Configuration"
 
 endmenu
 
-menu "ADS-B Receiver"
-
-    # Kconfig has no float type, so these are strings parsed with strtof().
-    config ADSB_RX_LAT
-        string "Receiver latitude (decimal degrees, north positive)"
-        default "29.879221"
-        help
-            Latitude of the antenna. The radar panel plots bearing and range
-            relative to this point. There is no GPS on the board and nothing
-            in the ADS-B stream says where the receiver is, so it has to be
-            configured here -- a wrong value still renders a perfectly
-            plausible-looking display.
-
-    config ADSB_RX_LON
-        string "Receiver longitude (decimal degrees, east positive)"
-        default "121.649690"
-        help
-            Longitude of the antenna. See ADSB_RX_LAT.
-
-endmenu
+# The antenna position is deliberately NOT a Kconfig option: it lives in NVS
+# (namespace "rxcfg", set with `pos <lat> <lon>` or the config page) so one
+# image serves any location. There is no GPS on the board and nothing in the
+# ADS-B stream says where the receiver is, and a baked-in default would render
+# a perfectly plausible-looking display against someone else's home.
 
 menu "WiFi (ESP32-C6 co-processor)"
 

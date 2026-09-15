@@ -194,10 +194,26 @@ CRC clean, ADS-B v2, consecutive squawks 3631/3632, coherent moving fixes NE ove
 does `tracker_tick()` — expiry (60 s), the message rate, the DEC/FIX window — from the demod loop
 once a second. Everything else reads through `adsb.h` (`tui.c`, `feed_json.c`, `ac`) and takes a
 torn field as one wrong number. The **`t` key** (`adsb_inject_test()`) pushes one synthetic
-contact per press, cycling the four categories, positioned relative to `CONFIG_ADSB_RX_LAT/LON`:
-the key handler (core0) sets `s_inject_req` and the demod loop does the write. With no dongle
-there is no writer to race, so it runs inline, and `adsb_tick()` from the draw task runs the
-expiry the same way. Same rule for anything else that touches the table: defer it.
+contact per press, cycling the four categories, positioned relative to the antenna (a no-fix row
+while no position is set): the key handler (core0) sets `s_inject_req` and the demod loop does
+the write. With no dongle there is no writer to race, so it runs inline, and `adsb_tick()` from
+the draw task runs the expiry the same way. Same rule for anything else that touches the table:
+defer it -- `adsb_pos_set()` is the second user (`s_pos_req` → `pos_apply()` re-ranges every row).
+
+**The antenna position is NVS-only** (namespace `rxcfg`, `lat`/`lon` as i32 microdegrees;
+`pos` on the console, `POST /pos` on the config page). There is deliberately **no Kconfig
+default**: one image serves any location, and a baked-in fallback would render a plausible
+display against the author's home. Unset is a real state -- `aircraft_t.rng_valid` is
+`pos_valid && position set`, and everything that shows `dist_km`/`brg_deg` (table columns,
+blips, distance sort, MAX) keys off it, never off `pos_valid`. Two copies in `class_driver.c`:
+`s_pos_cfg` (what NVS holds, written by the setters, read by `adsb_pos_get()`) and `s_pos`
+(`adsb_rx_task`'s working copy, written only by `pos_apply()` on that task), with a
+release/acquire pair on `s_pos_req` because unlike `s_inject_req` the flag carries a payload.
+`nvs_flash_init()` + `adsb_pos_init()` are the first things after `shell_init()` in `app_main`
+-- `tui_init()`, the first decoded fix and `net_ssh_start()`'s `load_login()` all read NVS
+before `wifi_mgr` (where the init used to live) is guaranteed to have run. The feeds never
+touch it: AVR/Beast carry raw frames, JSON the aircraft's own lat/lon, and `cpr_decode()` is
+global-only (no receiver-relative branch).
 
 **TUI column budget** (`tui.c`): 120 columns = 85-column left block (table above, map below)
 + `│` + space + 33-column event log running the full height. Every table row is exactly
@@ -212,26 +228,24 @@ every layer -- land, blips, airports, the `+` -- derives from; nothing else know
 Arrow keys reach `tui_key()` as ESC-sequence bytes and a two-state parser folds them onto
 `hjkl`; `[` is a zoom key, which is why the ESC state has to swallow it.
 
-**The map is baked, not computed** (`map.c`, `map_data.h`): `tools/mkmap.py` clips Natural
-Earth 10m land polygons (lakes as holes) and OurAirports around `CONFIG_ADSB_RX_LAT/LON` from
-`sdkconfig` and writes them as 0.1 km offsets from the antenna -- the same equirectangular
-projection as `update_range()`, so blips and coast agree. Land is an even-odd scanline fill
-per row at draw time (a few thousand edges, well under a millisecond); the rings are
-Sutherland-Hodgman clipped to the box in the generator so parity survives the clip. Moving the
-antenna means rerunning the script and committing the regenerated header (`map_matches()` at
-`tui_init()` flags a mismatch on the map title rather than drawing the wrong coast). The script
-needs the network once; the downloads are cached in `tools/.cache/` (ignored). `map.c` has no
-ESP dependency, so it builds on the host for a look at the raster before flashing.
+**The map is baked, not computed** (`map.c`, `map_data.h`): `tools/mkmap.py --lat --lon`
+clips Natural Earth 10m land polygons (lakes as holes) and OurAirports around that point and
+writes them as 0.1 km offsets from the antenna -- the same equirectangular projection as
+`update_range()`, so blips and coast agree (a plain rerun with no `--lat/--lon` rebakes the
+header's own `MAP_LAT/LON`). Land is an even-odd scanline fill per row at draw time (a few
+thousand edges, well under a millisecond); the rings are Sutherland-Hodgman clipped to the box
+in the generator so parity survives the clip. The position is runtime and the header is not,
+so `tui_draw()` re-evaluates `map_matches()` every frame and the map title says "baked
+elsewhere" (or "no antenna position") rather than drawing the wrong coast. The script needs the
+network once; the downloads are cached in `tools/.cache/` (ignored). `map.c` has no ESP
+dependency, so it builds on the host for a look at the raster before flashing.
 
-TODO (map portability, decided 2026-09-14, not started): the header is baked for one antenna,
-and `CONFIG_ADSB_RX_LAT/LON` is compile-time anyway, so another location means a rebuild plus
-a rerun of the script. Steps, cheapest first: (1) a CMake rule that reruns `mkmap.py` when the
-`sdkconfig` position differs from the header's `MAP_LAT/LON`, keeping the stale header with a
-warning when offline; (2) only once the position becomes a runtime setting (console + NVS):
-ship world Natural Earth 10m land + islands (~480k points, ~2 MB int16, 3244 scheduled
-airports ~26 KB) in the unused 12 MB `storage` partition and clip to the +-450 x +-170 km box
-at boot in C, so one image serves any location. A `map.bin` upload over HTTP is the middle
-option if only the data, not the firmware, needs to travel.
+TODO (map portability, decided 2026-09-14; the position half landed 2026-09-15, the map half
+not started): one image now serves any location for everything except the coast, which is
+still baked for one antenna. Remaining step: ship world Natural Earth 10m land + islands
+(~480k points, ~2 MB int16, 3244 scheduled airports ~26 KB) in the unused 12 MB `storage`
+partition and clip to the +-450 x +-170 km box in C whenever `pos` changes. A `map.bin`
+upload over HTTP is the middle option if only the data, not the firmware, needs to travel.
 
 **Map cells carry glyph indices, not bytes.** `s_map.ch` values below 0x10 index `GLYPH[]`
 (arrows, `▪`, scale bar) and `emit_map_row()` expands them; land is a separate `land[][]`
@@ -315,7 +329,8 @@ SoftAP. Only decoded messages go out (hundreds of B/s).
   Android's MAC randomisation, not a bug.
 - SoftAP gateway is **192.168.8.1** (`wifi_bringup()` overrides esp_netif's 192.168.4.0/24).
 - Credentials (upstream WiFi, SSH user/pass/host key) live in NVS namespace `netcfg`, never in
-  Kconfig — `sdkconfig` is tracked and the remote is public.
+  Kconfig — `sdkconfig` is tracked and the remote is public. The antenna position is NVS too
+  (`rxcfg`, see above), for portability rather than secrecy.
 - **Feeds** bind `INADDR_ANY`, so every interface serves them with no per-interface code. AVR raw
   :30001 and Beast :30005 share the ring-buffer/non-blocking-broadcast design; Beast's 12 MHz
   timestamp is receiver-local monotonic (`mode_s_msg.timestamp_12mhz`), **not** PPS-disciplined —

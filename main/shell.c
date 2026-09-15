@@ -53,6 +53,7 @@
 #include "feed_avr.h"
 #include "feed_beast.h"
 #include "feed_json.h"
+#include "adsb.h"
 
 #if CONFIG_SPIRAM
 #include "esp_psram.h"
@@ -386,6 +387,32 @@ static int cmd_wifi(int argc, char **argv)
            "       wifi sta on | off          -- STA half; credentials kept\n"
            "       wifi sta clear             -- forget them\n"
            "       wifi ap  on | off          -- SoftAP half\n");
+    return ESP_ERR_INVALID_ARG;
+}
+
+/* ── pos ──────────────────────────────────────────────────────────────────── */
+static int cmd_pos(int argc, char **argv)
+{
+    float lat, lon;
+    if (argc == 1) {
+        if (adsb_pos_get(&lat, &lon)) printf("antenna %+.6f %+.6f\n", lat, lon);
+        else printf("no antenna position set -- distance, bearing and the map need one\n");
+        return ESP_OK;
+    }
+    if (argc == 2 && strcmp(argv[1], "clear") == 0) {
+        esp_err_t e = adsb_pos_clear();
+        printf("antenna position cleared (%s)\n", esp_err_to_name(e));
+        return e;
+    }
+    if (argc == 3 && adsb_pos_parse(argv[1], argv[2], &lat, &lon)) {
+        esp_err_t e = adsb_pos_set(lat, lon);
+        if (e == ESP_OK) printf("antenna at %+.6f %+.6f, stored; table re-ranged\n", lat, lon);
+        else             printf("failed: %s\n", esp_err_to_name(e));
+        return e;
+    }
+    printf("usage: pos                 -- show the antenna position\n"
+           "       pos <lat> <lon>     -- decimal degrees, N and E positive; stored in NVS\n"
+           "       pos clear           -- forget it\n");
     return ESP_ERR_INVALID_ARG;
 }
 
@@ -903,6 +930,7 @@ void shell_init(void)
     reg("tasks",   "the `top` table once: per-task CPU% over 1 s, stack, run time", cmd_tasks);
     reg("net",     "interface addresses and per-feed client counts",               cmd_net);
     reg("wifi",    "WiFi status, upstream credentials, or switch either half off",  cmd_wifi);
+    reg("pos",     "antenna position: show, 'pos <lat> <lon>' to set, 'pos clear'", cmd_pos);
     reg("log",     "recent receiver events, echo control, esp_log levels",         cmd_log);
     reg("sys",     "firmware build, IDF version, uptime, reset reason",            cmd_sys);
     reg("ota",     "OTA slot/version status, or 'ota rollback' to revert",         cmd_ota);

@@ -126,6 +126,13 @@ network. `help` lists the commands; `tui` opens the live display once the
 dongle enumerates and the tuner locks, `top [seconds]` the system monitor, and
 `q` in either returns to the prompt. Both work the same way in an SSH session —
 the display needs a 120-column window, `top` an 80-column one.
+
+The first thing to type on a new board is where it is: `pos <lat> <lon>`
+(decimal degrees, N and E positive; also a form on the config page at
+`http://<board-ip>/`). The position lives in NVS, not in the firmware, so one
+image serves any location; until it is set the table shows no distance or
+bearing and the map has no blips. The feeds do not need it — the aircraft
+positions on :30001/:30005/:8888 come from the air.
 Press `ctrl+]` to exit the monitor itself.
 
 ---
@@ -136,7 +143,7 @@ Press `ctrl+]` to exit the monitor itself.
 - Position (lat/lon) is not decoded as I struggled finding how to get this to work from the source.
 - Only one dongle is supported at a time.
 - Tested only with RTL-SDR V4. Other dongles with supported tuners (E4000, FC0012, FC0013, FC2580, R820T) should work but are untested on P4.
-- The map is baked for the antenna position in `sdkconfig`; after changing `ADSB_RX_LAT/LON` run `python tools/mkmap.py` (needs the network once) and rebuild, or the display shows blips over an empty sea. Automating this, and a world map that needs no rebuild, are on the TODO list in `CLAUDE.md`.
+- The map's land and airports are baked into the firmware for one antenna position (`main/map_data.h`). Blips, distance and bearing follow whatever `pos` is set to, but the coast does not: after moving the antenna run `python tools/mkmap.py --lat <lat> --lon <lon>` (needs the network once) and rebuild, or the display shows blips over an empty sea and says so on the map title. A world map that needs no rebuild is on the TODO list in `CLAUDE.md`.
 
 ---
 

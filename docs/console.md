@@ -33,8 +33,8 @@ what makes the socket transport a matter of where bytes come from and where `pri
 linenoise (it wants to own stdin and block in it): editing is backspace, Ctrl-C, Ctrl-U; no
 history, no completion.
 
-**Commands split by what they can reach**: generic ones (`free`, `tasks`, `net`, `wifi`, `log`,
-`sys`, `tui`, `top`, `ota`, `ssh`, `restart`, `exit`) in `shell.c`; `ac`, `usb`, `sdr` registered
+**Commands split by what they can reach**: generic ones (`free`, `tasks`, `net`, `wifi`, `pos`,
+`log`, `sys`, `tui`, `top`, `ota`, `ssh`, `restart`, `exit`) in `shell.c`; `ac`, `usb`, `sdr` registered
 from `class_driver.c` because they read its statics (`s_aircraft`, `rtldev`). `tasks` is
 `top_batch()`: the sampler in `top.c` is shared by `top` and this command, and
 `tasks` forces a fresh 1 s window (sample, sleep, sample) because the sampler only runs while
@@ -109,7 +109,7 @@ repair, MAX = farthest position decoded since boot, volume), then an 85-column b
 table above and the map below it, a 33-column event log running the full height beside them,
 then the key legend. The table has ICAO, callsign, category,
 squawk (7500/7600/7700 turn the row red and are logged), altitude, speed, heading, vertical rate,
-distance and bearing from `CONFIG_ADSB_RX_LAT/LON`, the last frame's signal level, message count
+distance and bearing from the antenna position (`pos`; `--` until one is set), the last frame's signal level, message count
 and seconds since the last frame; a row dims past 15 s and is dropped at 60. Sorted by distance
 (no position last, then freshest), `s` cycles distance / altitude / messages / freshness. The
 map is north-up around the antenna: land is a dark green background and sea is black (no
@@ -126,8 +126,9 @@ colour with the first three callsign letters beside it -- to the right, else to 
 none; two blips on one cell become a headcount digit (no label) and the map title says how many
 were folded and how many contacts have no fix yet. An airport that would sit under a blip or a
 label gives way whole. The geography is baked into `main/map_data.h` by `tools/mkmap.py`
-(Natural Earth land with lakes cut out + OurAirports, clipped around the antenna in
-`sdkconfig`); move the antenna and the title asks for a rerun until you do. Height follows the
+(Natural Earth land with lakes cut out + OurAirports, clipped around the `--lat/--lon` it was
+run with); the position itself is runtime (`pos`, NVS), so the title asks for a rerun whenever
+the two disagree, and for a position at all while none is set. Height follows the
 terminal, map first: the table is sized to its contents in steps of five so the map does not hop
 on every contact, and the map takes everything else but never under 21 rows, so a crowded table
 loses rows ("(n shown)" on the title) before the map shrinks; past 39 rows the table gets the
@@ -141,7 +142,8 @@ has no lock; the key is read on core0, so `tui_key()` calls `adsb_inject_test()`
 inline. Expiry follows the same rule: it used to live in the draw loop, so with nobody watching
 the table never emptied; now `tracker_tick()` runs from the demod loop once a second and
 `adsb_tick()` from the draw task covers the no-dongle case only. Same for anything else in a key
-handler that touches the aircraft table.
+handler that touches the aircraft table -- `pos` is the other case: `adsb_pos_set()` persists to
+NVS on the caller's task, then `s_pos_req` hands the re-ranging of every row to the demod loop.
 
 ## SSH preempts the serial shell
 
@@ -264,6 +266,7 @@ Not in `README.md` (which stops at the console itself), so kept here.
 | `top [seconds]` / `q` | enter / leave the system monitor: per-core busy %, heap, PSRAM, display cost, per-task CPU%/stack/TIME+ busiest first, refreshed every `seconds` (1–60, default 2). Inside: `+` / `-` change the interval |
 | `tasks`, `usb`, `free`, `sys`, `ac`, `sdr`, `net` | `top` once over a fresh 1 s window / USB stream probe / heap / board / aircraft table / tuner / network as text — the way to read numbers that have to be copied. `net` also prints the STA failure count and seconds to the next attempt |
 | `log echo <off\|sys\|brief\|all>`, `log tail` | move the console end of the event split; dump every facility in one stream |
+| `pos`, `pos <lat> <lon>`, `pos clear` | antenna position: show; set (decimal degrees, N and E positive, stored in NVS `rxcfg`, the whole table is re-ranged from `adsb_rx_task`); forget it. Distance, bearing, the map's blips and MAX all wait for it |
 | `wifi sta <ssid> <pass>` | write upstream credentials to NVS (echoed in clear — fine on a cable, remember it before exposing the shell) |
 | `wifi sta on\|off`, `wifi sta clear` | stop / resume the join loop keeping credentials; forget them |
 | `wifi ap on\|off [force]` | SoftAP switch; `off` is refused unless Ethernet has a lease or the STA is joined, `force` overrides |

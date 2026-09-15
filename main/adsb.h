@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include "esp_err.h"
 #include "plane_cat.h"
 
 /* ═════════════════════════════════════════════════════════════════════════════
@@ -37,8 +38,9 @@ typedef struct {
     float       lat;
     float       lon;
     bool        pos_valid;
-    float       dist_km;        /* from CONFIG_ADSB_RX_LAT/LON; valid with pos_valid */
+    float       dist_km;        /* from the antenna position; valid with rng_valid */
     float       brg_deg;        /* 0..360, true north */
+    bool        rng_valid;      /* pos_valid AND an antenna position is set */
     int         ew_velocity;
     int         ns_velocity;
     int         vert_rate;      /* ft/min */
@@ -72,6 +74,20 @@ void adsb_tick(void);
 
 /* The 't' key: one synthetic contact, cycling the four categories. */
 void adsb_inject_test(void);
+
+/* ── antenna position ──────────────────────────────────────────────────────
+ * NVS only (namespace "rxcfg"), no compile-time default: one image serves
+ * any location, and until a position is set every contact has rng_valid
+ * false rather than a plausible range against someone else's home.
+ * adsb_pos_init() loads it -- call after nvs_flash_init(), before the
+ * display or the demodulator can run. The setters persist first, then hand
+ * the change to adsb_rx_task, which re-ranges the whole table (same rule as
+ * adsb_inject_test(): that task is the table's only writer). */
+void      adsb_pos_init(void);
+bool      adsb_pos_get(float *lat, float *lon);     /* false when unset */
+bool      adsb_pos_parse(const char *lat_s, const char *lon_s, float *lat, float *lon);
+esp_err_t adsb_pos_set(float lat, float lon);       /* validates, persists */
+esp_err_t adsb_pos_clear(void);
 
 /* ── event ring ────────────────────────────────────────────────────────────
  * The entry points (sys_log/air_log/ui_log) are in shell.h, since every

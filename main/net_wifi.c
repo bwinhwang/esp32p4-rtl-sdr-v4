@@ -347,23 +347,13 @@ static void on_sta_got_ip(void *arg, esp_event_base_t base, int32_t id, void *da
 
 static esp_err_t wifi_bringup(void)
 {
-    /* WiFi keeps calibration data and the country/protocol settings in NVS.
-     * Nothing else in this project uses it yet, so it is initialised here
-     * rather than in app_main. */
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        nvs_flash_erase();
-        err = nvs_flash_init();
-    }
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "nvs_flash_init: %s", esp_err_to_name(err));
-        return err;
-    }
+    /* NVS (the WiFi driver's calibration store, and our credentials) is
+     * initialised in app_main, before the display and the SSH login read it. */
 
     /* net_eth_start() normally did both of these already, but it returns early
      * on its own failures, so neither can be assumed. Both are idempotent
      * except for the second call's return code. */
-    err = esp_netif_init();
+    esp_err_t err = esp_netif_init();
     if (err != ESP_OK) return err;
     err = esp_event_loop_create_default();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return err;

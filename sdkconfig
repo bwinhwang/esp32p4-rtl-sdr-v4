@@ -1303,15 +1303,6 @@ CONFIG_APP_QUIT_PIN=0
 # end of Example Configuration
 
 #
-# ADS-B Receiver
-#
-# default:
-CONFIG_ADSB_RX_LAT="29.879221"
-# default:
-CONFIG_ADSB_RX_LON="121.649690"
-# end of ADS-B Receiver
-
-#
 # WiFi (ESP32-C6 co-processor)
 #
 # default:
@@ -3097,7 +3088,6 @@ CONFIG_LWIP_LOOPBACK_MAX_PBUFS=8
 #
 # TCP
 #
-# default:
 CONFIG_LWIP_MAX_ACTIVE_TCP=24
 # default:
 CONFIG_LWIP_MAX_LISTENING_TCP=16

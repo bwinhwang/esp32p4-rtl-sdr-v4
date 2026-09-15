@@ -2,9 +2,12 @@
 """Bake the map under the display into main/map_data.h.
 
 Land (Natural Earth 10m land + minor islands, lakes cut out) and airports
-(OurAirports), both public domain, clipped to a box around the antenna in
-sdkconfig and stored as 0.1 km offsets from it, so rerun this after moving the
-antenna. Downloads go through http(s)_proxy like curl.
+(OurAirports), both public domain, clipped to a box around the antenna given
+as --lat/--lon and stored as 0.1 km offsets from it, so rerun this after
+moving the antenna (the position itself is a runtime setting in NVS, `pos`
+on the console; this header only has to agree with it). With no --lat/--lon
+the current header's MAP_LAT/MAP_LON are reused, i.e. a plain rerun rebakes
+the same place from fresh data. Downloads go through http(s)_proxy like curl.
 """
 
 import argparse
@@ -86,16 +89,27 @@ def thin(pts, min_km):
 def main():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--sdkconfig", default=os.path.join(root, "sdkconfig"))
+    ap.add_argument("--lat", type=float, help="antenna latitude, decimal degrees, N positive")
+    ap.add_argument("--lon", type=float, help="antenna longitude, decimal degrees, E positive")
     ap.add_argument("--out", default=os.path.join(root, "main", "map_data.h"))
     ap.add_argument("--cache", default=os.path.join(root, "tools", ".cache"))
     ap.add_argument("--half-ew", type=float, default=450, help="km east/west kept (default 450)")
     ap.add_argument("--half-ns", type=float, default=300, help="km north/south kept (default 300)")
     args = ap.parse_args()
 
-    cfg = open(args.sdkconfig).read()
-    lat0 = float(re.search(r'^CONFIG_ADSB_RX_LAT="([^"]+)"', cfg, re.M).group(1))
-    lon0 = float(re.search(r'^CONFIG_ADSB_RX_LON="([^"]+)"', cfg, re.M).group(1))
+    if (args.lat is None) != (args.lon is None):
+        sys.exit("give both --lat and --lon, or neither")
+    if args.lat is None:
+        try:
+            hdr = open(args.out).read()
+            lat0 = float(re.search(r"^#define MAP_LAT\s+([-0-9.]+)f", hdr, re.M).group(1))
+            lon0 = float(re.search(r"^#define MAP_LON\s+([-0-9.]+)f", hdr, re.M).group(1))
+        except (OSError, AttributeError):
+            sys.exit(f"no --lat/--lon and no bake to reuse in {args.out}")
+    else:
+        lat0, lon0 = args.lat, args.lon
+    if not (-90 <= lat0 <= 90 and -180 <= lon0 <= 180):
+        sys.exit("lat must be -90..90 and lon -180..180")
     kx = 111.32 * math.cos(math.radians(lat0))       # same projection as update_range()
     ky = 111.32
 

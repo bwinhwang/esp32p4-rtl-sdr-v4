@@ -23,6 +23,7 @@
 #include "shell.h"       /* sys_log() */
 #include "net_eth.h"
 #include "net_wifi.h"
+#include "adsb.h"
 #include "ota.h"
 #include "web_config.h"
 
@@ -105,8 +106,8 @@ static const char PAGE_HEAD[] =
 static esp_err_t root_get(httpd_req_t *req)
 {
     /* row has to hold the widest template plus a fully escaped SSID: 32 chars
-     * of "&quot;" expand to 192. */
-    char eth_ip[16], sta_ip[16], ssid[33], esc[224], row[640];
+     * of "&quot;" expand to 192 -- the status table reaches ~670 that way. */
+    char eth_ip[16], sta_ip[16], ssid[33], esc[224], row[768];
 
     net_eth_ip_str(eth_ip, sizeof(eth_ip));
     net_wifi_sta_ip_str(sta_ip, sizeof(sta_ip));
@@ -127,12 +128,21 @@ static esp_err_t root_get(httpd_req_t *req)
     const esp_app_desc_t *app  = esp_app_get_description();
     const esp_partition_t *run = esp_ota_get_running_partition();
 
+    float lat = 0, lon = 0;
+    bool  pos_ok = adsb_pos_get(&lat, &lon);
+    char  lat_s[16] = "", lon_s[16] = "";
+    if (pos_ok) {
+        snprintf(lat_s, sizeof(lat_s), "%.6f", lat);
+        snprintf(lon_s, sizeof(lon_s), "%.6f", lon);
+    }
+
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_send_chunk(req, PAGE_HEAD, HTTPD_RESP_USE_STRLEN);
 
     snprintf(row, sizeof(row),
         "<table>"
         "<tr><td>Firmware</td><td>%s (%s)</td></tr>"
+        "<tr><td>Antenna</td><td>%s%s%s</td></tr>"
         "<tr><td>Ethernet</td><td>%s</td></tr>"
         "<tr><td>WiFi</td><td>%s</td></tr>"
         "<tr><td>SoftAP</td><td>%s, %d client(s)</td></tr>"
@@ -141,9 +151,22 @@ static esp_err_t root_get(httpd_req_t *req)
         "<tr><td>Upstream IP</td><td>%s</td></tr>"
         "</table>",
         app->version, run->label,
+        pos_ok ? lat_s : "<i>not set &mdash; no distance, bearing or map until it is</i>",
+        pos_ok ? ", " : "", lon_s,
         eth_ip, wtxt, ap_on ? "on" : "off", net_wifi_ap_clients(),
         sta_on ? "on" : "off",
         esc[0] ? esc : "<i>not configured</i>", sta_ip);
+    httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
+
+    /* The position first: a fresh board has nothing else that needs typing
+     * before the display makes sense. Decimal degrees, N and E positive. */
+    snprintf(row, sizeof(row),
+        "<form method=post action=/pos>"
+        "<label>Antenna latitude</label>"
+        "<input name=lat value=\"%s\" inputmode=decimal placeholder=\"51.477900\">"
+        "<label>Antenna longitude</label>"
+        "<input name=lon value=\"%s\" inputmode=decimal placeholder=\"-0.001500\">"
+        "<button type=submit>Save position</button></form>", lat_s, lon_s);
     httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN);
 
     snprintf(row, sizeof(row),
@@ -226,6 +249,48 @@ static esp_err_t wifi_post(httpd_req_t *req)
     sys_log(1, "WEB      upstream SSID set to \"%s\"", ssid[0] ? ssid : "(none)");
 
     /* 303 so a reload of the result page is a GET, not a re-POST. */
+    httpd_resp_set_status(req, "303 See Other");
+    httpd_resp_set_hdr(req, "Location", "/");
+    return httpd_resp_send(req, NULL, 0);
+}
+
+/* ── POST /pos ─────────────────────────────────────────────────────────── */
+
+static esp_err_t pos_post(httpd_req_t *req)
+{
+    char body[96];
+    int  len = req->content_len < (int)sizeof(body) - 1
+             ? req->content_len : (int)sizeof(body) - 1;
+    int  got = httpd_req_recv(req, body, len);
+    if (got <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
+        return ESP_FAIL;
+    }
+    body[got] = '\0';
+
+    char lat_s[24] = {0}, lon_s[24] = {0};
+    httpd_query_key_value(body, "lat", lat_s, sizeof(lat_s));
+    httpd_query_key_value(body, "lon", lon_s, sizeof(lon_s));
+    url_decode(lat_s);
+    url_decode(lon_s);
+
+    esp_err_t err;
+    float lat, lon;
+    if (lat_s[0] == '\0' && lon_s[0] == '\0') {
+        err = adsb_pos_clear();                 /* both blank: forget it */
+    } else if (!adsb_pos_parse(lat_s, lon_s, &lat, &lon)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+            "want decimal degrees: lat -90..90, lon -180..180 (N and E positive)");
+        return ESP_FAIL;
+    } else {
+        err = adsb_pos_set(lat, lon);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "pos set failed: %s", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
+        return ESP_FAIL;
+    }
+
     httpd_resp_set_status(req, "303 See Other");
     httpd_resp_set_hdr(req, "Location", "/");
     return httpd_resp_send(req, NULL, 0);
@@ -330,7 +395,7 @@ esp_err_t web_config_start(void)
     cfg.core_id         = 0;
     cfg.task_priority   = 3;
     cfg.stack_size      = 5120;
-    cfg.max_uri_handlers = 6;   /* root, wifi, radio, aircraft.json, ota, +1 */
+    cfg.max_uri_handlers = 7;   /* root, wifi, pos, radio, aircraft.json, ota, +1 */
     /* Down from esp_http_server's default of 7, because those sockets come out
      * of the same CONFIG_LWIP_MAX_SOCKETS pool as the three feeds and SSH, and
      * the arithmetic that makes them all fit is written out in
@@ -358,6 +423,7 @@ esp_err_t web_config_start(void)
     static const httpd_uri_t uris[] = {
         { .uri = "/",              .method = HTTP_GET,  .handler = root_get     },
         { .uri = "/wifi",          .method = HTTP_POST, .handler = wifi_post    },
+        { .uri = "/pos",           .method = HTTP_POST, .handler = pos_post     },
         { .uri = "/radio",         .method = HTTP_POST, .handler = radio_post   },
         { .uri = "/aircraft.json", .method = HTTP_GET,  .handler = aircraft_get },
     };

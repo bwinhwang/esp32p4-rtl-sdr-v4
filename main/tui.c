@@ -6,7 +6,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include "sdkconfig.h"
 #include "esp_attr.h"
 #include "esp_timer.h"
 #include "adsb.h"
@@ -112,7 +111,8 @@ static EXT_RAM_BSS_ATTR map_grid_t s_map;   /* draw task only */
  * the title already covers the table row limit, this covers the map's own
  * lossy step so MAP's header can say so instead of just looking sparse. */
 static int  s_map_folded;
-static bool s_map_ok;                       /* map_data.h was baked for this antenna */
+static bool s_map_ok;                       /* map_data.h was baked for this antenna; per frame */
+static bool s_pos_ok;                       /* an antenna position is set at all */
 
 static void mput(int y, int x, char ch, uint8_t col)
 {
@@ -241,7 +241,7 @@ static void render_map(const aircraft_t *ac, const int *idx, int n, int rows)
 
     int cand[MAX_TRACKED], nc = 0;
     for (int k = 0; k < n; k++)
-        if (ac[idx[k]].pos_valid) cand[nc++] = idx[k];
+        if (ac[idx[k]].rng_valid) cand[nc++] = idx[k];
     sort_map_cand(ac, cand, nc);
 
     /* Blips first so no label is laid where a later blip lands; the blip is
@@ -322,8 +322,8 @@ static bool before(const aircraft_t *a, const aircraft_t *b)
 {
     switch (s_sort) {
         case SORT_DIST:
-            if (a->pos_valid != b->pos_valid) return a->pos_valid;
-            if (a->pos_valid && a->dist_km != b->dist_km) return a->dist_km < b->dist_km;
+            if (a->rng_valid != b->rng_valid) return a->rng_valid;
+            if (a->rng_valid && a->dist_km != b->dist_km) return a->dist_km < b->dist_km;
             break;
         case SORT_ALT:
             if (a->altitude != b->altitude) return a->altitude > b->altitude;
@@ -364,7 +364,7 @@ static void draw_row(const aircraft_t *a, int64_t now)
     }
     int vr = a->vert_rate > 9999 ? 9999 : a->vert_rate < -9999 ? -9999 : a->vert_rate;
     if (vr > 200 || vr < -200) snprintf(vs, sizeof(vs), "%+d", vr);
-    if (a->pos_valid) {
+    if (a->rng_valid) {
         snprintf(dist, sizeof(dist), "%.0f",   a->dist_km > 9999.0f ? 9999.0f : a->dist_km);
         snprintf(brg,  sizeof(brg),  "%03.0f", a->brg_deg);
     }
@@ -458,6 +458,12 @@ static void tui_draw(int64_t now)
 {
     adsb_tick();
 
+    /* Re-checked every frame: the position is a runtime setting now, and the
+     * baked map is only right for one of them. Two fabsf() -- free. */
+    float alat, alon;
+    s_pos_ok = adsb_pos_get(&alat, &alon);
+    s_map_ok = s_pos_ok && map_matches(alat, alon);
+
     adsb_stats_t st;
     adsb_stats_get(&st);
     const aircraft_t *ac = adsb_aircraft();
@@ -481,7 +487,8 @@ static void tui_draw(int64_t now)
     if (s_map_folded && n_nofix) nl = snprintf(note, sizeof(note), " (%d folded, %d no-fix)", s_map_folded, n_nofix);
     else if (s_map_folded)       nl = snprintf(note, sizeof(note), " (%d folded)", s_map_folded);
     else if (n_nofix)            nl = snprintf(note, sizeof(note), " (%d no-fix)", n_nofix);
-    if (!s_map_ok) snprintf(note + nl, sizeof(note) - nl, " (map baked elsewhere: rerun tools/mkmap.py)");
+    if (!s_pos_ok)      snprintf(note + nl, sizeof(note) - nl, " (no antenna position: `pos <lat> <lon>`)");
+    else if (!s_map_ok) snprintf(note + nl, sizeof(note) - nl, " (map baked elsewhere: rerun tools/mkmap.py)");
 
     /* The log column runs beside everything -- table, rule, map title and
      * map -- newest first from the top, so it is as tall as the terminal
@@ -587,6 +594,5 @@ void tui_init(void)
 {
     for (int i = 0; i < TUI_COLS; i++) memcpy(s_rule + i * 3, HL, 3);
     s_rule[TUI_COLS * 3] = '\0';
-    s_map_ok = map_matches(strtof(CONFIG_ADSB_RX_LAT, NULL), strtof(CONFIG_ADSB_RX_LON, NULL));
     screen_register(SCREEN_TUI, "the display", TUI_COLS, TUI_REFRESH_MS, tui_draw, tui_key);
 }

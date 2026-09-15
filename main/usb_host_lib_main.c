@@ -9,6 +9,7 @@
 #include "freertos/event_groups.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "nvs_flash.h"
 #if CONFIG_SPIRAM
 #include "esp_psram.h"
 #endif
@@ -27,6 +28,7 @@
 #include "feed_avr.h"
 #include "feed_beast.h"
 #include "feed_json.h"
+#include "adsb.h"
 
 #define HOST_LIB_TASK_PRIORITY  2
 #define CLASS_TASK_PRIORITY     3
@@ -111,6 +113,19 @@ void app_main(void)
      * anything can want it. The prompt itself waits for
      * shell_console_start() at the end of this function. */
     shell_init();
+
+    /* NVS before anything that reads it: the antenna position (needed by the
+     * first frame the display draws and the first decoded fix), the WiFi
+     * credentials, the SSH login. The WiFi driver's own calibration store
+     * lands in the same partition. A stale layout is erased rather than
+     * fatal: every setting in it can be typed back in. */
+    esp_err_t nvs = nvs_flash_init();
+    if (nvs == ESP_ERR_NVS_NO_FREE_PAGES || nvs == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        nvs = nvs_flash_init();
+    }
+    if (nvs != ESP_OK) ESP_LOGW(TAG, "nvs_flash_init: %s", esp_err_to_name(nvs));
+    adsb_pos_init();
 
     /* The display service next: one draw task that idles until `tui` or `top`
      * attaches a viewer, so both work with no dongle enumerated. Registered
