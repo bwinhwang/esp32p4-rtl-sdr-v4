@@ -108,8 +108,9 @@ DEC % = frames passing CRC over the last second, FIX % = the share that needed a
 repair, MAX = farthest position decoded since boot, volume), then an 85-column block with the
 table above and the map below it, a 33-column event log running the full height beside them,
 then the key legend. The table has ICAO, callsign, category,
-squawk (7500/7600/7700 or a TC28 emergency state turn the row red and are logged), altitude
-(`GND` while the last position report was a surface one), speed, heading, vertical rate,
+squawk (7500/7600/7700, a TC28 emergency state or an ACAS resolution advisory turn the row red
+and are logged), altitude (`GND` while the last position report was a surface one or a
+surveillance reply flagged the ground), speed, heading, vertical rate,
 distance and bearing from the antenna position (`pos`; `--` until one is set), the last frame's signal level, message count
 and seconds since the last frame; a row dims past 15 s and is dropped at 60. Sorted by distance
 (no position last, then freshest), `s` cycles distance / altitude / messages / freshness. The
@@ -167,7 +168,7 @@ entry points declared in `shell.h` over a common `log_put()`:
 | | covers | LOG panel | reaches a prompt at |
 |---|---|---|---|
 | `sys_log()` | the board — USB, IQ stream, WiFi, Ethernet, OTA, web server, console | **no** | `sys` and above |
-| `air_log()` | the sky — CONTACT / IDENT / SQUAWK / EMERG / FIX / LOST; ALT / VEL / GND in colour 0 are **measurements**, echoed at `all` but never stored | yes | `brief` (colours 1 and 4 only) and `all` |
+| `air_log()` | the sky — CONTACT / IDENT / SQUAWK / EMERG / SPI / RA / FIX / LOST; ALT / VEL / GND in colour 0 are **measurements**, echoed at `all` but never stored | yes | `brief` (colours 1 and 4 only) and `all` |
 | `ui_log()` | the display answering a key — `leave_screen()`'s refusal | yes | `all` only |
 
 The split is on both ends: the panel is aircraft-only, the prompt board-only by default. A board

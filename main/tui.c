@@ -159,7 +159,8 @@ static uint8_t cat_colour(plane_cat_t c)
 
 static bool ac_emergency(const aircraft_t *a)
 {
-    return a->emergency || a->squawk == 7500 || a->squawk == 7600 || a->squawk == 7700;
+    return a->emergency || a->ra_active ||
+           a->squawk == 7500 || a->squawk == 7600 || a->squawk == 7700;
 }
 
 static uint8_t map_priority(const aircraft_t *a)

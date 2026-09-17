@@ -75,12 +75,28 @@ struct mode_s_msg
     int emergency_valid;  // TC28 subtype 1 seen; `identity` is its squawk.
     int emergency;        // 0 none, 1 general, 2 lifeguard, 3 min fuel,
                           // 4 no comms, 5 unlawful interference, 6 downed.
+    int category;         // TC1-4 emitter category, readsb's byte form:
+                          // 0xA0..0xD7 (A0 = "no information"); 0 = not carried.
+    int airspeed_valid;   // TC19 sub 3/4: IAS or TAS in kt (GNSS velocity unavailable)
+    int airspeed;
+    int airspeed_tas;
+    int acas_ra_valid;    // msg+4 holds a plausible ACAS resolution advisory
+                          // (BDS 3,0): DF16 MV, TC28 sub 2 ME or DF20/21 MB.
+
+    // Status shared by the surveillance replies and the ES position messages.
+    // airground: 0 no information, 1 on the ground, 2 airborne. Only the
+    // two certain values are reported; FS 0/2 and CA 6 say nothing (many
+    // transponders send them regardless), so they stay 0.
+    int airground;
+    int alert_valid, alert; // squawk changed recently, or an emergency squawk
+    int spi_valid, spi;     // pilot pressed IDENT
 
     // DF4, DF5, DF20, DF21
     int fs;       // Flight status for DF4,5,20,21
     int dr;       // Request extraction of downlink request.
     int um;       // Request extraction of downlink request.
     int identity; // 13 bits identity (Squawk).
+    int squawk_valid; // identity is a squawk: DF5/21, TC28 sub 1, TC23 sub 7
 
     // Fields used by multiple message types.
     int altitude, unit;
@@ -106,4 +122,7 @@ void mode_s_compute_magnitude_vector(unsigned char *data, uint16_t *mag, uint32_
 // sample offset (2 MSPS => 6 ticks/sample at 12MHz).
 void mode_s_detect(mode_s_t *self, uint16_t *mag, uint32_t maglen, uint64_t base_ts_us, mode_s_callback_t);
 void mode_s_decode(mode_s_t *self, struct mode_s_msg *mm, unsigned char *msg);
+// Human-readable advisory for a BDS 3,0 block that passed the acas_ra_valid
+// test ("climb", "clear of conflict", ...). Returns out.
+const char *mode_s_acas_ra_text(const unsigned char *mb, char *out, size_t n);
 void runme();

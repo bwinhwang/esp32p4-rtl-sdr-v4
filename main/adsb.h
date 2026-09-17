@@ -19,7 +19,7 @@
 
 /* Table depth, not screen depth. A full table drops new contacts on the floor
  * (find_or_create() returns NULL) rather than evicting, so size it for the
- * busiest sky, not the screen. ~120 B each. */
+ * busiest sky, not the screen. ~250 B each. */
 #define MAX_TRACKED  64
 
 typedef struct {
@@ -35,9 +35,11 @@ typedef struct {
     char        callsign[9];
     int         altitude;
     bool        alt_geom;       /* altitude is geometric (TC20-22), not barometric */
-    bool        on_ground;      /* last position message was a surface one */
+    bool        on_ground;      /* surface position, or a ground flag in FS/VS/CA */
     int         velocity;
     int         heading;
+    int         airspeed;       /* TC19 sub 3/4 only (no GNSS velocity), kt; 0 = none */
+    bool        airspeed_tas;
     float       lat;
     float       lon;
     bool        pos_valid;
@@ -51,6 +53,13 @@ typedef struct {
     int         vert_rate;      /* ft/min */
     int         squawk;         /* 0 = none received yet */
     uint8_t     emergency;      /* TC28 state, 0 = none; the 7x00 squawks are the other signal */
+    uint8_t     emitter;        /* TC1-4 category as readsb's byte, 0xA0..0xD7; 0 = not yet seen */
+    bool        alert;          /* FS/SS: squawk changed or emergency; held STATUS_HOLD_US */
+    bool        spi;            /* FS/SS: IDENT pressed; same hold */
+    int64_t     status_us;      /* last message carrying alert/spi */
+    bool        ra_active;      /* ACAS RA in progress: cleared by "clear of conflict" or RA_HOLD_US */
+    int64_t     ra_us;
+    char        ra_text[48];    /* the advisory, as logged */
     uint8_t     sig;            /* signal_level of the last frame, 0-255, relative */
     int         msg_count;
     int64_t     last_seen_us;

@@ -1,4 +1,5 @@
 #include "mode-s.h"
+#include <stdio.h>
 #include <time.h>
 
 #define MODE_S_PREAMBLE_US 8 // microseconds
@@ -375,6 +376,79 @@ int decode_ac12_field(unsigned char *msg, int *unit)
 
 static const char *ais_charset = "?ABCDEFGHIJKLMNOPQRSTUVWXYZ????? ???????????????0123456789??????";
 
+// Bit n (1-based, MSB first) of a 7-byte ME/MV/MB block, numbered as the
+// ICAO register tables do.
+static inline int fbit(const unsigned char *b, int n)
+{
+    return (b[(n - 1) >> 3] >> (7 - ((n - 1) & 7))) & 1;
+}
+
+static unsigned fbits(const unsigned char *b, int from, int to)
+{
+    unsigned v = 0;
+    for (int i = from; i <= to; i++)
+        v = (v << 1) | fbit(b, i);
+    return v;
+}
+
+// BDS 3,0 (active resolution advisory) layout: 1-8 BDS code, 9-22 ARA,
+// 23-26 RAC, 27 RAT, 28 MTE, 29-30 TTI, 31-56 threat identity. In the TC28
+// broadcast the first byte is the TC/subtype instead. The register is read
+// back empty most of the time and the code byte alone is weak evidence, so
+// reject the shapes a real advisory cannot take.
+static int acas_ra_plausible(mode_s_t *self, const unsigned char *b, int df, int tc28)
+{
+    if (!tc28 && b[0] != 0x30) return 0;
+    if (!fbit(b, 9) && !fbit(b, 27) && !fbit(b, 28)) return 0;
+    if (fbits(b, 9, 28) == 0) return 0;
+    if ((fbit(b, 23) && fbit(b, 24)) || (fbit(b, 25) && fbit(b, 26))) return 0;
+    if (df == 16) return fbits(b, 29, 56) == 0;      // reserved in the air-air reply
+    if (fbit(b, 25) || fbit(b, 26)) return 0;        // turn complements: air-air only
+    switch (fbits(b, 29, 30))
+    {
+    case 0:  return fbits(b, 31, 56) == 0;
+    case 1:  return fbits(b, 55, 56) == 0 &&
+                    icao_addr_was_recently_seen(self, fbits(b, 31, 54));
+    case 2:  return tc28;   // range/bearing form: only trusted from the ES broadcast
+    default: return 0;
+    }
+}
+
+const char *mode_s_acas_ra_text(const unsigned char *b, char *out, size_t n)
+{
+    if (fbit(b, 27))
+    {
+        snprintf(out, n, "clear of conflict");
+    }
+    else if (fbit(b, 9))
+    {
+        // Single threat, or several resolved by one vertical advisory:
+        // 10 corrective, 11 downward sense, 12 increased rate, 13 sense
+        // reversal, 14 altitude crossing, 15 positive (vs. a rate limit).
+        int corr = fbit(b, 10), down = fbit(b, 11), positive = fbit(b, 15);
+        const char *sense = down ? "descend" : "climb";
+        if (corr && positive)
+            snprintf(out, n, "%s%s%s%s", fbit(b, 12) ? "increase " : "", sense,
+                     fbit(b, 13) ? " now" : "", fbit(b, 14) ? " (crossing)" : "");
+        else if (corr)
+            snprintf(out, n, "level off");
+        else if (positive)
+            snprintf(out, n, "maintain v/s%s", fbit(b, 14) ? " (crossing)" : "");
+        else
+            snprintf(out, n, "monitor v/s");
+    }
+    else
+    {
+        // Multiple threats, each bit a separate constraint: 10 correct up,
+        // 11 climb, 12 correct down, 13 descend, 14 crossing, 15 keep rate.
+        snprintf(out, n, "multi-threat%s%s%s%s%s", fbit(b, 11) ? " climb" : "",
+                 fbit(b, 13) ? " descend" : "",
+                 fbit(b, 10) ? " correct up" : "", fbit(b, 12) ? " correct down" : "",
+                 fbit(b, 14) ? " (crossing)" : "");
+    }
+    return out;
+}
+
 // Decode a raw Mode S message demodulated as a stream of bytes by
 // mode_s_detect(), and split it into fields populating a mode_s_msg structure.
 void mode_s_decode(mode_s_t *self, struct mode_s_msg *mm, unsigned char *msg)
@@ -394,6 +468,27 @@ void mode_s_decode(mode_s_t *self, struct mode_s_msg *mm, unsigned char *msg)
 
     // Get the message type ASAP as other operations depend on this
     mm->msgtype = msg[0] >> 3; // Downlink Format
+
+    // A DF field one bit away from 17 (1/16/19/21/25) may be a DF17 with the
+    // error in its first byte -- the ES is the one format with a zero
+    // expected CRC, so patching the DF and rechecking is a cheap, safe test
+    // that the single-bit fixer below never gets to run for these types.
+    mm->errorbit = -1; // No error
+    if (self->fix_errors &&
+        (mm->msgtype == 1 || mm->msgtype == 16 || mm->msgtype == 19 ||
+         mm->msgtype == 21 || mm->msgtype == 25))
+    {
+        unsigned char orig = msg[0];
+        msg[0] = (orig & 7) | (17 << 3);
+        if (mode_s_checksum(msg, MODE_S_LONG_MSG_BITS) ==
+            (((uint32_t)msg[11] << 16) | ((uint32_t)msg[12] << 8) | msg[13]))
+        {
+            mm->msgtype  = 17;
+            mm->errorbit = __builtin_ctz((orig ^ msg[0]) & 0xf8) ^ 7;
+        }
+        else
+            msg[0] = orig;
+    }
     mm->msgbits = mode_s_msg_len_by_type(mm->msgtype);
 
     // CRC is always the last three bytes.
@@ -403,7 +498,6 @@ void mode_s_decode(mode_s_t *self, struct mode_s_msg *mm, unsigned char *msg)
     crc2 = mode_s_checksum(msg, mm->msgbits);
 
     // Check CRC and fix single bit errors using the CRC when possible (DF 11 and 17).
-    mm->errorbit = -1; // No error
     mm->crcok = (mm->crc == crc2);
 
     if (!mm->crcok && self->fix_errors &&
@@ -444,6 +538,34 @@ void mode_s_decode(mode_s_t *self, struct mode_s_msg *mm, unsigned char *msg)
 
     // Squawk from message bits 20-32; meaningful for DF5/21 only.
     mm->identity = decode_id13_field(((msg[2] & 0x1f) << 8) | msg[3]);
+    mm->squawk_valid = mm->msgtype == 5 || mm->msgtype == 21;
+
+    // Air/ground and alert/SPI status. FS (DF4/5/20/21): 0 airborne,
+    // 1 ground, 2 alert airborne, 3 alert ground, 4 alert+SPI, 5 SPI --
+    // the "airborne" of 0/2/4/5 is not trusted (readsb: many transponders
+    // never report ground), only the explicit ground states are. VS
+    // (DF0/16) bit 6 set = ground. CA (DF11/17): 4 ground, 5 airborne.
+    if (mm->msgtype == 4 || mm->msgtype == 5 || mm->msgtype == 20 || mm->msgtype == 21)
+    {
+        if (mm->fs <= 5)
+        {
+            mm->alert_valid = mm->spi_valid = 1;
+            mm->alert = mm->fs >= 2 && mm->fs <= 4;
+            mm->spi   = mm->fs >= 4;
+            if (mm->fs == 1 || mm->fs == 3)
+                mm->airground = 1;
+        }
+    }
+    else if (mm->msgtype == 0 || mm->msgtype == 16)
+    {
+        if (msg[0] & 0x04)
+            mm->airground = 1;
+    }
+    else if (mm->msgtype == 11 || mm->msgtype == 17)
+    {
+        if (mm->ca == 4) mm->airground = 1;
+        else if (mm->ca == 5) mm->airground = 2;
+    }
 
     // DF 11 & 17: try to populate our ICAO addresses whitelist. DFs with an AP
     // field (xored addr and crc), try to decode it. DF18 shares 17's CRC
@@ -482,6 +604,15 @@ void mode_s_decode(mode_s_t *self, struct mode_s_msg *mm, unsigned char *msg)
         mm->altitude = decode_ac13_field(msg, &mm->unit);
     }
 
+    // ACAS RA: the DF16 MV field, or the Comm-B register read back in a
+    // DF20/21. The BDS number is not carried, so a reply with DR/UM set
+    // (almost always noise) or a corrected bit is not trusted to be 3,0.
+    if (mm->crcok && mm->msgtype == 16)
+        mm->acas_ra_valid = acas_ra_plausible(self, msg + 4, 16, 0);
+    else if (mm->crcok && (mm->msgtype == 20 || mm->msgtype == 21) &&
+             mm->dr == 0 && mm->um == 0 && mm->errorbit == -1)
+        mm->acas_ra_valid = acas_ra_plausible(self, msg + 4, mm->msgtype, 0);
+
     // Decode extended squitter specific stuff.
     if (mm->msgtype == 17)
     {
@@ -489,8 +620,9 @@ void mode_s_decode(mode_s_t *self, struct mode_s_msg *mm, unsigned char *msg)
 
         if (mm->metype >= 1 && mm->metype <= 4)
         {
-            // Aircraft Identification and Category
+            // Aircraft Identification and Category. TC4 is set A, TC1 set D.
             mm->aircraft_type = mm->metype - 1;
+            mm->category = ((0x0e - mm->metype) << 4) | mm->mesub;
             mm->flight[0] = (ais_charset)[msg[5] >> 2];
             mm->flight[1] = ais_charset[((msg[5] & 3) << 4) | (msg[6] >> 4)];
             mm->flight[2] = ais_charset[((msg[6] & 15) << 2) | (msg[7] >> 6)];
@@ -509,6 +641,18 @@ void mode_s_decode(mode_s_t *self, struct mode_s_msg *mm, unsigned char *msg)
             // geometric (HAE), TC0 altitude only with no position.
             mm->altitude = decode_ac12_field(msg, &mm->unit);
             mm->alt_geom = mm->metype >= 20;
+            mm->airground = 2;
+            // Surveillance status: 0 none, 1 permanent alert (emergency
+            // squawk), 2 temporary alert (squawk changed), 3 SPI. 1/2 win
+            // over 3 in the encoding, so SPI is unknown while they are set.
+            int ss = (msg[4] >> 1) & 3;
+            mm->alert_valid = 1;
+            mm->alert = ss == 1 || ss == 2;
+            if (ss == 0 || ss == 3)
+            {
+                mm->spi_valid = 1;
+                mm->spi = ss == 3;
+            }
             if (mm->metype != 0)
             {
                 mm->fflag = msg[6] & (1 << 2);
@@ -553,6 +697,7 @@ void mode_s_decode(mode_s_t *self, struct mode_s_msg *mm, unsigned char *msg)
                                 msg[10];
             mm->cpr_valid = 1;
             mm->cpr_surface = 1;
+            mm->airground = 1;
         }
         else if (mm->metype == 19 && mm->mesub >= 1 && mm->mesub <= 4)
         {
@@ -602,9 +747,17 @@ void mode_s_decode(mode_s_t *self, struct mode_s_msg *mm, unsigned char *msg)
             else if (mm->mesub == 3 || mm->mesub == 4)
             {
                 // Airspeed subtypes (GNSS velocity unavailable): magnetic or
-                // true heading; the IAS/TAS field is left to readsb.
+                // true heading, then IAS or TAS -- 10 bits biased by one,
+                // subtype 4 in 4 kt steps like the supersonic ground speed.
                 mm->heading_is_valid = msg[5] & (1 << 2);
                 mm->heading = (int)((((msg[5] & 3) << 8) | msg[6]) * 360.0 / 1024 + 0.5) % 360;
+                int as_raw = ((msg[7] & 0x7f) << 3) | (msg[8] >> 5);
+                if (as_raw)
+                {
+                    mm->airspeed_valid = 1;
+                    mm->airspeed_tas   = (msg[7] & 0x80) != 0;
+                    mm->airspeed       = (as_raw - 1) * (mm->mesub == 4 ? 4 : 1);
+                }
             }
             // Vertical rate sits at the same bits in all four subtypes.
             mm->vert_rate_source = (msg[8] & 0x10) >> 4;
@@ -619,6 +772,22 @@ void mode_s_decode(mode_s_t *self, struct mode_s_msg *mm, unsigned char *msg)
             mm->emergency_valid = 1;
             mm->emergency = msg[5] >> 5;
             mm->identity = decode_id13_field(((msg[5] & 0x1f) << 8) | msg[6]);
+            mm->squawk_valid = 1;
+        }
+        else if (mm->metype == 28 && mm->mesub == 2)
+        {
+            // ACAS RA broadcast: the ME carries the BDS 3,0 register.
+            mm->acas_ra_valid = acas_ra_plausible(self, msg + 4, 17, 1);
+        }
+        else if (mm->metype == 23 && mm->mesub == 7)
+        {
+            // Test message, national use: a squawk in ME bits 9-21.
+            int id13 = (msg[5] << 5) | (msg[6] >> 3);
+            if (id13)
+            {
+                mm->identity = decode_id13_field(id13);
+                mm->squawk_valid = 1;
+            }
         }
     }
     mm->phase_corrected = 0; // Set to 1 by the caller if needed.
@@ -897,7 +1066,7 @@ void mode_s_detect(mode_s_t *self, uint16_t *mag, uint32_t maglen, uint64_t base
             // Skip this message if we are sure it's fine.
             if (mm.crcok)
             {
-                j += (MODE_S_PREAMBLE_US + (msglen * 8)) * 2;
+                j += (MODE_S_PREAMBLE_US + mm.msgbits) * 2;
                 good_message = 1;
                 if (use_correction)
                     mm.phase_corrected = 1;

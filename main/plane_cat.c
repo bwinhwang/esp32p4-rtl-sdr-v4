@@ -85,7 +85,22 @@ static bool callsign_is_ga(const char *cs)
     return false;
 }
 
-plane_cat_t plane_classify(uint32_t icao, const char *callsign)
+/* The broadcast category is a weight/type class, not an operator, so it is
+ * the fallback only. A6 (>5 g, >400 kt) is in practice a fighter; the
+ * airliner weight classes cover bizjets and military transports too, but
+ * those mostly have a callsign or an address that already decided. */
+static plane_cat_t emitter_guess(uint8_t emitter)
+{
+    switch (emitter) {
+    case 0xA6:                                     return PLANE_MILITARY;
+    case 0xA3: case 0xA4: case 0xA5:               return PLANE_COMMERCIAL;
+    case 0xA1: case 0xA7: case 0xB1: case 0xB2: case 0xB4:
+                                                   return PLANE_GA;
+    default:                                       return PLANE_UNKNOWN;
+    }
+}
+
+plane_cat_t plane_classify(uint32_t icao, const char *callsign, uint8_t emitter)
 {
     const char *cs = callsign ? callsign : "";
 
@@ -95,7 +110,16 @@ plane_cat_t plane_classify(uint32_t icao, const char *callsign)
      * flight number from a five-letter registration like "DEFGH". */
     if (callsign_is_commercial(cs))               return PLANE_COMMERCIAL;
     if (callsign_is_ga(cs))                       return PLANE_GA;
-    return PLANE_UNKNOWN;
+    return emitter_guess(emitter);
+}
+
+const char *plane_emitter_label(uint8_t emitter, char *buf)
+{
+    if (!emitter) { buf[0] = '\0'; return buf; }
+    buf[0] = (char)('A' + ((emitter >> 4) - 0xA));
+    buf[1] = (char)('0' + (emitter & 7));
+    buf[2] = '\0';
+    return buf;
 }
 
 const char *plane_cat_label(plane_cat_t c)

@@ -41,6 +41,14 @@
 #define DEFAULT_BUF_LENGTH    (MAX_PACKET_SIZE * 2)
 /* A contact with no frame for this long is dropped from the table. */
 #define CONTACT_TTL_US        60000000LL
+/* alert/SPI are only ever cleared by a later status message; a contact that
+ * stops replying would otherwise show IDENT until it is lost. An RA is
+ * rebroadcast for ~18 s after it ends, readsb shows it for 15 s. */
+#define STATUS_HOLD_US        30000000LL
+#define RA_HOLD_US            15000000LL
+/* A position message's own kind (surface/airborne) settles air/ground for
+ * this long; the FS/VS/CA flags only fill in outside it. */
+#define AIRGROUND_CPR_WINDOW_US 20000000LL
 
 /* ── audio pins (Waveshare ESP32-P4-WIFI6-DEV-KIT + ES8311) ──────────────── */
 #define I2C_SCL_PIN     8
@@ -427,7 +435,7 @@ static aircraft_t *find_or_create(uint32_t icao)
         empty->active = true;
         /* No callsign this early, but an address inside a military block is
          * already enough to classify -- and that is the one worth flagging. */
-        empty->category = plane_classify(icao, NULL);
+        empty->category = plane_classify(icao, NULL, 0);
         air_log(1, "CONTACT  %06lX  first squawk  %s", (unsigned long)icao,
                 plane_cat_label(empty->category));
         audio_play(AUDIO_EVT_NEW_CONTACT);
@@ -659,7 +667,17 @@ static void tracker_tick(int64_t now)
 
     for (int i = 0; i < MAX_TRACKED; i++) {
         aircraft_t *a = &s_aircraft[i];
-        if (!a->active || now - a->last_seen_us <= CONTACT_TTL_US) continue;
+        if (!a->active) continue;
+        if ((a->alert || a->spi) && now - a->status_us > STATUS_HOLD_US)
+            a->alert = a->spi = false;
+        if (a->ra_us && now - a->ra_us > RA_HOLD_US) {
+            /* ra_text too, or the same advisory an hour later is "unchanged"
+             * and never logged. */
+            a->ra_active = false;
+            a->ra_text[0] = '\0';
+            a->ra_us = 0;
+        }
+        if (now - a->last_seen_us <= CONTACT_TTL_US) continue;
         air_log(4, "LOST     %06lX  (%s)", (unsigned long)a->icao,
                 a->callsign[0] ? a->callsign : "--------");
         a->active = false;
@@ -727,22 +745,34 @@ size_t aircraft_export_ndjson(char *buf, size_t bufsize)
         aircraft_t *a = &s_aircraft[i];
         if (!a->active || now - a->last_seen_us > 60000000LL) continue;
 
-        char latbuf[16] = "null", lonbuf[16] = "null", altbuf[16];
+        char latbuf[16] = "null", lonbuf[16] = "null", altbuf[16], emit[4];
         if (a->on_ground) snprintf(altbuf, sizeof(altbuf), "\"ground\"");
         else              snprintf(altbuf, sizeof(altbuf), "%d", a->altitude);
         if (a->pos_valid) {
             snprintf(latbuf, sizeof(latbuf), "%.5f", a->lat);
             snprintf(lonbuf, sizeof(lonbuf), "%.5f", a->lon);
         }
+        /* The rare fields, readsb's names, only while they hold a value --
+         * a fixed "spi":0 on every row is noise for the consumers. */
+        char   extra[128] = "";
+        size_t x = 0;
+        if (a->airspeed)
+            x += snprintf(extra + x, sizeof(extra) - x, ",\"%s\":%d",
+                          a->airspeed_tas ? "tas" : "ias", a->airspeed);
+        if (a->alert) x += snprintf(extra + x, sizeof(extra) - x, ",\"alert\":1");
+        if (a->spi)   x += snprintf(extra + x, sizeof(extra) - x, ",\"spi\":1");
+        if (a->ra_active)
+            x += snprintf(extra + x, sizeof(extra) - x, ",\"acas_ra\":\"%s\"", a->ra_text);
 
         n = json_append(buf, bufsize, n,
                 "%s{\"hex\":\"%06lx\",\"flight\":\"%s\",\"%s\":%s,"
                 "\"gs\":%d,\"track\":%d,\"vert_rate\":%d,\"lat\":%s,\"lon\":%s,"
-                "\"category\":\"%s\",\"messages\":%d,\"seen\":%.1f}",
+                "\"category\":\"%s\",\"emitter\":\"%s\"%s,\"messages\":%d,\"seen\":%.1f}",
                 first ? "" : ",", (unsigned long)a->icao, a->callsign,
                 a->alt_geom ? "alt_geom" : "alt_baro", altbuf,
                 a->velocity, a->heading, a->vert_rate,
-                latbuf, lonbuf, plane_cat_label(a->category), a->msg_count,
+                latbuf, lonbuf, plane_cat_label(a->category),
+                plane_emitter_label(a->emitter, emit), extra, a->msg_count,
                 (double)(now - a->last_seen_us) / 1e6);
         first = false;
     }
@@ -790,18 +820,18 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
     a->sig = (uint8_t)mm->signal_level;
 
     if (mm->flight[0]) {
+        char emit[4];
         strncpy(a->callsign, mm->flight, 8);
         a->callsign[8] = '\0';
         for (int i = 7; i >= 0 && a->callsign[i] == ' '; i--)
             a->callsign[i] = '\0';
-        a->category = plane_classify(icao, a->callsign);
-        air_log(2, "IDENT    %06lX  %s  %s", (unsigned long)icao, a->callsign,
-                plane_cat_label(a->category));
+        a->emitter  = (uint8_t)mm->category;
+        a->category = plane_classify(icao, a->callsign, a->emitter);
+        air_log(2, "IDENT    %06lX  %s  %s  %s", (unsigned long)icao, a->callsign,
+                plane_cat_label(a->category), plane_emitter_label(a->emitter, emit));
     }
 
-    /* mode-s.c fills `identity` for every frame; it is the squawk only in the
-     * two identity replies and in the TC28 emergency broadcast. */
-    if ((mm->msgtype == 5 || mm->msgtype == 21 || mm->emergency_valid) && mm->identity) {
+    if (mm->squawk_valid && mm->identity) {
         if (a->squawk != mm->identity)
             air_log(mm->identity == 7500 || mm->identity == 7600 || mm->identity == 7700 ? 4 : 2,
                     "SQUAWK   %06lX  %04d", (unsigned long)icao, mm->identity);
@@ -820,6 +850,40 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
         a->emergency = mm->emergency;
     }
 
+    /* Air/ground. A position message says it by its format and wins for a
+     * while; FS/VS/CA fill in for Mode S-only contacts, and of those only the
+     * certain states move it (mode-s.c leaves FS/CA "airborne" at 0: a
+     * transponder that never reports ground would flip a taxiing aircraft). */
+    if (mm->cpr_valid) {
+        a->on_ground = mm->cpr_surface != 0;
+    } else if (mm->airground) {
+        int64_t last_cpr = a->cpr_even.valid ? a->cpr_even.ts_us : 0;
+        if (a->cpr_odd.valid && a->cpr_odd.ts_us > last_cpr) last_cpr = a->cpr_odd.ts_us;
+        if (a->last_seen_us - last_cpr > AIRGROUND_CPR_WINDOW_US)
+            a->on_ground = mm->airground == 1;
+    }
+
+    if (mm->alert_valid || mm->spi_valid) {
+        if (mm->alert_valid) a->alert = mm->alert;
+        if (mm->spi_valid) {
+            if (mm->spi && !a->spi)
+                air_log(2, "SPI      %06lX  ident", (unsigned long)icao);
+            a->spi = mm->spi;
+        }
+        a->status_us = a->last_seen_us;
+    }
+
+    if (mm->acas_ra_valid) {
+        char text[sizeof(a->ra_text)];
+        mode_s_acas_ra_text(mm->msg + 4, text, sizeof(text));
+        bool ended = mm->msg[7] & 0x20;              /* RAT, bit 27 of the register */
+        if (strcmp(text, a->ra_text) != 0)
+            air_log(ended ? 2 : 4, "RA       %06lX  %s", (unsigned long)icao, text);
+        strcpy(a->ra_text, text);
+        a->ra_active = !ended;
+        a->ra_us     = a->last_seen_us;
+    }
+
     if (mm->altitude) {
         a->altitude = mm->altitude;
         a->alt_geom = mm->alt_geom;
@@ -829,6 +893,10 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
         a->velocity    = mm->velocity;
         a->ew_velocity = mm->ew_dir ? -mm->ew_velocity : mm->ew_velocity;
         a->ns_velocity = mm->ns_dir ? -mm->ns_velocity : mm->ns_velocity;
+    }
+    if (mm->airspeed_valid) {
+        a->airspeed     = mm->airspeed;
+        a->airspeed_tas = mm->airspeed_tas != 0;
     }
     /* mm->vert_rate is the raw 9-bit field as dump1090 leaves it: 0 means "no
      * information", otherwise it's 64 ft/min steps biased by one. The table's
@@ -844,7 +912,6 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
         int64_t ts = esp_timer_get_time();
         cpr_frame_t *f = mm->fflag ? &a->cpr_odd : &a->cpr_even;
         *f = (cpr_frame_t){ mm->raw_latitude, mm->raw_longitude, ts, mm->cpr_surface != 0, true };
-        a->on_ground = mm->cpr_surface != 0;
         bool   was_valid = a->pos_valid;
         double lat, lon;
         if (decode_position(a, mm, ts, &lat, &lon) && position_plausible(a, lat, lon, ts)) {
@@ -876,6 +943,9 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
         else if (mm->metype == 19 && mm->gs_valid)
             air_log(0, "VEL      %06lX  %d kt  hdg=%d  vs=%d",
                     (unsigned long)icao, a->velocity, a->heading, a->vert_rate);
+        else if (mm->metype == 19 && mm->airspeed_valid)
+            air_log(0, "VEL      %06lX  %s %d kt  hdg=%d  vs=%d", (unsigned long)icao,
+                    a->airspeed_tas ? "tas" : "ias", a->airspeed, a->heading, a->vert_rate);
     }
 }
 
@@ -910,7 +980,7 @@ static void inject_fake_aircraft(void)
         strncpy(a->callsign, FAKE[n].callsign, 8);
         a->callsign[8] = '\0';
     }
-    a->category = plane_classify(a->icao, a->callsign);
+    a->category = plane_classify(a->icao, a->callsign, 0);
 
     /* Placed around the antenna, not a fixed lat/lon, so the blips land on
      * the map wherever the receiver is; 20..190 km spans the three range

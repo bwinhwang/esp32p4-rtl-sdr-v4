@@ -180,14 +180,23 @@ ssh_srv             core0 prio 3   accept loop; runs the line editor and the com
   aircraft's last airborne fix; with neither, a target that was never seen airborne gets no
   fix. `position_plausible()` drops a fix implying >~970 kt from the last one, three strikes
   and the new one wins (the *reference* may be the bad one).
-  What it decodes for the table is deliberately small: DF17 TC0/5-8/9-18/20-22 (position,
-  altitude — `alt_geom` marks HAE — movement/track on the ground), TC1-4, TC19 (sub 3/4 give
-  heading and vertical rate only; IAS/TAS are left to readsb), TC28 sub 1; altitude from
-  DF0/4/16/20, squawk from DF5/21. Everything else that passes CRC (DF11 CA, DF18,
-  Comm-B/Comm-D payloads, TC29/31) goes out raw on AVR/Beast for readsb; DF18 in particular is
-  forwarded but never enters the table (CF 1/5 carry non-ICAO addresses). The length table is
-  `type & 0x10`, not dump1090's 16/17/19/20/21 list — that list truncated DF18 and DF24-31 to
-  56 bits, so they failed CRC and never reached the feeds at all.
+  What it decodes for the table: DF17 TC0/5-8/9-18/20-22 (position, altitude — `alt_geom`
+  marks HAE — movement/track on the ground, surveillance status → alert/SPI), TC1-4 (callsign
+  and the emitter category, `aircraft_t.emitter` in readsb's byte form, which `plane_classify()`
+  uses only as a fallback), TC19 (ground speed, or IAS/TAS from sub 3/4), TC23 sub 7 and TC28
+  sub 1 (squawk, emergency), TC28 sub 2 / DF16 MV / DF20-21 BDS 3,0 (ACAS RA — `acas_ra_plausible()`
+  is the same shape test readsb applies, since the register reads back empty most of the time and
+  the BDS number is not carried); altitude from DF0/4/16/20, squawk from DF5/21, air/ground
+  from FS/VS/CA — a position message's own format decides for 20 s, the flags fill in outside
+  that, and of those only the *certain* states move `on_ground` (FS "airborne" is not trusted,
+  many transponders never report ground). alert/SPI and an
+  RA are held 30 s / 15 s past the last message that carried them (`tracker_tick()`), because
+  nothing else ever clears them. Comm-B beyond 3,0, TC29/31 and DF18 go out raw on AVR/Beast for
+  readsb; DF18 in particular is forwarded but never enters the table (CF 1/5 carry non-ICAO
+  addresses). The length table is `type & 0x10`, not dump1090's 16/17/19/20/21 list — that list
+  truncated DF18 and DF24-31 to 56 bits, so they failed CRC and never reached the feeds at all.
+  A DF field one bit off 17 (1/16/19/21/25) is re-tried as DF17 before anything else (readsb's
+  `fixDF17msgtype`): the single-bit fixer only runs for DF11/17/18, so those frames were lost.
 - **API polarity traps**: `rtlsdr_get_tuner_pll_locked()` returns **1 for locked**, 0 unlocked,
   -1 unknown — not librtlsdr's 0-is-success convention. The dongle has no gain-*mode* getter and
   keeps returning the last manual value under AGC, so `cmd_sdr()` mirrors the mode in a static.
@@ -198,7 +207,9 @@ ssh_srv             core0 prio 3   accept loop; runs the line editor and the com
 the whole reason the file needs care: **commercial is tested before GA** (an airline flight
 number — three letters then a digit — also satisfies the GA registration rule), and **a military
 prefix must be followed by a digit** (or `CG` swallows every Canadian `C-Gxxx` and `GAF` every
-British `G-AFxx`).
+British `G-AFxx`). The broadcast emitter category (TC1-4) is a weight class, not an operator, so
+it only settles what those two leave UNK: A6 (high-performance) → MIL, A3-A5 → COM, A1/A7/B1/B2/B4
+→ GA. The JSON snapshot carries both: `category` is the label above, `emitter` the raw "A3".
 
 **Do not filter "placeholder" contacts.** ICAO `AAAAAA`/callsign `1000` and `FFFFFE`/`3456` with
 thousands of messages are real airborne transponders — readsb on the same Beast stream shows DF17,
@@ -352,7 +363,10 @@ SoftAP. Only decoded messages go out (hundreds of B/s).
   timestamp is receiver-local monotonic (`mode_s_msg.timestamp_12mhz`), **not** PPS-disciplined —
   feeder compatibility, not MLAT; `signal_level` is the bit-slicing delta, relative only. JSON
   :8888 broadcasts one full `aircraft_t` snapshot per tick (~1.3 Hz, NDJSON, `aircraft.json`-like)
-  so a slow client misses a tick instead of needing backpressure.
+  so a slow client misses a tick instead of needing backpressure. Fixed keys per row
+  (`hex flight alt_baro|alt_geom gs track vert_rate lat lon category emitter messages seen`);
+  `ias`/`tas`, `alert`, `spi` and `acas_ra` appear only while they hold a value — readsb's names,
+  so a consumer written against `aircraft.json` reads them unchanged.
 - `web_config.c` (port `CONFIG_ADSB_WEB_PORT`, default 80) pins httpd to **core0 prio 3** —
   `httpd_config_t` defaults to `tskNO_AFFINITY` at prio 5, exactly `adsb_rx_task`'s.
   Connect-per-request HTTP/1.0 clients RST-storm it (`CONFIG_LWIP_MAX_ACTIVE_TCP` 16 + TIME_WAIT
