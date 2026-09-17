@@ -19,8 +19,12 @@
 
 /* Table depth, not screen depth. A full table drops new contacts on the floor
  * (find_or_create() returns NULL) rather than evicting, so size it for the
- * busiest sky, not the screen. ~250 B each. */
+ * busiest sky, not the screen. ~550 B each, in PSRAM. */
 #define MAX_TRACKED  64
+
+/* One JSON snapshot of the whole table (feed_json.c, /aircraft.json). A row
+ * with every optional field present is ~650 B. */
+#define ADSB_SNAPSHOT_MAX  49152
 
 typedef struct {
     int     raw_lat;
@@ -30,16 +34,31 @@ typedef struct {
     bool    valid;
 } cpr_frame_t;
 
+/* A value with the time it was last reported; us == 0 means never. The JSON
+ * export shows it while under OPT_FRESH_US old -- these come from registers
+ * an interrogator may stop asking for while the contact stays alive. `es`
+ * marks an extended-squitter source, which a Comm-B reading of the same
+ * quantity does not replace while fresh. */
+typedef struct {
+    int64_t us;
+    float   v;
+    bool    es;
+} opt_f_t;
+
+#define OPT_FRESH_US  60000000LL
+#define FRESH_AT(us, now)  ((us) && (now) - (us) < OPT_FRESH_US)
+#define OPT_FRESH(o, now)  FRESH_AT((o).us, now)
+
 typedef struct {
     uint32_t    icao;
     char        callsign[9];
+    int64_t     cs_adsb_us;     /* last TC1-4 callsign; a BDS 2,0 one only fills in when stale */
     int         altitude;
     bool        alt_geom;       /* altitude is geometric (TC20-22), not barometric */
     bool        on_ground;      /* surface position, or a ground flag in FS/VS/CA */
     int         velocity;
     int         heading;
-    int         airspeed;       /* TC19 sub 3/4 only (no GNSS velocity), kt; 0 = none */
-    bool        airspeed_tas;
+    int64_t     vel_us;         /* last ADS-B velocity (TC19 / TC5-8); BDS 5,0 fills in when stale */
     float       lat;
     float       lon;
     bool        pos_valid;
@@ -60,6 +79,23 @@ typedef struct {
     bool        ra_active;      /* ACAS RA in progress: cleared by "clear of conflict" or RA_HOLD_US */
     int64_t     ra_us;
     char        ra_text[48];    /* the advisory, as logged */
+
+    /* ── the rest of readsb's aircraft.json: JSON feed only, nothing on
+     * screen reads them ── */
+    opt_f_t     ias, tas, mach;             /* TC19 sub 3/4, BDS 5,0 / 6,0 */
+    opt_f_t     roll, track_rate;           /* BDS 5,0 */
+    opt_f_t     mag_heading;                /* BDS 6,0 */
+    opt_f_t     baro_rate, geom_rate;       /* TC19 by its source bit, BDS 6,0 */
+    opt_f_t     geom_delta;                 /* TC19: geometric minus barometric, gives the other altitude */
+    opt_f_t     nav_alt_mcp, nav_alt_fms, nav_qnh, nav_heading;   /* TC29, BDS 4,0 */
+    opt_f_t     nav_modes;                  /* MODE_S_NAV_MODE_* bits in v */
+    opt_f_t     nac_v;                      /* TC19, TC31 surface */
+    int64_t     acc_us;                     /* nac_p / sil / sil_type / nic_baro: TC29 or TC31 */
+    uint8_t     nac_p, sil, sil_type, nic_baro;
+    int64_t     ops_us;                     /* TC31 */
+    uint8_t     version, nic_a, nic_c, gva, sda;
+    bool        sda_valid, gva_valid, cc_acas;
+    uint8_t     nic;                        /* of the last accepted position; valid with pos_valid */
     uint8_t     sig;            /* signal_level of the last frame, 0-255, relative */
     int         msg_count;
     int64_t     last_seen_us;

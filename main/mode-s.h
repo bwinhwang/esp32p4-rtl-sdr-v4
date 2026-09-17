@@ -77,11 +77,54 @@ struct mode_s_msg
                           // 4 no comms, 5 unlawful interference, 6 downed.
     int category;         // TC1-4 emitter category, readsb's byte form:
                           // 0xA0..0xD7 (A0 = "no information"); 0 = not carried.
-    int airspeed_valid;   // TC19 sub 3/4: IAS or TAS in kt (GNSS velocity unavailable)
-    int airspeed;
-    int airspeed_tas;
     int acas_ra_valid;    // msg+4 holds a plausible ACAS resolution advisory
                           // (BDS 3,0): DF16 MV, TC28 sub 2 ME or DF20/21 MB.
+
+    // DF11: interrogator code recovered from the PI residual; 0 for a
+    // squitter. Non-zero means the address was only accepted because it
+    // was recently seen, so it must not seed the cache.
+    int iid;
+
+    // Comm-B (DF20/21 MB): the register is not named in the reply, so it
+    // is inferred from the content -- 0x10 0x17 0x20 0x30 0x40 0x50 0x60,
+    // 0 when nothing fits or two fit equally.
+    int commb_bds;
+
+    // Intent (TC29, BDS 4,0). The nav_have bits say which are set.
+    int nav_have;
+    int nav_alt_mcp;      // ft
+    int nav_alt_fms;      // ft
+    float nav_qnh;        // hPa
+    float nav_heading;    // deg
+    int nav_modes;        // MODE_S_NAV_MODE_* bits, meaningful with NAV_HAVE_MODES
+
+    // Speeds and rates: TC19 (all subtypes), BDS 5,0, BDS 6,0. The
+    // vertical rate carries its source with it; dump1090's raw vert_rate
+    // fields above are still filled for TC19.
+    int ias_valid, ias;             // kt
+    int tas_valid, tas;             // kt
+    int mach_valid; float mach;
+    int roll_valid; float roll;                 // deg, right positive
+    int track_rate_valid; float track_rate;     // deg/s, right positive
+    int mag_heading_valid; float mag_heading;   // BDS 6,0
+    int baro_rate_valid, baro_rate;             // ft/min
+    int geom_rate_valid, geom_rate;             // ft/min; BDS 6,0 inertial counts as geometric
+    int geom_delta_valid, geom_delta;           // ft, geometric minus barometric (TC19)
+
+    // Accuracy and operational status (TC9-18 NIC-B, TC19 NACv, TC29, TC31).
+    int nic_b_valid, nic_b;     // per message, TC9-18
+    int nac_v_valid, nac_v;
+    int nac_p_valid, nac_p;
+    int sil_valid, sil, sil_type;   // sil_type: 0 unknown, 1 per hour, 2 per sample
+    int nic_baro_valid, nic_baro;
+    int gva_valid, gva;
+    int sda_valid, sda;
+    int opstatus_valid;         // the fields below are set
+    int version;                // ADS-B version 0/1/2
+    int nic_a, nic_c;
+    int om_ident;               // IDENT switch active (another SPI source)
+    int om_acas_ra;             // RA active
+    int cc_acas;                // ACAS operational
 
     // Status shared by the surveillance replies and the ES position messages.
     // airground: 0 no information, 1 on the ground, 2 airborne. Only the
@@ -113,6 +156,19 @@ struct mode_s_msg
     int      signal_level;
 };
 
+#define MODE_S_NAV_HAVE_MCP     (1 << 0)
+#define MODE_S_NAV_HAVE_FMS     (1 << 1)
+#define MODE_S_NAV_HAVE_QNH     (1 << 2)
+#define MODE_S_NAV_HAVE_HEADING (1 << 3)
+#define MODE_S_NAV_HAVE_MODES   (1 << 4)
+
+#define MODE_S_NAV_MODE_AUTOPILOT (1 << 0)
+#define MODE_S_NAV_MODE_VNAV      (1 << 1)
+#define MODE_S_NAV_MODE_ALT_HOLD  (1 << 2)
+#define MODE_S_NAV_MODE_APPROACH  (1 << 3)
+#define MODE_S_NAV_MODE_LNAV      (1 << 4)
+#define MODE_S_NAV_MODE_TCAS      (1 << 5)
+
 typedef void (*mode_s_callback_t)(mode_s_t *self, struct mode_s_msg *mm);
 
 void mode_s_init(mode_s_t *self);
@@ -125,4 +181,8 @@ void mode_s_decode(mode_s_t *self, struct mode_s_msg *mm, unsigned char *msg);
 // Human-readable advisory for a BDS 3,0 block that passed the acas_ra_valid
 // test ("climb", "clear of conflict", ...). Returns out.
 const char *mode_s_acas_ra_text(const unsigned char *mb, char *out, size_t n);
+// NIC (navigation integrity category) of a position message: the type code
+// sets it, the supplements (A and C from the aircraft's TC31, B from this
+// message) refine it under version 1/2 rules.
+int mode_s_nic(int metype, int version, int nic_a, int nic_b, int nic_c);
 void runme();

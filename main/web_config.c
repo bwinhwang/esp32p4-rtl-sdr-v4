@@ -31,11 +31,10 @@
  * modules already use, to keep a dependency edge out of the TUI internals. */
 extern size_t aircraft_export_ndjson(char *buf, size_t bufsize);
 
-/* Must match feed_json.c's: MAX_TRACKED=64 aircraft at ~165 B each is
- * ~10.7 KB, so the 4096 this used to be was already serving a truncated,
- * invalid-JSON body whenever the table filled. Request-scoped, so it is a
- * malloc() and not a static like the feed's. */
-#define SNAPSHOT_MAX  16384
+/* Sized with the table in adsb.h (the 4096 this used to be served a
+ * truncated, invalid-JSON body whenever the table filled). Request-scoped,
+ * so it is a malloc() and not a static like the feed's. */
+#define SNAPSHOT_MAX  ADSB_SNAPSHOT_MAX
 
 static const char *TAG = "web";
 

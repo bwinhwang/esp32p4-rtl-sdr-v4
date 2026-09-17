@@ -29,6 +29,7 @@
 #include "esp_timer.h"
 #include "lwip/sockets.h"
 
+#include "adsb.h"        /* ADSB_SNAPSHOT_MAX only */
 #include "feed_json.h"
 
 /* Defined in class_driver.c, where s_aircraft[] lives; not put in a shared
@@ -41,9 +42,7 @@ extern size_t aircraft_export_ndjson(char *buf, size_t bufsize);
 #define FEED_PORT     8888
 #define MAX_CLIENTS   4
 #define TICK_MS       750   /* ~1.3 Hz, inside the plan's 1-2 Hz target */
-/* MAX_TRACKED=64 aircraft at ~165 B each plus the header and "]}\n" is
- * ~10.7 KB worst case. */
-#define SNAPSHOT_MAX  16384
+#define SNAPSHOT_MAX  ADSB_SNAPSHOT_MAX
 
 /* Per-client budget for pushing one whole snapshot out, and the poll step
  * inside it. A snapshot is ~2x CONFIG_LWIP_TCP_SND_BUF_DEFAULT (5760), so it

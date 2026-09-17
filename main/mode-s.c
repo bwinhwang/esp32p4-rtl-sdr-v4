@@ -374,7 +374,32 @@ int decode_ac12_field(unsigned char *msg, int *unit)
     }
 }
 
-static const char *ais_charset = "?ABCDEFGHIJKLMNOPQRSTUVWXYZ????? ???????????????0123456789??????";
+// Code 0 reads as a space: undefined, but some transponders pad with it
+// and readsb keeps those callsigns. Every other '?' is a real hole.
+static const char *ais_charset = " ABCDEFGHIJKLMNOPQRSTUVWXYZ????? ???????????????0123456789??????";
+
+// Eight 6-bit characters from a 48-bit field starting at b (TC1-4 and
+// BDS 2,0 share the layout). Returns 0 and an empty string on an
+// undefined code -- a callsign with a hole in it is noise, not data.
+static int decode_callsign(const unsigned char *b, char *out)
+{
+    out[0] = ais_charset[b[0] >> 2];
+    out[1] = ais_charset[((b[0] & 3) << 4) | (b[1] >> 4)];
+    out[2] = ais_charset[((b[1] & 15) << 2) | (b[2] >> 6)];
+    out[3] = ais_charset[b[2] & 63];
+    out[4] = ais_charset[b[3] >> 2];
+    out[5] = ais_charset[((b[3] & 3) << 4) | (b[4] >> 4)];
+    out[6] = ais_charset[((b[4] & 15) << 2) | (b[5] >> 6)];
+    out[7] = ais_charset[b[5] & 63];
+    out[8] = '\0';
+    for (int i = 0; i < 8; i++)
+        if (out[i] == '?')
+        {
+            out[0] = '\0';
+            return 0;
+        }
+    return 1;
+}
 
 // Bit n (1-based, MSB first) of a 7-byte ME/MV/MB block, numbered as the
 // ICAO register tables do.
@@ -449,6 +474,345 @@ const char *mode_s_acas_ra_text(const unsigned char *b, char *out, size_t n)
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// Comm-B register inference. A DF20/21 does not say which register it
+// carries, so each candidate is scored on whether its status bits and
+// value ranges make sense (the way readsb and pyModeS do it) and the clear
+// winner is decoded. Any field with its status bit clear must read zero;
+// a value outside what an aircraft can do sinks the candidate outright.
+// ---------------------------------------------------------------------------
+
+static int bds_empty(const unsigned char *b)
+{
+    for (int i = 0; i < 7; i++)
+        if (b[i]) return 0;
+    return 56;
+}
+
+static int bds10(const unsigned char *b)
+{
+    return (b[0] == 0x10 && fbits(b, 10, 14) == 0) ? 56 : 0;
+}
+
+// Common-usage GICB capability report. Bits 25-56 are reserved; the rest
+// is judged on which combinations of capabilities are seen in practice.
+static int bds17(const unsigned char *b)
+{
+    if (fbits(b, 25, 56)) return 0;
+    int score = fbit(b, 7) ? 1 : -2;                 // 2,0 is on nearly everything
+    static const int unlikely[] = { 10, 11, 12, 13, 14, 20, 21, 22, 0 };   // waypoints, met reports
+    for (int i = 0; unlikely[i]; i++)
+        if (fbit(b, unlikely[i])) score -= 2;
+    unsigned es = fbits(b, 1, 5);
+    if (es == 0x1f)       score += 5 + fbit(b, 6);   // all ES registers: ADS-B out
+    else if (es == 0 && !fbit(b, 6)) score += 1;     // none: Mode S only
+    else                  score -= 12;               // partial ES support does not exist
+    if (fbit(b, 16) && fbit(b, 24)) score += 2 + fbit(b, 9);   // 5,0 + 6,0, and 4,0 with them
+    else if (!fbit(b, 16) && !fbit(b, 24) && !fbit(b, 9)) score += 1;
+    else score -= 6;
+    return score;
+}
+
+static int bds20(const unsigned char *b, struct mode_s_msg *mm, int store)
+{
+    char cs[9];
+    if (b[0] != 0x20 || !decode_callsign(b + 1, cs)) return 0;
+    if (store) memcpy(mm->flight, cs, sizeof(cs));
+    return 8 + 6 * 8;
+}
+
+static int bds30(mode_s_t *self, const unsigned char *b, struct mode_s_msg *mm, int store)
+{
+    if (!acas_ra_plausible(self, b, mm->msgtype, 0)) return 0;
+    if (store) mm->acas_ra_valid = 1;
+    return 56;
+}
+
+// Selected vertical intention: MCP/FCU and FMS selected altitudes, the
+// barometric setting, the vertical mode bits and the altitude source.
+static int bds40(const unsigned char *b, struct mode_s_msg *mm, int store)
+{
+    int mcp_ok = fbit(b, 1), fms_ok = fbit(b, 14), qnh_ok = fbit(b, 27), mode_ok = fbit(b, 48), src_ok = fbit(b, 54);
+    unsigned mcp = fbits(b, 2, 13), fms = fbits(b, 15, 26), qnh = fbits(b, 28, 39), mode = fbits(b, 49, 51), src = fbits(b, 55, 56);
+    if (!mcp_ok && !fms_ok && !qnh_ok && !mode_ok && !src_ok) return 0;
+    if (fbits(b, 40, 47) || fbits(b, 52, 53)) return 0;
+    int score = 0;
+    if (mcp_ok && mcp) { if (mcp * 16 < 1000 || mcp * 16 > 50000) return 0; score += 13; }
+    else if (!mcp_ok && !mcp) score += 1;
+    else return 0;
+    if (fms_ok && fms) { if (fms * 16 < 1000 || fms * 16 > 50000) return 0; score += 13; }
+    else if (!fms_ok && !fms) score += 1;
+    else return 0;
+    if (qnh_ok && qnh) { if (800 + qnh * 0.1 < 900 || 800 + qnh * 0.1 > 1100) return 0; score += 13; }
+    else if (!qnh_ok && !qnh) score += 1;
+    else return 0;
+    if (mode_ok) score += 4; else if (!mode) score += 1; else return 0;
+    if (src_ok) score += 3; else if (!src) score += 1; else return 0;
+    if (mcp_ok && fms_ok && mcp != fms) score -= 4;
+    // selected altitudes are almost always a multiple of 500 ft
+    if (mcp_ok && (mcp * 16 % 500) >= 16 && (mcp * 16 % 500) <= 484) score -= 4;
+    if (fms_ok && (fms * 16 % 500) >= 16 && (fms * 16 % 500) <= 484) score -= 4;
+    if (store)
+    {
+        if (mcp_ok) { mm->nav_have |= MODE_S_NAV_HAVE_MCP; mm->nav_alt_mcp = mcp * 16; }
+        if (fms_ok) { mm->nav_have |= MODE_S_NAV_HAVE_FMS; mm->nav_alt_fms = fms * 16; }
+        if (qnh_ok) { mm->nav_have |= MODE_S_NAV_HAVE_QNH; mm->nav_qnh = 800 + qnh * 0.1f; }
+        if (mode_ok)
+        {
+            mm->nav_have |= MODE_S_NAV_HAVE_MODES;
+            mm->nav_modes = ((mode & 4) ? MODE_S_NAV_MODE_VNAV : 0) |
+                            ((mode & 2) ? MODE_S_NAV_MODE_ALT_HOLD : 0) |
+                            ((mode & 1) ? MODE_S_NAV_MODE_APPROACH : 0);
+        }
+    }
+    return score;
+}
+
+// Track and turn report: roll, true track, ground speed, track rate, TAS.
+static int bds50(const unsigned char *b, struct mode_s_msg *mm, int store)
+{
+    if (!fbit(b, 1) || !fbit(b, 12) || !fbit(b, 24) || !fbit(b, 46)) return 0;
+    float roll = fbits(b, 3, 11) * 45.0f / 256 - (fbit(b, 2) ? 90 : 0);
+    float track = fbits(b, 14, 23) * 90.0f / 512 + (fbit(b, 13) ? 180 : 0);
+    unsigned gs = fbits(b, 25, 34) * 2, tas = fbits(b, 47, 56) * 2;
+    int tr_ok = fbit(b, 35);
+    float tr = fbits(b, 37, 45) * 8.0f / 256 - (fbit(b, 36) ? 16 : 0);
+    if (roll < -40 || roll >= 40) return 0;
+    if (!gs || gs < 50 || gs > 700) return 0;
+    if (!tas || tas < 50 || tas > 700) return 0;
+    int score = 11 + 12 + 11 + 11;
+    if (tr_ok) { if (tr < -10 || tr > 10) return 0; score += 11; }
+    else if (!fbits(b, 36, 45)) score += 1;
+    else return 0;
+    // a coordinated turn's rate follows from bank and TAS: g*tan(roll)/v
+    if (tr_ok && fabs(68625 * tan(roll * M_PI / 180) / (tas * 20 * M_PI) - tr) > 2.0) score -= 6;
+    if (store)
+    {
+        mm->roll_valid = 1;        mm->roll = roll;
+        mm->heading_is_valid = 1;  mm->heading = (int)(track + 0.5) % 360;
+        mm->gs_valid = 1;          mm->velocity = gs;
+        mm->tas_valid = 1;         mm->tas = tas;
+        if (tr_ok) { mm->track_rate_valid = 1; mm->track_rate = tr; }
+    }
+    return score;
+}
+
+// Heading and speed report: magnetic heading, IAS, Mach, barometric and
+// inertial vertical rates.
+static int bds60(const unsigned char *b, struct mode_s_msg *mm, int store)
+{
+    if (!fbit(b, 1) || !fbit(b, 13) || !fbit(b, 24) || (!fbit(b, 35) && !fbit(b, 46))) return 0;
+    float hdg = fbits(b, 3, 12) * 90.0f / 512 + (fbit(b, 2) ? 180 : 0);
+    unsigned ias = fbits(b, 14, 23);
+    float mach = fbits(b, 25, 34) * 2.048f / 512;
+    int br_ok = fbit(b, 35), ir_ok = fbit(b, 46);
+    int br = fbits(b, 37, 45) * 32 - (fbit(b, 36) ? 16384 : 0);
+    int ir = fbits(b, 48, 56) * 32 - (fbit(b, 47) ? 16384 : 0);
+    if (!ias || ias < 50 || ias > 700) return 0;
+    if (mach < 0.1f || mach > 0.9f) return 0;
+    int score = 12 + 11 + 11;
+    if (br_ok) { if (br < -6000 || br > 6000) return 0; score += 11; }
+    else if (!fbits(b, 36, 45)) score += 1;
+    else return 0;
+    if (ir_ok) { if (ir < -6000 || ir > 6000) return 0; score += 11; }
+    else if (!fbits(b, 47, 56)) score += 1;
+    else return 0;
+    if (br_ok && ir_ok && abs(br - ir) > 2000) score -= 12;
+    if (store)
+    {
+        mm->mag_heading_valid = 1; mm->mag_heading = hdg;
+        mm->ias_valid = 1;         mm->ias = ias;
+        mm->mach_valid = 1;        mm->mach = mach;
+        if (br_ok) { mm->baro_rate_valid = 1; mm->baro_rate = br; }
+        if (ir_ok) { mm->geom_rate_valid = 1; mm->geom_rate = ir; }
+    }
+    return score;
+}
+
+static void decode_commb(mode_s_t *self, struct mode_s_msg *mm)
+{
+    const unsigned char *b = mm->msg + 4;
+    struct { int bds; int score; } c[] = {
+        { 0x00, bds_empty(b) },
+        { 0x10, bds10(b) },
+        { 0x17, bds17(b) },
+        { 0x20, bds20(b, mm, 0) },
+        { 0x30, bds30(self, b, mm, 0) },
+        { 0x40, bds40(b, mm, 0) },
+        { 0x50, bds50(b, mm, 0) },
+        { 0x60, bds60(b, mm, 0) },
+    };
+    int best = 0, tie = 0, bds = 0;
+    for (unsigned i = 0; i < sizeof(c) / sizeof(c[0]); i++)
+    {
+        if (c[i].score > best) { best = c[i].score; bds = c[i].bds; tie = 0; }
+        else if (c[i].score == best && best) tie = 1;
+    }
+    if (!best || tie) return;
+    mm->commb_bds = bds;
+    switch (bds)
+    {
+    case 0x20: bds20(b, mm, 1); break;
+    case 0x30: bds30(self, b, mm, 1); break;
+    case 0x40: bds40(b, mm, 1); break;
+    case 0x50: bds50(b, mm, 1); break;
+    case 0x60: bds60(b, mm, 1); break;
+    default: break;
+    }
+}
+
+int mode_s_nic(int metype, int version, int nic_a, int nic_b, int nic_c)
+{
+    switch (metype)
+    {
+    case 5: case 9: case 20:  return 11;
+    case 6: case 10: case 21: return 10;
+    case 7:  return version == 2 ? (nic_a && !nic_c ? 9 : 8) : version == 1 ? (nic_a ? 9 : 8) : 8;
+    case 8:  return version == 2 ? (nic_a && nic_c ? 7 : (nic_a || nic_c) ? 6 : 0) : 0;
+    case 11: return version == 2 ? (nic_a && nic_b ? 9 : 8) : version == 1 ? (nic_a ? 9 : 8) : 8;
+    case 12: return 7;
+    case 13: return 6;
+    case 14: return 5;
+    case 15: return 4;
+    case 16: return nic_a && nic_b ? 3 : 2;
+    case 17: return 1;
+    default: return 0;
+    }
+}
+
+// TC29 target state and status. Subtype 0 is the version 1 layout
+// (vertical/horizontal source + mode + target), subtype 1 the version 2 one
+// (selected altitude, barometric setting, selected heading, mode bits).
+// Both carry NACp / NICbaro / SIL.
+static void decode_target_status(struct mode_s_msg *mm)
+{
+    const unsigned char *me = mm->msg + 4;
+    mm->mesub = fbits(me, 6, 7);
+    if (mm->mesub == 0 && !fbit(me, 11))
+    {
+        int vsrc = fbits(me, 8, 9);     // 1 MCP/FCU, 2 holding current altitude, 3 FMS
+        int vmode = fbits(me, 14, 15);  // 1 acquiring, 2 maintaining
+        int alt = -1000 + 100 * fbits(me, 16, 25);
+        if (vsrc == 1) { mm->nav_have |= MODE_S_NAV_HAVE_MCP; mm->nav_alt_mcp = alt; }
+        if (vsrc == 3) { mm->nav_have |= MODE_S_NAV_HAVE_FMS; mm->nav_alt_fms = alt; }
+        if (vmode == 1 || vmode == 2)
+        {
+            mm->nav_have |= MODE_S_NAV_HAVE_MODES;
+            mm->nav_modes |= vsrc == 3 ? MODE_S_NAV_MODE_VNAV
+                           : (vmode == 2 && vsrc == 2) ? MODE_S_NAV_MODE_ALT_HOLD
+                           : MODE_S_NAV_MODE_AUTOPILOT;
+        }
+        int hsrc = fbits(me, 26, 27);   // 1 MCP/FCU, 2 current track, 3 FMS
+        if (hsrc)
+        {
+            mm->nav_have |= MODE_S_NAV_HAVE_HEADING;
+            mm->nav_heading = fbits(me, 28, 36);
+        }
+        int hmode = fbits(me, 38, 39);
+        if (hmode == 1 || hmode == 2)
+        {
+            mm->nav_have |= MODE_S_NAV_HAVE_MODES;
+            mm->nav_modes |= hsrc == 3 ? MODE_S_NAV_MODE_LNAV : MODE_S_NAV_MODE_AUTOPILOT;
+        }
+        int tcas = fbits(me, 52, 53);   // 1 not operational, 2/3 operational
+        if (tcas) mm->nav_have |= MODE_S_NAV_HAVE_MODES;
+        if (tcas != 1) mm->nav_modes |= MODE_S_NAV_MODE_TCAS;
+        mm->emergency_valid = 1;
+        mm->emergency = fbits(me, 54, 56);
+    }
+    else if (mm->mesub == 1)
+    {
+        unsigned alt = fbits(me, 10, 20);
+        if (alt)
+        {
+            if (fbit(me, 9)) { mm->nav_have |= MODE_S_NAV_HAVE_FMS; mm->nav_alt_fms = (alt - 1) * 32; }
+            else             { mm->nav_have |= MODE_S_NAV_HAVE_MCP; mm->nav_alt_mcp = (alt - 1) * 32; }
+        }
+        unsigned qnh = fbits(me, 21, 29);
+        if (qnh) { mm->nav_have |= MODE_S_NAV_HAVE_QNH; mm->nav_qnh = 800 + (qnh - 1) * 0.8f; }
+        if (fbit(me, 30))
+        {
+            // two's complement -180..180, which reads the same as 0..360
+            mm->nav_have |= MODE_S_NAV_HAVE_HEADING;
+            mm->nav_heading = fbits(me, 31, 39) * 180.0f / 256;
+        }
+        if (fbit(me, 47))
+        {
+            mm->nav_have |= MODE_S_NAV_HAVE_MODES;
+            mm->nav_modes = (fbit(me, 48) ? MODE_S_NAV_MODE_AUTOPILOT : 0) |
+                            (fbit(me, 49) ? MODE_S_NAV_MODE_VNAV : 0) |
+                            (fbit(me, 50) ? MODE_S_NAV_MODE_ALT_HOLD : 0) |
+                            (fbit(me, 52) ? MODE_S_NAV_MODE_APPROACH : 0) |
+                            (fbit(me, 53) ? MODE_S_NAV_MODE_TCAS : 0) |
+                            (fbit(me, 54) ? MODE_S_NAV_MODE_LNAV : 0);
+        }
+    }
+    else
+        return;
+    mm->nac_p_valid = 1;    mm->nac_p = fbits(me, 40, 43);
+    mm->nic_baro_valid = 1; mm->nic_baro = fbit(me, 44);
+    mm->sil_valid = 1;      mm->sil = fbits(me, 45, 46); mm->sil_type = 0;
+}
+
+// TC31 operational status, subtype 0 airborne / 1 surface. The layout of
+// the capability and mode fields moved between versions 0, 1 and 2, so
+// the version (bits 41-43, same place in all three) is read first.
+static void decode_operational_status(struct mode_s_msg *mm)
+{
+    const unsigned char *me = mm->msg + 4;
+    int surface = mm->mesub == 1;
+    if (mm->mesub > 1) return;
+    mm->opstatus_valid = 1;
+    mm->version = fbits(me, 41, 43);
+    switch (mm->version)
+    {
+    case 0:
+        if (!surface && fbits(me, 9, 10) == 0) mm->cc_acas = !fbit(me, 12);
+        break;
+    case 1:
+        if (fbits(me, 25, 26) == 0)
+        {
+            mm->om_acas_ra = fbit(me, 27);
+            mm->om_ident   = fbit(me, 28);
+        }
+        if (fbits(me, 9, 10) == 0 && fbits(me, 13, 14) == 0)
+        {
+            if (!surface) mm->cc_acas = !fbit(me, 11);
+            else { mm->nac_v_valid = 1; mm->nac_v = fbits(me, 17, 19); mm->nic_c = fbit(me, 20); }
+        }
+        mm->nic_a = fbit(me, 44);
+        mm->nac_p_valid = 1; mm->nac_p = fbits(me, 45, 48);
+        mm->sil_valid = 1;   mm->sil = fbits(me, 51, 52); mm->sil_type = 0;
+        if (!surface) { mm->nic_baro_valid = 1; mm->nic_baro = fbit(me, 53); }
+        break;
+    case 2:
+        if (fbits(me, 25, 26) == 0)
+        {
+            mm->om_acas_ra = fbit(me, 27);
+            mm->om_ident   = fbit(me, 28);
+            mm->sda_valid = 1; mm->sda = fbits(me, 31, 32);
+        }
+        if (fbits(me, 9, 10) == 0)
+        {
+            if (!surface) mm->cc_acas = fbit(me, 11);   // sense inverted from v0/v1
+            else { mm->nac_v_valid = 1; mm->nac_v = fbits(me, 17, 19); mm->nic_c = fbit(me, 20); }
+        }
+        mm->nic_a = fbit(me, 44);
+        mm->nac_p_valid = 1; mm->nac_p = fbits(me, 45, 48);
+        mm->sil_valid = 1;   mm->sil = fbits(me, 51, 52); mm->sil_type = fbit(me, 55) ? 2 : 1;
+        if (!surface)
+        {
+            mm->gva_valid = 1;      mm->gva = fbits(me, 49, 50);
+            mm->nic_baro_valid = 1; mm->nic_baro = fbit(me, 53);
+        }
+        break;
+    default:
+        // versions 3-7 are unassigned; nothing else in the message is safe to read
+        mm->opstatus_valid = 0;
+        break;
+    }
+}
+
 // Decode a raw Mode S message demodulated as a stream of bytes by
 // mode_s_detect(), and split it into fields populating a mode_s_msg structure.
 void mode_s_decode(mode_s_t *self, struct mode_s_msg *mm, unsigned char *msg)
@@ -500,7 +864,20 @@ void mode_s_decode(mode_s_t *self, struct mode_s_msg *mm, unsigned char *msg)
     // Check CRC and fix single bit errors using the CRC when possible (DF 11 and 17).
     mm->crcok = (mm->crc == crc2);
 
-    if (!mm->crcok && self->fix_errors &&
+    // DF11 answering a ground interrogation carries PI = CRC xor the
+    // interrogator code (II 1-15 / SI 16-79) in the low 7 bits; the squitter
+    // form has II 0. A residual that small is that code, not a bit error --
+    // accepted when the address is one already seen, as readsb does.
+    if (!mm->crcok && mm->msgtype == 11 && ((mm->crc ^ crc2) & 0xffff80) == 0)
+    {
+        uint32_t addr = ((uint32_t)msg[1] << 16) | ((uint32_t)msg[2] << 8) | msg[3];
+        if (icao_addr_was_recently_seen(self, addr))
+        {
+            mm->iid   = (mm->crc ^ crc2) & 0x7f;
+            mm->crcok = 1;
+        }
+    }
+    else if (!mm->crcok && self->fix_errors &&
         (mm->msgtype == 11 || mm->msgtype == 17 || mm->msgtype == 18))
     {
         if ((mm->errorbit = fix_single_bit_errors(msg, mm->msgbits)) != -1)
@@ -590,7 +967,7 @@ void mode_s_decode(mode_s_t *self, struct mode_s_msg *mm, unsigned char *msg)
     {
         // If this is DF 11 or DF 17 and the checksum was ok, we can add this
         // address to the list of recently seen addresses.
-        if (mm->crcok && mm->errorbit == -1 && mm->msgtype != 18)
+        if (mm->crcok && mm->errorbit == -1 && mm->msgtype != 18 && mm->iid == 0)
         {
             uint32_t addr = (mm->aa1 << 16) | (mm->aa2 << 8) | mm->aa3;
             add_recently_seen_icao_addr(self, addr);
@@ -604,14 +981,14 @@ void mode_s_decode(mode_s_t *self, struct mode_s_msg *mm, unsigned char *msg)
         mm->altitude = decode_ac13_field(msg, &mm->unit);
     }
 
-    // ACAS RA: the DF16 MV field, or the Comm-B register read back in a
-    // DF20/21. The BDS number is not carried, so a reply with DR/UM set
-    // (almost always noise) or a corrected bit is not trusted to be 3,0.
+    // ACAS RA in the DF16 MV field; the Comm-B register of a DF20/21 is
+    // inferred from its content. A reply with DR/UM set is almost always
+    // noise (nothing uses the multisite protocol), so it is not decoded.
     if (mm->crcok && mm->msgtype == 16)
         mm->acas_ra_valid = acas_ra_plausible(self, msg + 4, 16, 0);
     else if (mm->crcok && (mm->msgtype == 20 || mm->msgtype == 21) &&
              mm->dr == 0 && mm->um == 0 && mm->errorbit == -1)
-        mm->acas_ra_valid = acas_ra_plausible(self, msg + 4, mm->msgtype, 0);
+        decode_commb(self, mm);
 
     // Decode extended squitter specific stuff.
     if (mm->msgtype == 17)
@@ -623,15 +1000,7 @@ void mode_s_decode(mode_s_t *self, struct mode_s_msg *mm, unsigned char *msg)
             // Aircraft Identification and Category. TC4 is set A, TC1 set D.
             mm->aircraft_type = mm->metype - 1;
             mm->category = ((0x0e - mm->metype) << 4) | mm->mesub;
-            mm->flight[0] = (ais_charset)[msg[5] >> 2];
-            mm->flight[1] = ais_charset[((msg[5] & 3) << 4) | (msg[6] >> 4)];
-            mm->flight[2] = ais_charset[((msg[6] & 15) << 2) | (msg[7] >> 6)];
-            mm->flight[3] = ais_charset[msg[7] & 63];
-            mm->flight[4] = ais_charset[msg[8] >> 2];
-            mm->flight[5] = ais_charset[((msg[8] & 3) << 4) | (msg[9] >> 4)];
-            mm->flight[6] = ais_charset[((msg[9] & 15) << 2) | (msg[10] >> 6)];
-            mm->flight[7] = ais_charset[msg[10] & 63];
-            mm->flight[8] = '\0';
+            decode_callsign(msg + 5, mm->flight);
         }
         else if (mm->metype == 0 ||
                  (mm->metype >= 9 && mm->metype <= 18) ||
@@ -653,6 +1022,9 @@ void mode_s_decode(mode_s_t *self, struct mode_s_msg *mm, unsigned char *msg)
                 mm->spi_valid = 1;
                 mm->spi = ss == 3;
             }
+            // ME bit 8: NIC supplement B (version 2; IMF on a DF18)
+            mm->nic_b_valid = 1;
+            mm->nic_b = msg[4] & 1;
             if (mm->metype != 0)
             {
                 mm->fflag = msg[6] & (1 << 2);
@@ -754,15 +1126,34 @@ void mode_s_decode(mode_s_t *self, struct mode_s_msg *mm, unsigned char *msg)
                 int as_raw = ((msg[7] & 0x7f) << 3) | (msg[8] >> 5);
                 if (as_raw)
                 {
-                    mm->airspeed_valid = 1;
-                    mm->airspeed_tas   = (msg[7] & 0x80) != 0;
-                    mm->airspeed       = (as_raw - 1) * (mm->mesub == 4 ? 4 : 1);
+                    int kt = (as_raw - 1) * (mm->mesub == 4 ? 4 : 1);
+                    if (msg[7] & 0x80) { mm->tas_valid = 1; mm->tas = kt; }
+                    else               { mm->ias_valid = 1; mm->ias = kt; }
                 }
             }
-            // Vertical rate sits at the same bits in all four subtypes.
+            // ME bits 11-13: NACv
+            mm->nac_v_valid = 1;
+            mm->nac_v = (msg[5] >> 3) & 7;
+            // Vertical rate sits at the same bits in all four subtypes:
+            // bit 36 source (1 = barometric), 37 sign, 38-46 in 64 ft/min
+            // steps biased by one.
             mm->vert_rate_source = (msg[8] & 0x10) >> 4;
             mm->vert_rate_sign = (msg[8] & 0x8) >> 3;
             mm->vert_rate = ((msg[8] & 7) << 6) | ((msg[9] & 0xfc) >> 2);
+            if (mm->vert_rate)
+            {
+                int fpm = (mm->vert_rate - 1) * (mm->vert_rate_sign ? -64 : 64);
+                if (mm->vert_rate_source) { mm->baro_rate_valid = 1; mm->baro_rate = fpm; }
+                else                      { mm->geom_rate_valid = 1; mm->geom_rate = fpm; }
+            }
+            // Bits 49-56: geometric minus barometric altitude, 25 ft steps
+            // biased by one, bit 49 the sign.
+            int delta = msg[10] & 0x7f;
+            if (delta)
+            {
+                mm->geom_delta_valid = 1;
+                mm->geom_delta = (delta - 1) * ((msg[10] & 0x80) ? -25 : 25);
+            }
         }
         else if (mm->metype == 28 && mm->mesub == 1)
         {
@@ -788,6 +1179,14 @@ void mode_s_decode(mode_s_t *self, struct mode_s_msg *mm, unsigned char *msg)
                 mm->identity = decode_id13_field(id13);
                 mm->squawk_valid = 1;
             }
+        }
+        else if (mm->metype == 29)
+        {
+            decode_target_status(mm);
+        }
+        else if (mm->metype == 31)
+        {
+            decode_operational_status(mm);
         }
     }
     mm->phase_corrected = 0; // Set to 1 by the caller if needed.

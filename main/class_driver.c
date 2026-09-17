@@ -733,6 +733,55 @@ static size_t json_append(char *buf, size_t bufsize, size_t n, const char *fmt, 
     return (n + (size_t)w >= bufsize) ? bufsize : n + (size_t)w;
 }
 
+/* The optional fields, readsb's names and units, only while they hold a
+ * value -- a fixed "spi":0 on every row is noise for the consumers, and a
+ * register the interrogator stopped asking for goes away with OPT_FRESH. */
+static size_t json_optional(char *buf, size_t bufsize, size_t n, const aircraft_t *a, int64_t now)
+{
+    static const struct { const char *key; size_t off; const char *fmt; } F[] = {
+        { "ias",              offsetof(aircraft_t, ias),         ",\"%s\":%.0f" },
+        { "tas",              offsetof(aircraft_t, tas),         ",\"%s\":%.0f" },
+        { "mach",             offsetof(aircraft_t, mach),        ",\"%s\":%.3f" },
+        { "mag_heading",      offsetof(aircraft_t, mag_heading), ",\"%s\":%.1f" },
+        { "roll",             offsetof(aircraft_t, roll),        ",\"%s\":%.1f" },
+        { "track_rate",       offsetof(aircraft_t, track_rate),  ",\"%s\":%.2f" },
+        { "baro_rate",        offsetof(aircraft_t, baro_rate),   ",\"%s\":%.0f" },
+        { "geom_rate",        offsetof(aircraft_t, geom_rate),   ",\"%s\":%.0f" },
+        { "nav_qnh",          offsetof(aircraft_t, nav_qnh),     ",\"%s\":%.1f" },
+        { "nav_altitude_mcp", offsetof(aircraft_t, nav_alt_mcp), ",\"%s\":%.0f" },
+        { "nav_altitude_fms", offsetof(aircraft_t, nav_alt_fms), ",\"%s\":%.0f" },
+        { "nav_heading",      offsetof(aircraft_t, nav_heading), ",\"%s\":%.1f" },
+        { "nac_v",            offsetof(aircraft_t, nac_v),       ",\"%s\":%.0f" },
+    };
+    for (size_t i = 0; i < sizeof(F) / sizeof(F[0]); i++) {
+        const opt_f_t *o = (const opt_f_t *)((const char *)a + F[i].off);
+        if (OPT_FRESH(*o, now)) n = json_append(buf, bufsize, n, F[i].fmt, F[i].key, o->v);
+    }
+    if (OPT_FRESH(a->nav_modes, now)) {
+        static const char *const names[6] = { "autopilot", "vnav", "althold", "approach", "lnav", "tcas" };
+        int m = (int)a->nav_modes.v, k = 0;
+        n = json_append(buf, bufsize, n, ",\"nav_modes\":[");
+        for (int b = 0; b < 6; b++)
+            if (m & (1 << b)) n = json_append(buf, bufsize, n, "%s\"%s\"", k++ ? "," : "", names[b]);
+        n = json_append(buf, bufsize, n, "]");
+    }
+    if (a->pos_valid) n = json_append(buf, bufsize, n, ",\"nic\":%u", a->nic);
+    if (FRESH_AT(a->acc_us, now))
+        n = json_append(buf, bufsize, n, ",\"nac_p\":%u,\"sil\":%u,\"sil_type\":\"%s\",\"nic_baro\":%u",
+                        a->nac_p, a->sil,
+                        a->sil_type == 2 ? "persample" : a->sil_type == 1 ? "perhour" : "unknown",
+                        a->nic_baro);
+    if (FRESH_AT(a->ops_us, now)) {
+        n = json_append(buf, bufsize, n, ",\"version\":%u", a->version);
+        if (a->gva_valid) n = json_append(buf, bufsize, n, ",\"gva\":%u", a->gva);
+        if (a->sda_valid) n = json_append(buf, bufsize, n, ",\"sda\":%u", a->sda);
+    }
+    if (a->alert)     n = json_append(buf, bufsize, n, ",\"alert\":1");
+    if (a->spi)       n = json_append(buf, bufsize, n, ",\"spi\":1");
+    if (a->ra_active) n = json_append(buf, bufsize, n, ",\"acas_ra\":\"%s\"", a->ra_text);
+    return n;
+}
+
 size_t aircraft_export_ndjson(char *buf, size_t bufsize)
 {
     int64_t now = esp_timer_get_time();
@@ -745,35 +794,34 @@ size_t aircraft_export_ndjson(char *buf, size_t bufsize)
         aircraft_t *a = &s_aircraft[i];
         if (!a->active || now - a->last_seen_us > 60000000LL) continue;
 
-        char latbuf[16] = "null", lonbuf[16] = "null", altbuf[16], emit[4];
-        if (a->on_ground) snprintf(altbuf, sizeof(altbuf), "\"ground\"");
-        else              snprintf(altbuf, sizeof(altbuf), "%d", a->altitude);
+        char latbuf[16] = "null", lonbuf[16] = "null", altbuf[40], emit[4];
+        /* One altitude is measured, the other follows from TC19's
+         * geometric-minus-barometric delta while that is fresh. */
+        int  geom_ok = OPT_FRESH(a->geom_delta, now);
+        int  other   = a->altitude + (a->alt_geom ? -1 : 1) * (int)a->geom_delta.v;
+        if (a->on_ground)
+            snprintf(altbuf, sizeof(altbuf), "\"alt_baro\":\"ground\"");
+        else if (!geom_ok)
+            snprintf(altbuf, sizeof(altbuf), "\"%s\":%d", a->alt_geom ? "alt_geom" : "alt_baro", a->altitude);
+        else
+            snprintf(altbuf, sizeof(altbuf), "\"alt_baro\":%d,\"alt_geom\":%d",
+                     a->alt_geom ? other : a->altitude, a->alt_geom ? a->altitude : other);
         if (a->pos_valid) {
             snprintf(latbuf, sizeof(latbuf), "%.5f", a->lat);
             snprintf(lonbuf, sizeof(lonbuf), "%.5f", a->lon);
         }
-        /* The rare fields, readsb's names, only while they hold a value --
-         * a fixed "spi":0 on every row is noise for the consumers. */
-        char   extra[128] = "";
-        size_t x = 0;
-        if (a->airspeed)
-            x += snprintf(extra + x, sizeof(extra) - x, ",\"%s\":%d",
-                          a->airspeed_tas ? "tas" : "ias", a->airspeed);
-        if (a->alert) x += snprintf(extra + x, sizeof(extra) - x, ",\"alert\":1");
-        if (a->spi)   x += snprintf(extra + x, sizeof(extra) - x, ",\"spi\":1");
-        if (a->ra_active)
-            x += snprintf(extra + x, sizeof(extra) - x, ",\"acas_ra\":\"%s\"", a->ra_text);
 
         n = json_append(buf, bufsize, n,
-                "%s{\"hex\":\"%06lx\",\"flight\":\"%s\",\"%s\":%s,"
+                "%s{\"hex\":\"%06lx\",\"flight\":\"%s\",%s,"
                 "\"gs\":%d,\"track\":%d,\"vert_rate\":%d,\"lat\":%s,\"lon\":%s,"
-                "\"category\":\"%s\",\"emitter\":\"%s\"%s,\"messages\":%d,\"seen\":%.1f}",
-                first ? "" : ",", (unsigned long)a->icao, a->callsign,
-                a->alt_geom ? "alt_geom" : "alt_baro", altbuf,
+                "\"category\":\"%s\",\"emitter\":\"%s\"",
+                first ? "" : ",", (unsigned long)a->icao, a->callsign, altbuf,
                 a->velocity, a->heading, a->vert_rate,
                 latbuf, lonbuf, plane_cat_label(a->category),
-                plane_emitter_label(a->emitter, emit), extra, a->msg_count,
-                (double)(now - a->last_seen_us) / 1e6);
+                plane_emitter_label(a->emitter, emit));
+        n = json_optional(buf, bufsize, n, a, now);
+        n = json_append(buf, bufsize, n, ",\"messages\":%d,\"seen\":%.1f}",
+                a->msg_count, (double)(now - a->last_seen_us) / 1e6);
         first = false;
     }
     n = json_append(buf, bufsize, n, "]}\n");
@@ -788,6 +836,15 @@ size_t aircraft_export_ndjson(char *buf, size_t bufsize)
 /* ═══════════════════════════════════════════════════════════════════════════
  * ON_MSG CALLBACK
  * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* An ES value beats a Comm-B reading of the same quantity while it is fresh:
+ * the register is the same number seen through an interrogator, and the ES
+ * keeps repeating on its own. */
+static void opt_set(opt_f_t *o, int64_t now, float v, bool es)
+{
+    if (!es && o->es && FRESH_AT(o->us, now)) return;
+    *o = (opt_f_t){ now, v, es };
+}
 
 static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
 {
@@ -819,16 +876,28 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
     a->msg_count++;
     a->sig = (uint8_t)mm->signal_level;
 
-    if (mm->flight[0]) {
-        char emit[4];
-        strncpy(a->callsign, mm->flight, 8);
-        a->callsign[8] = '\0';
-        for (int i = 7; i >= 0 && a->callsign[i] == ' '; i--)
-            a->callsign[i] = '\0';
-        a->emitter  = (uint8_t)mm->category;
-        a->category = plane_classify(icao, a->callsign, a->emitter);
-        air_log(2, "IDENT    %06lX  %s  %s  %s", (unsigned long)icao, a->callsign,
-                plane_cat_label(a->category), plane_emitter_label(a->emitter, emit));
+    const int64_t now = a->last_seen_us;
+
+    /* A callsign from the ES (TC1-4) or the Comm-B register (BDS 2,0, the
+     * only source for an aircraft without ADS-B). The register never
+     * overrides a live ES one: the ES repeats every few seconds, so "stale"
+     * here means the aircraft stopped sending it. */
+    if (mm->flight[0] && (mm->commb_bds != 0x20 || !FRESH_AT(a->cs_adsb_us, now))) {
+        char cs[9], emit[4];
+        strncpy(cs, mm->flight, 8);
+        cs[8] = '\0';
+        for (int i = 7; i >= 0 && cs[i] == ' '; i--)
+            cs[i] = '\0';
+        if (mm->commb_bds != 0x20) {
+            a->cs_adsb_us = now;
+            a->emitter    = (uint8_t)mm->category;
+        }
+        if (strcmp(cs, a->callsign) != 0) {
+            strcpy(a->callsign, cs);
+            a->category = plane_classify(icao, a->callsign, a->emitter);
+            air_log(2, "IDENT    %06lX  %s  %s  %s", (unsigned long)icao, a->callsign,
+                    plane_cat_label(a->category), plane_emitter_label(a->emitter, emit));
+        }
     }
 
     if (mm->squawk_valid && mm->identity) {
@@ -870,7 +939,7 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
                 air_log(2, "SPI      %06lX  ident", (unsigned long)icao);
             a->spi = mm->spi;
         }
-        a->status_us = a->last_seen_us;
+        a->status_us = now;
     }
 
     if (mm->acas_ra_valid) {
@@ -888,23 +957,53 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
         a->altitude = mm->altitude;
         a->alt_geom = mm->alt_geom;
     }
-    if (mm->heading_is_valid) a->heading   = mm->heading;
-    if (mm->gs_valid) {
-        a->velocity    = mm->velocity;
-        a->ew_velocity = mm->ew_dir ? -mm->ew_velocity : mm->ew_velocity;
-        a->ns_velocity = mm->ns_dir ? -mm->ns_velocity : mm->ns_velocity;
+    /* Ground speed and track: the ES first, BDS 5,0 (an interrogator's
+     * question, answered with the same numbers) only while no ES velocity
+     * has come in for a minute -- a Mode S-only contact, in practice. */
+    bool commb_vel = mm->commb_bds == 0x50;
+    if (!commb_vel || !FRESH_AT(a->vel_us, now)) {
+        if (mm->heading_is_valid) a->heading = mm->heading;
+        if (mm->gs_valid) {
+            a->velocity    = mm->velocity;
+            a->ew_velocity = mm->ew_dir ? -mm->ew_velocity : mm->ew_velocity;
+            a->ns_velocity = mm->ns_dir ? -mm->ns_velocity : mm->ns_velocity;
+            if (!commb_vel) a->vel_us = now;
+        }
     }
-    if (mm->airspeed_valid) {
-        a->airspeed     = mm->airspeed;
-        a->airspeed_tas = mm->airspeed_tas != 0;
+    /* The table's one vertical rate is whichever came last; the JSON keeps
+     * both with their sources. */
+    const bool es = mm->msgtype == 17;
+    if (mm->baro_rate_valid) { a->vert_rate = mm->baro_rate; opt_set(&a->baro_rate, now, mm->baro_rate, es); }
+    if (mm->geom_rate_valid) { a->vert_rate = mm->geom_rate; opt_set(&a->geom_rate, now, mm->geom_rate, es); }
+    if (mm->ias_valid)         opt_set(&a->ias,         now, mm->ias, es);
+    if (mm->tas_valid)         opt_set(&a->tas,         now, mm->tas, es);
+    if (mm->mach_valid)        opt_set(&a->mach,        now, mm->mach, es);
+    if (mm->roll_valid)        opt_set(&a->roll,        now, mm->roll, es);
+    if (mm->track_rate_valid)  opt_set(&a->track_rate,  now, mm->track_rate, es);
+    if (mm->mag_heading_valid) opt_set(&a->mag_heading, now, mm->mag_heading, es);
+    if (mm->geom_delta_valid)  opt_set(&a->geom_delta,  now, mm->geom_delta, es);
+    if (mm->nav_have & MODE_S_NAV_HAVE_MCP)     opt_set(&a->nav_alt_mcp, now, mm->nav_alt_mcp, es);
+    if (mm->nav_have & MODE_S_NAV_HAVE_FMS)     opt_set(&a->nav_alt_fms, now, mm->nav_alt_fms, es);
+    if (mm->nav_have & MODE_S_NAV_HAVE_QNH)     opt_set(&a->nav_qnh,     now, mm->nav_qnh, es);
+    if (mm->nav_have & MODE_S_NAV_HAVE_HEADING) opt_set(&a->nav_heading, now, mm->nav_heading, es);
+    if (mm->nav_have & MODE_S_NAV_HAVE_MODES)   opt_set(&a->nav_modes,   now, mm->nav_modes, es);
+    if (mm->nac_v_valid)       opt_set(&a->nac_v,       now, mm->nac_v, es);
+    if (mm->nac_p_valid) {
+        a->acc_us = now;
+        a->nac_p  = mm->nac_p;
+        a->sil    = mm->sil;
+        /* TC29 carries SIL but not its type; TC31 (v2) does -- keep that */
+        if (mm->sil_type) a->sil_type = mm->sil_type;
+        if (mm->nic_baro_valid) a->nic_baro = mm->nic_baro;
     }
-    /* mm->vert_rate is the raw 9-bit field as dump1090 leaves it: 0 means "no
-     * information", otherwise it's 64 ft/min steps biased by one. The table's
-     * climb/descent thresholds are in ft/min, so convert here or every
-     * aircraft reads as level. */
-    if (mm->vert_rate) {
-        int fpm = (mm->vert_rate - 1) * 64;
-        a->vert_rate = mm->vert_rate_sign ? -fpm : fpm;
+    if (mm->opstatus_valid) {
+        a->ops_us    = now;
+        a->version   = mm->version;
+        a->nic_a     = mm->nic_a;
+        a->nic_c     = mm->nic_c;
+        a->cc_acas   = mm->cc_acas;
+        a->gva_valid = mm->gva_valid; a->gva = mm->gva;
+        a->sda_valid = mm->sda_valid; a->sda = mm->sda;
     }
 
     /* CPR position */
@@ -919,6 +1018,12 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
             a->lon       = (float)lon;
             a->pos_valid = true;
             a->pos_us    = ts;
+            /* NIC-A/C come from TC31 and go stale with it; the version too,
+             * and a contact never heard on TC31 is treated as version 0. */
+            bool ops = FRESH_AT(a->ops_us, ts);
+            a->nic = (uint8_t)mode_s_nic(mm->metype, ops ? a->version : 0,
+                                         ops && a->nic_a, mm->nic_b_valid && mm->nic_b,
+                                         ops && a->nic_c);
             update_range(a);
             /* A CPR pair straddling a zone boundary decodes to somewhere
              * absurd; no real 1090 MHz reception reaches this far. */
@@ -943,9 +1048,14 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
         else if (mm->metype == 19 && mm->gs_valid)
             air_log(0, "VEL      %06lX  %d kt  hdg=%d  vs=%d",
                     (unsigned long)icao, a->velocity, a->heading, a->vert_rate);
-        else if (mm->metype == 19 && mm->airspeed_valid)
+        else if (mm->metype == 19 && (mm->ias_valid || mm->tas_valid))
             air_log(0, "VEL      %06lX  %s %d kt  hdg=%d  vs=%d", (unsigned long)icao,
-                    a->airspeed_tas ? "tas" : "ias", a->airspeed, a->heading, a->vert_rate);
+                    mm->tas_valid ? "tas" : "ias", mm->tas_valid ? mm->tas : mm->ias,
+                    a->heading, a->vert_rate);
+    } else if (mm->commb_bds >= 0x40) {
+        air_log(0, "BDS%X,%X  %06lX  %s", mm->commb_bds >> 4, mm->commb_bds & 15, (unsigned long)icao,
+                mm->commb_bds == 0x40 ? "selected altitude" :
+                mm->commb_bds == 0x50 ? "track and turn" : "heading and speed");
     }
 }
 

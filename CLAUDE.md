@@ -180,23 +180,38 @@ ssh_srv             core0 prio 3   accept loop; runs the line editor and the com
   aircraft's last airborne fix; with neither, a target that was never seen airborne gets no
   fix. `position_plausible()` drops a fix implying >~970 kt from the last one, three strikes
   and the new one wins (the *reference* may be the bad one).
-  What it decodes for the table: DF17 TC0/5-8/9-18/20-22 (position, altitude — `alt_geom`
-  marks HAE — movement/track on the ground, surveillance status → alert/SPI), TC1-4 (callsign
-  and the emitter category, `aircraft_t.emitter` in readsb's byte form, which `plane_classify()`
-  uses only as a fallback), TC19 (ground speed, or IAS/TAS from sub 3/4), TC23 sub 7 and TC28
-  sub 1 (squawk, emergency), TC28 sub 2 / DF16 MV / DF20-21 BDS 3,0 (ACAS RA — `acas_ra_plausible()`
-  is the same shape test readsb applies, since the register reads back empty most of the time and
-  the BDS number is not carried); altitude from DF0/4/16/20, squawk from DF5/21, air/ground
-  from FS/VS/CA — a position message's own format decides for 20 s, the flags fill in outside
-  that, and of those only the *certain* states move `on_ground` (FS "airborne" is not trusted,
-  many transponders never report ground). alert/SPI and an
-  RA are held 30 s / 15 s past the last message that carried them (`tracker_tick()`), because
-  nothing else ever clears them. Comm-B beyond 3,0, TC29/31 and DF18 go out raw on AVR/Beast for
-  readsb; DF18 in particular is forwarded but never enters the table (CF 1/5 carry non-ICAO
-  addresses). The length table is `type & 0x10`, not dump1090's 16/17/19/20/21 list — that list
-  truncated DF18 and DF24-31 to 56 bits, so they failed CRC and never reached the feeds at all.
-  A DF field one bit off 17 (1/16/19/21/25) is re-tried as DF17 before anything else (readsb's
-  `fixDF17msgtype`): the single-bit fixer only runs for DF11/17/18, so those frames were lost.
+  What it decodes: DF17 TC0/5-8/9-18/20-22 (position, altitude — `alt_geom` marks HAE —
+  movement/track on the ground, surveillance status → alert/SPI, NIC-B), TC1-4 (callsign and
+  the emitter category, `aircraft_t.emitter` in readsb's byte form, which `plane_classify()`
+  uses only as a fallback), TC19 (ground speed or IAS/TAS, vertical rate by its source bit,
+  geometric-minus-barometric delta, NACv), TC23 sub 7 and TC28 sub 1 (squawk, emergency),
+  TC28 sub 2 / DF16 MV / BDS 3,0 (ACAS RA — `acas_ra_plausible()` is the same shape test readsb
+  applies, since the register reads back empty most of the time), TC29 (selected altitude /
+  QNH / heading / autopilot modes, both the v1 and v2 layouts), TC31 (version, NIC-A/C, NACp,
+  SIL, GVA, SDA); altitude from DF0/4/16/20, squawk from DF5/21, air/ground from FS/VS/CA — a
+  position message's own format decides for 20 s, the flags fill in outside that, and of those
+  only the *certain* states move `on_ground` (FS "airborne" is not trusted, many transponders
+  never report ground). **Comm-B (DF20/21) is inferred, not addressed**: the reply does not name
+  the register, so `decode_commb()` scores 1,0 / 1,7 / 2,0 / 3,0 / 4,0 / 5,0 / 6,0 on status-bit
+  consistency and value ranges (readsb's and pyModeS's approach) and decodes only a clear
+  winner; DR/UM set means the reply is not looked at. 4,4 (weather) is not decoded — readsb
+  derives `wd`/`ws`/`oat` from TAS/GS/heading instead and never publishes 4,4. Source priority
+  in `on_msg()`: the ES wins, BDS 2,0 / 5,0 only fill callsign / speed / track while no ES
+  version has arrived for a minute (`cs_adsb_us`, `vel_us`); everything else lands in `opt_f_t`
+  fields with their own timestamp and an `es` flag, `opt_set()` applies the same rule, and the
+  JSON shows them while under `OPT_FRESH_US` — an interrogator may stop asking for a register
+  while the contact stays alive. alert/SPI and an RA
+  are held 30 s / 15 s past the last message that carried them (`tracker_tick()`), because
+  nothing else ever clears them. `nic` is computed per accepted position from the type code
+  plus NIC-A/C (TC31, version-dependent) and NIC-B (the message). DF18 is forwarded but never
+  enters the table (CF 1/5 carry non-ICAO addresses). The length table is `type & 0x10`, not
+  dump1090's 16/17/19/20/21 list — that list truncated DF18 and DF24-31 to 56 bits, so they
+  failed CRC and never reached the feeds at all. A DF field one bit off 17 (1/16/19/21/25) is
+  re-tried as DF17 before anything else (readsb's `fixDF17msgtype`): the single-bit fixer only
+  runs for DF11/17/18, so those frames were lost. A DF11 whose PI residual is under 0x80 is an
+  all-call reply to an interrogator with that II/SI code, accepted when the address is already
+  known and never used to seed the cache (`iid`); requiring a zero residual dropped every
+  ground-interrogated reply from Mode S-only aircraft.
 - **API polarity traps**: `rtlsdr_get_tuner_pll_locked()` returns **1 for locked**, 0 unlocked,
   -1 unknown — not librtlsdr's 0-is-success convention. The dongle has no gain-*mode* getter and
   keeps returning the last manual value under AGC, so `cmd_sdr()` mirrors the mode in a static.
@@ -364,9 +379,13 @@ SoftAP. Only decoded messages go out (hundreds of B/s).
   feeder compatibility, not MLAT; `signal_level` is the bit-slicing delta, relative only. JSON
   :8888 broadcasts one full `aircraft_t` snapshot per tick (~1.3 Hz, NDJSON, `aircraft.json`-like)
   so a slow client misses a tick instead of needing backpressure. Fixed keys per row
-  (`hex flight alt_baro|alt_geom gs track vert_rate lat lon category emitter messages seen`);
-  `ias`/`tas`, `alert`, `spi` and `acas_ra` appear only while they hold a value — readsb's names,
-  so a consumer written against `aircraft.json` reads them unchanged.
+  (`hex flight alt_baro|alt_geom gs track vert_rate lat lon category emitter messages seen`;
+  both altitudes when TC19's delta is fresh, `"ground"` on the ground); the rest appear only
+  while they hold a value, under readsb's names and units so a consumer written against
+  `aircraft.json` reads them unchanged: `ias tas mach mag_heading roll track_rate baro_rate
+  geom_rate nav_qnh nav_altitude_mcp nav_altitude_fms nav_heading nav_modes nic nac_p nac_v sil
+  sil_type nic_baro version gva sda alert spi acas_ra`. `ADSB_SNAPSHOT_MAX` (adsb.h) sizes the
+  buffer for a full table with every field present.
 - `web_config.c` (port `CONFIG_ADSB_WEB_PORT`, default 80) pins httpd to **core0 prio 3** —
   `httpd_config_t` defaults to `tskNO_AFFINITY` at prio 5, exactly `adsb_rx_task`'s.
   Connect-per-request HTTP/1.0 clients RST-storm it (`CONFIG_LWIP_MAX_ACTIVE_TCP` 16 + TIME_WAIT
