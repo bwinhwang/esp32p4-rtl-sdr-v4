@@ -824,6 +824,11 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
     feed_avr_push(mm->msg, mm->msgbits);
     feed_beast_push(mm->msg, mm->msgbits, mm->timestamp_12mhz, mm->signal_level);
 
+    /* DF18 is forwarded only: mode-s.c leaves its ME undecoded, and with
+     * CF 1/5 the address is not an ICAO one, so a table entry keyed on it
+     * would be an empty row under a made-up hex. readsb sorts out CF. */
+    if (mm->msgtype == 18) return;
+
     aircraft_t *a = find_or_create(icao);
     if (!a) return;
 
@@ -842,12 +847,24 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
     }
 
     /* mode-s.c fills `identity` for every frame; it is the squawk only in the
-     * two identity replies. */
-    if ((mm->msgtype == 5 || mm->msgtype == 21) && mm->identity) {
+     * two identity replies and in the TC28 emergency broadcast. */
+    if ((mm->msgtype == 5 || mm->msgtype == 21 || mm->emergency_valid) && mm->identity) {
         if (a->squawk != mm->identity)
             air_log(mm->identity == 7500 || mm->identity == 7600 || mm->identity == 7700 ? 4 : 2,
                     "SQUAWK   %06lX  %04d", (unsigned long)icao, mm->identity);
         a->squawk = mm->identity;
+    }
+
+    /* Most v2 transponders broadcast TC28 routinely with state 0, so only a
+     * change involving a real state is an event -- not the first "none". */
+    if (mm->emergency_valid && a->emergency != mm->emergency) {
+        static const char *const names[8] = {
+            "cleared", "general", "lifeguard", "min fuel",
+            "no comms", "unlawful", "downed", "reserved" };
+        if (mm->emergency || a->emergency)
+            air_log(mm->emergency ? 4 : 2, "EMERG    %06lX  %s",
+                    (unsigned long)icao, names[mm->emergency & 7]);
+        a->emergency = mm->emergency;
     }
 
     if (mm->altitude)         a->altitude  = mm->altitude;

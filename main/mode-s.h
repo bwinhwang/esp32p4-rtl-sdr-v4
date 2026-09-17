@@ -68,6 +68,9 @@ struct mode_s_msg
     int vert_rate_sign;   // Vertical rate sign.
     int vert_rate;        // Vertical rate.
     int velocity;         // Computed from EW and NS velocity.
+    int emergency_valid;  // TC28 subtype 1 seen; `identity` is its squawk.
+    int emergency;        // 0 none, 1 general, 2 lifeguard, 3 min fuel,
+                          // 4 no comms, 5 unlawful interference, 6 downed.
 
     // DF4, DF5, DF20, DF21
     int fs;       // Flight status for DF4,5,20,21

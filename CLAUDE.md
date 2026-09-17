@@ -171,7 +171,12 @@ ssh_srv             core0 prio 3   accept loop; runs the line editor and the com
 - `mode-s.c` is dump1090-derived. `mode_s_detect()` fills `timestamp_12mhz`/`signal_level` itself
   from a caller-supplied buffer timestamp (2 MSPS ⇒ 6 ticks/sample at Beast's 12 MHz). CPR
   lat/lon is decoded downstream in `class_driver.c`'s `cpr_decode()` into `aircraft_t`, not in
-  `mode_s_msg`.
+  `mode_s_msg`. What it decodes for the table is deliberately small: DF17 TC1-4/9-18/19/28,
+  altitude from DF0/4/16/20, squawk from DF5/21. Everything else that passes CRC (DF11 CA,
+  DF18, Comm-B/Comm-D payloads, the other TCs) goes out raw on AVR/Beast for readsb; DF18 in
+  particular is forwarded but never enters the table (CF 1/5 carry non-ICAO addresses).
+  The length table is `type & 0x10`, not dump1090's 16/17/19/20/21 list — that list truncated
+  DF18 and DF24-31 to 56 bits, so they failed CRC and never reached the feeds at all.
 - **API polarity traps**: `rtlsdr_get_tuner_pll_locked()` returns **1 for locked**, 0 unlocked,
   -1 unknown — not librtlsdr's 0-is-success convention. The dongle has no gain-*mode* getter and
   keeps returning the last manual value under AGC, so `cmd_sdr()` mirrors the mode in a static.

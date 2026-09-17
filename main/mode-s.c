@@ -109,12 +109,10 @@ uint32_t mode_s_checksum(unsigned char *msg, int bits)
 // bits.
 int mode_s_msg_len_by_type(int type)
 {
-    if (type == 16 || type == 17 ||
-        type == 19 || type == 20 ||
-        type == 21)
-        return MODE_S_LONG_MSG_BITS;
-    else
-        return MODE_S_SHORT_MSG_BITS;
+    /* DF16-31 are all 112 bits. dump1090 listed 16/17/19/20/21 only, which
+     * truncated DF18 (TIS-B/ADS-R/non-transponder ADS-B) and DF24-31
+     * (Comm-D) to 56 bits, so their CRC could never pass. */
+    return (type & 0x10) ? MODE_S_LONG_MSG_BITS : MODE_S_SHORT_MSG_BITS;
 }
 
 // Try to fix single bit errors using the checksum. On success modifies the
@@ -256,7 +254,7 @@ int brute_force_ap(mode_s_t *self, unsigned char *msg, struct mode_s_msg *mm)
         msgtype == 16 || // Long Air-Air survillance
         msgtype == 20 || // Comm-A, altitude request
         msgtype == 21 || // Comm-A, identity request
-        msgtype == 24)   // Comm-C ELM
+        msgtype >= 24)   // Comm-D ELM: the low 3 bits of "DF" are payload
     {
         uint32_t addr;
         uint32_t crc;
@@ -286,6 +284,23 @@ int brute_force_ap(mode_s_t *self, unsigned char *msg, struct mode_s_msg *mm)
         }
     }
     return 0;
+}
+
+// The 13-bit identity field, as carried in DF5/21 (message bits 20-32) and
+// in the TC28 aircraft-status ME (bits 12-24), is Gillham-interleaved:
+//
+// C1-A1-C2-A2-C4-A4-ZERO-B1-D1-B2-D2-B4-D4
+//
+// Every group of three bits A, B, C, D is an octal digit. The result is the
+// base-ten number that happens to spell those four octal digits (7700).
+// For more info: http://en.wikipedia.org/wiki/Gillham_code
+static int decode_id13_field(uint32_t f)
+{
+    int a = (((f >> 7) & 1) << 2) | (((f >> 9) & 1) << 1) | ((f >> 11) & 1);
+    int b = (((f >> 1) & 1) << 2) | (((f >> 3) & 1) << 1) | ((f >> 5) & 1);
+    int c = (((f >> 8) & 1) << 2) | (((f >> 10) & 1) << 1) | ((f >> 12) & 1);
+    int d = (((f >> 0) & 1) << 2) | (((f >> 2) & 1) << 1) | ((f >> 4) & 1);
+    return a * 1000 + b * 100 + c * 10 + d;
 }
 
 // Decode the 13 bit AC altitude field (in DF 20 and others). Returns the
@@ -376,7 +391,8 @@ void mode_s_decode(mode_s_t *self, struct mode_s_msg *mm, unsigned char *msg)
     mm->errorbit = -1; // No error
     mm->crcok = (mm->crc == crc2);
 
-    if (!mm->crcok && self->fix_errors && (mm->msgtype == 11 || mm->msgtype == 17))
+    if (!mm->crcok && self->fix_errors &&
+        (mm->msgtype == 11 || mm->msgtype == 17 || mm->msgtype == 18))
     {
         if ((mm->errorbit = fix_single_bit_errors(msg, mm->msgbits)) != -1)
         {
@@ -411,39 +427,14 @@ void mode_s_decode(mode_s_t *self, struct mode_s_msg *mm, unsigned char *msg)
     mm->um = ((msg[1] & 7) << 3) | // Request extraction of downlink request.
              msg[2] >> 5;
 
-    // In the squawk (identity) field bits are interleaved like that (message
-    // bit 20 to bit 32):
-    //
-    // C1-A1-C2-A2-C4-A4-ZERO-B1-D1-B2-D2-B4-D4
-    //
-    // So every group of three bits A, B, C, D represent an integer from 0 to
-    // 7.
-    //
-    // The actual meaning is just 4 octal numbers, but we convert it into a
-    // base ten number tha happens to represent the four octal numbers.
-    //
-    // For more info: http://en.wikipedia.org/wiki/Gillham_code
-    {
-        int a, b, c, d;
-
-        a = ((msg[3] & 0x80) >> 5) |
-            ((msg[2] & 0x02) >> 0) |
-            ((msg[2] & 0x08) >> 3);
-        b = ((msg[3] & 0x02) << 1) |
-            ((msg[3] & 0x08) >> 2) |
-            ((msg[3] & 0x20) >> 5);
-        c = ((msg[2] & 0x01) << 2) |
-            ((msg[2] & 0x04) >> 1) |
-            ((msg[2] & 0x10) >> 4);
-        d = ((msg[3] & 0x01) << 2) |
-            ((msg[3] & 0x04) >> 1) |
-            ((msg[3] & 0x10) >> 4);
-        mm->identity = a * 1000 + b * 100 + c * 10 + d;
-    }
+    // Squawk from message bits 20-32; meaningful for DF5/21 only.
+    mm->identity = decode_id13_field(((msg[2] & 0x1f) << 8) | msg[3]);
 
     // DF 11 & 17: try to populate our ICAO addresses whitelist. DFs with an AP
-    // field (xored addr and crc), try to decode it.
-    if (mm->msgtype != 11 && mm->msgtype != 17)
+    // field (xored addr and crc), try to decode it. DF18 shares 17's CRC
+    // scheme but is kept out of the whitelist: a TIS-B/ADS-R source has no
+    // Mode S transponder, so no AP-addressed reply will ever come from it.
+    if (mm->msgtype != 11 && mm->msgtype != 17 && mm->msgtype != 18)
     {
         // Check if we can check the checksum for the Downlink Formats where
         // the checksum is xored with the aircraft ICAO address. We try to
@@ -462,7 +453,7 @@ void mode_s_decode(mode_s_t *self, struct mode_s_msg *mm, unsigned char *msg)
     {
         // If this is DF 11 or DF 17 and the checksum was ok, we can add this
         // address to the list of recently seen addresses.
-        if (mm->crcok && mm->errorbit == -1)
+        if (mm->crcok && mm->errorbit == -1 && mm->msgtype != 18)
         {
             uint32_t addr = (mm->aa1 << 16) | (mm->aa2 << 8) | mm->aa3;
             add_recently_seen_icao_addr(self, addr);
@@ -557,6 +548,15 @@ void mode_s_decode(mode_s_t *self, struct mode_s_msg *mm, unsigned char *msg)
                 mm->heading = (360.0 / 128) * (((msg[5] & 3) << 5) |
                                                (msg[6] >> 3));
             }
+        }
+        else if (mm->metype == 28 && mm->mesub == 1)
+        {
+            // Aircraft status, emergency/priority: ME bits 9-11 are the
+            // state, 12-24 the squawk -- the only place a squawk is
+            // broadcast without a ground interrogation.
+            mm->emergency_valid = 1;
+            mm->emergency = msg[5] >> 5;
+            mm->identity = decode_id13_field(((msg[5] & 0x1f) << 8) | msg[6]);
         }
     }
     mm->phase_corrected = 0; // Set to 1 by the caller if needed.

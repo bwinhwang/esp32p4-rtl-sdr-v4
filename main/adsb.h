@@ -45,6 +45,7 @@ typedef struct {
     int         ns_velocity;
     int         vert_rate;      /* ft/min */
     int         squawk;         /* 0 = none received yet */
+    uint8_t     emergency;      /* TC28 state, 0 = none; the 7x00 squawks are the other signal */
     uint8_t     sig;            /* signal_level of the last frame, 0-255, relative */
     int         msg_count;
     int64_t     last_seen_us;

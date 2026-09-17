@@ -166,7 +166,7 @@ entry points declared in `shell.h` over a common `log_put()`:
 | | covers | LOG panel | reaches a prompt at |
 |---|---|---|---|
 | `sys_log()` | the board — USB, IQ stream, WiFi, Ethernet, OTA, web server, console | **no** | `sys` and above |
-| `air_log()` | the sky — CONTACT / IDENT / SQUAWK / FIX / LOST; ALT / VEL in colour 0 are **measurements**, echoed at `all` but never stored | yes | `brief` (colours 1 and 4 only) and `all` |
+| `air_log()` | the sky — CONTACT / IDENT / SQUAWK / EMERG / FIX / LOST; ALT / VEL in colour 0 are **measurements**, echoed at `all` but never stored | yes | `brief` (colours 1 and 4 only) and `all` |
 | `ui_log()` | the display answering a key — `leave_screen()`'s refusal | yes | `all` only |
 
 The split is on both ends: the panel is aircraft-only, the prompt board-only by default. A board
