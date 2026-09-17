@@ -169,14 +169,25 @@ ssh_srv             core0 prio 3   accept loop; runs the line editor and the com
   `class_driver.c` (enumeration bookkeeping). Never in the same TU, so it compiles. `cmd_usb()`
   declares the `esp_libusb_stream_*` prototypes locally for this reason.
 - `mode-s.c` is dump1090-derived. `mode_s_detect()` fills `timestamp_12mhz`/`signal_level` itself
-  from a caller-supplied buffer timestamp (2 MSPS ⇒ 6 ticks/sample at Beast's 12 MHz). CPR
-  lat/lon is decoded downstream in `class_driver.c`'s `cpr_decode()` into `aircraft_t`, not in
-  `mode_s_msg`. What it decodes for the table is deliberately small: DF17 TC1-4/9-18/19/28,
-  altitude from DF0/4/16/20, squawk from DF5/21. Everything else that passes CRC (DF11 CA,
-  DF18, Comm-B/Comm-D payloads, the other TCs) goes out raw on AVR/Beast for readsb; DF18 in
-  particular is forwarded but never enters the table (CF 1/5 carry non-ICAO addresses).
-  The length table is `type & 0x10`, not dump1090's 16/17/19/20/21 list — that list truncated
-  DF18 and DF24-31 to 56 bits, so they failed CRC and never reached the feeds at all.
+  from a caller-supplied buffer timestamp (2 MSPS ⇒ 6 ticks/sample at Beast's 12 MHz). It
+  leaves CPR as raw 17-bit fields plus `cpr_valid`/`cpr_surface`; `cpr.c` is the pure math
+  (global airborne, global surface, single-frame relative — passes readsb's `cprtests.c`
+  vectors unchanged) and `class_driver.c`'s `decode_position()` is the policy: an even/odd pair
+  of the same kind within 10 s first, else one frame relative to the aircraft's own fix while
+  that is under 10 min old and the result within 100 NM of it. **No receiver-relative
+  single-frame decode** — it needs a trusted maximum range to stay unambiguous. Surface pairs
+  are ambiguous to a 90° quadrant and take the antenna position as reference, else the
+  aircraft's last airborne fix; with neither, a target that was never seen airborne gets no
+  fix. `position_plausible()` drops a fix implying >~970 kt from the last one, three strikes
+  and the new one wins (the *reference* may be the bad one).
+  What it decodes for the table is deliberately small: DF17 TC0/5-8/9-18/20-22 (position,
+  altitude — `alt_geom` marks HAE — movement/track on the ground), TC1-4, TC19 (sub 3/4 give
+  heading and vertical rate only; IAS/TAS are left to readsb), TC28 sub 1; altitude from
+  DF0/4/16/20, squawk from DF5/21. Everything else that passes CRC (DF11 CA, DF18,
+  Comm-B/Comm-D payloads, TC29/31) goes out raw on AVR/Beast for readsb; DF18 in particular is
+  forwarded but never enters the table (CF 1/5 carry non-ICAO addresses). The length table is
+  `type & 0x10`, not dump1090's 16/17/19/20/21 list — that list truncated DF18 and DF24-31 to
+  56 bits, so they failed CRC and never reached the feeds at all.
 - **API polarity traps**: `rtlsdr_get_tuner_pll_locked()` returns **1 for locked**, 0 unlocked,
   -1 unknown — not librtlsdr's 0-is-success convention. The dongle has no gain-*mode* getter and
   keeps returning the last manual value under AGC, so `cmd_sdr()` mirrors the mode in a static.
@@ -217,8 +228,8 @@ release/acquire pair on `s_pos_req` because unlike `s_inject_req` the flag carri
 `nvs_flash_init()` + `adsb_pos_init()` are the first things after `shell_init()` in `app_main`
 -- `tui_init()`, the first decoded fix and `net_ssh_start()`'s `load_login()` all read NVS
 before `wifi_mgr` (where the init used to live) is guaranteed to have run. The feeds never
-touch it: AVR/Beast carry raw frames, JSON the aircraft's own lat/lon, and `cpr_decode()` is
-global-only (no receiver-relative branch).
+touch it: AVR/Beast carry raw frames, JSON the aircraft's own lat/lon; `decode_position()`
+reads it only as the quadrant reference for surface pairs, never to place an airborne frame.
 
 **TUI column budget** (`tui.c`): 120 columns = 85-column left block (table above, map below)
 + `│` + space + 33-column event log running the full height. Every table row is exactly

@@ -286,6 +286,21 @@ int brute_force_ap(mode_s_t *self, unsigned char *msg, struct mode_s_msg *mm)
     return 0;
 }
 
+// TC5-8 movement field: 7 bits of ground speed in ranges of growing width.
+// Returns the midpoint of the range, 0 for stopped/no data/reserved.
+static double decode_movement(int mv)
+{
+    if (mv >= 125) return 0;
+    if (mv == 124) return 180;                       // > 175 kt, pick a value
+    if (mv >= 109) return 100 + (mv - 109 + 0.5) * 5;
+    if (mv >= 94)  return 70 + (mv - 94 + 0.5) * 2;
+    if (mv >= 39)  return 15 + (mv - 39 + 0.5);
+    if (mv >= 13)  return 2 + (mv - 13 + 0.5) * 0.5;
+    if (mv >= 9)   return 1 + (mv - 9 + 0.5) * 0.25;
+    if (mv >= 2)   return 0.125 + (mv - 2 + 0.5) * 0.125;
+    return 0;                                        // 1 stopped, 0 no data
+}
+
 // The 13-bit identity field, as carried in DF5/21 (message bits 20-32) and
 // in the TC28 aircraft-status ME (bits 12-24), is Gillham-interleaved:
 //
@@ -486,34 +501,80 @@ void mode_s_decode(mode_s_t *self, struct mode_s_msg *mm, unsigned char *msg)
             mm->flight[7] = ais_charset[msg[10] & 63];
             mm->flight[8] = '\0';
         }
-        else if (mm->metype >= 9 && mm->metype <= 18)
+        else if (mm->metype == 0 ||
+                 (mm->metype >= 9 && mm->metype <= 18) ||
+                 (mm->metype >= 20 && mm->metype <= 22))
         {
-            // Airborne position Message
+            // Airborne position: TC9-18 barometric altitude, TC20-22
+            // geometric (HAE), TC0 altitude only with no position.
+            mm->altitude = decode_ac12_field(msg, &mm->unit);
+            mm->alt_geom = mm->metype >= 20;
+            if (mm->metype != 0)
+            {
+                mm->fflag = msg[6] & (1 << 2);
+                mm->tflag = msg[6] & (1 << 3);
+                mm->raw_latitude = ((msg[6] & 3) << 15) |
+                                   (msg[7] << 7) |
+                                   (msg[8] >> 1);
+                mm->raw_longitude = ((msg[8] & 1) << 16) |
+                                    (msg[9] << 8) |
+                                    msg[10];
+                /* A known transponder failure mode (readsb filters the same
+                 * signature): TC15 with zero altitude, zero longitude and a
+                 * latitude ending in 12 zero bits is not a position. */
+                int ac12 = (msg[5] << 4) | (msg[6] >> 4);
+                mm->cpr_valid = !(mm->metype == 15 && ac12 == 0 &&
+                                  mm->raw_longitude == 0 &&
+                                  (mm->raw_latitude & 0x0fff) == 0);
+            }
+        }
+        else if (mm->metype >= 5 && mm->metype <= 8)
+        {
+            // Surface position: no altitude; movement and ground track
+            // instead, and CPR in quarter-size cells (see cpr.h).
+            int movement = ((msg[4] & 7) << 4) | (msg[5] >> 4);
+            if (movement >= 1 && movement <= 124)
+            {
+                mm->velocity = (int)(decode_movement(movement) + 0.5);
+                mm->gs_valid = 1;
+            }
+            if (msg[5] & 0x08)
+            {
+                mm->heading_is_valid = 1;
+                mm->heading = (int)((((msg[5] & 7) << 4) | (msg[6] >> 4)) * 360.0 / 128 + 0.5) % 360;
+            }
             mm->fflag = msg[6] & (1 << 2);
             mm->tflag = msg[6] & (1 << 3);
-            mm->altitude = decode_ac12_field(msg, &mm->unit);
             mm->raw_latitude = ((msg[6] & 3) << 15) |
                                (msg[7] << 7) |
                                (msg[8] >> 1);
             mm->raw_longitude = ((msg[8] & 1) << 16) |
                                 (msg[9] << 8) |
                                 msg[10];
+            mm->cpr_valid = 1;
+            mm->cpr_surface = 1;
         }
         else if (mm->metype == 19 && mm->mesub >= 1 && mm->mesub <= 4)
         {
             // Airborne Velocity Message
             if (mm->mesub == 1 || mm->mesub == 2)
             {
+                // Ground speed as E/W and N/S components. The 10-bit fields
+                // are biased by one (0 = no data); subtype 2 is the
+                // supersonic encoding in 4 kt steps.
+                int ew_raw = ((msg[5] & 3) << 8) | msg[6];
+                int ns_raw = ((msg[7] & 0x7f) << 3) | ((msg[8] & 0xe0) >> 5);
                 mm->ew_dir = (msg[5] & 4) >> 2;
-                mm->ew_velocity = ((msg[5] & 3) << 8) | msg[6];
                 mm->ns_dir = (msg[7] & 0x80) >> 7;
-                mm->ns_velocity = ((msg[7] & 0x7f) << 3) | ((msg[8] & 0xe0) >> 5);
-                mm->vert_rate_source = (msg[8] & 0x10) >> 4;
-                mm->vert_rate_sign = (msg[8] & 0x8) >> 3;
-                mm->vert_rate = ((msg[8] & 7) << 6) | ((msg[9] & 0xfc) >> 2);
-                // Compute velocity and angle from the two speed components
-                mm->velocity = sqrt(mm->ns_velocity * mm->ns_velocity +
-                                    mm->ew_velocity * mm->ew_velocity);
+                if (ew_raw && ns_raw)
+                {
+                    int scale = mm->mesub == 2 ? 4 : 1;
+                    mm->ew_velocity = (ew_raw - 1) * scale;
+                    mm->ns_velocity = (ns_raw - 1) * scale;
+                    mm->velocity = (int)(sqrt((double)mm->ns_velocity * mm->ns_velocity +
+                                              (double)mm->ew_velocity * mm->ew_velocity) + 0.5);
+                    mm->gs_valid = 1;
+                }
                 if (mm->velocity)
                 {
                     int ewv = mm->ew_velocity;
@@ -537,17 +598,18 @@ void mode_s_decode(mode_s_t *self, struct mode_s_msg *mm, unsigned char *msg)
                      * heading, since sub 1/2 is the common airborne case. */
                     mm->heading_is_valid = 1;
                 }
-                else
-                {
-                    mm->heading = 0;
-                }
             }
             else if (mm->mesub == 3 || mm->mesub == 4)
             {
+                // Airspeed subtypes (GNSS velocity unavailable): magnetic or
+                // true heading; the IAS/TAS field is left to readsb.
                 mm->heading_is_valid = msg[5] & (1 << 2);
-                mm->heading = (360.0 / 128) * (((msg[5] & 3) << 5) |
-                                               (msg[6] >> 3));
+                mm->heading = (int)((((msg[5] & 3) << 8) | msg[6]) * 360.0 / 1024 + 0.5) % 360;
             }
+            // Vertical rate sits at the same bits in all four subtypes.
+            mm->vert_rate_source = (msg[8] & 0x10) >> 4;
+            mm->vert_rate_sign = (msg[8] & 0x8) >> 3;
+            mm->vert_rate = ((msg[8] & 7) << 6) | ((msg[9] & 0xfc) >> 2);
         }
         else if (mm->metype == 28 && mm->mesub == 1)
         {

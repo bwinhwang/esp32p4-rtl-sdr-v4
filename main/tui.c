@@ -352,12 +352,13 @@ static void draw_row(const aircraft_t *a, int64_t now)
 {
     int  seen  = (int)((now - a->last_seen_us) / 1000000);
     bool stale = seen > STALE_S;
-    bool emerg = a->squawk == 7500 || a->squawk == 7600 || a->squawk == 7700;
+    bool emerg = ac_emergency(a);
 
     char sqk[6] = "----", alt[8] = "--", spd[6] = "--", hdg[5] = "---";
     char vs[12] = "--",   dist[6] = "--", brg[5] = "---";
-    if (a->squawk)   snprintf(sqk, sizeof(sqk), "%04d", a->squawk);
-    if (a->altitude) snprintf(alt, sizeof(alt), "%d",   a->altitude);
+    if (a->squawk)    snprintf(sqk, sizeof(sqk), "%04d", a->squawk);
+    if (a->on_ground) snprintf(alt, sizeof(alt), "GND");
+    else if (a->altitude) snprintf(alt, sizeof(alt), "%d", a->altitude);
     if (a->velocity) {
         snprintf(spd, sizeof(spd), "%d",   a->velocity);
         snprintf(hdg, sizeof(hdg), "%03d", a->heading);

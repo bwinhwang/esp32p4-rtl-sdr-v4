@@ -24,6 +24,7 @@
 #include "es8311_codec.h"
 #include "rtl-sdr.h"
 #include "mode-s.h"
+#include "cpr.h"
 #include "esp_task_wdt.h"
 #include "nvs_flash.h"
 #include "feed_avr.h"
@@ -319,128 +320,6 @@ esp_err_t audio_init(void)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * CPR DECODE
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-static int cpr_nl(double lat)
-{
-    if (lat < 0) lat = -lat;
-    if (lat < 10.47047130) return 59;
-    if (lat < 14.82817437) return 58;
-    if (lat < 18.18626357) return 57;
-    if (lat < 21.02939493) return 56;
-    if (lat < 23.54504487) return 55;
-    if (lat < 25.82924707) return 54;
-    if (lat < 27.93898710) return 53;
-    if (lat < 29.91135686) return 52;
-    if (lat < 31.77209708) return 51;
-    if (lat < 33.53993436) return 50;
-    if (lat < 35.22899598) return 49;
-    if (lat < 36.85025108) return 48;
-    if (lat < 38.41241892) return 47;
-    if (lat < 39.92256684) return 46;
-    if (lat < 41.38651832) return 45;
-    if (lat < 42.80914012) return 44;
-    if (lat < 44.19454951) return 43;
-    if (lat < 45.54626723) return 42;
-    if (lat < 46.86733252) return 41;
-    if (lat < 48.16039128) return 40;
-    if (lat < 49.42776439) return 39;
-    if (lat < 50.67150166) return 38;
-    if (lat < 51.89342469) return 37;
-    if (lat < 53.09516153) return 36;
-    if (lat < 54.27817472) return 35;
-    if (lat < 55.44378444) return 34;
-    if (lat < 56.59318756) return 33;
-    if (lat < 57.72747354) return 32;
-    if (lat < 58.84763776) return 31;
-    if (lat < 59.95459277) return 30;
-    if (lat < 61.04917774) return 29;
-    if (lat < 62.13216659) return 28;
-    if (lat < 63.20427479) return 27;
-    if (lat < 64.26616523) return 26;
-    if (lat < 65.31845310) return 25;
-    if (lat < 66.36171008) return 24;
-    if (lat < 67.39646774) return 23;
-    if (lat < 68.42322022) return 22;
-    if (lat < 69.44242631) return 21;
-    if (lat < 70.45451075) return 20;
-    if (lat < 71.45986473) return 19;
-    if (lat < 72.45884545) return 18;
-    if (lat < 73.45177442) return 17;
-    if (lat < 74.43893416) return 16;
-    if (lat < 75.42056257) return 15;
-    if (lat < 76.39684391) return 14;
-    if (lat < 77.36789461) return 13;
-    if (lat < 78.33374083) return 12;
-    if (lat < 79.29428225) return 11;
-    if (lat < 80.24923213) return 10;
-    if (lat < 81.19801349) return 9;
-    if (lat < 82.13956981) return 8;
-    if (lat < 83.07199445) return 7;
-    if (lat < 83.99173563) return 6;
-    if (lat < 84.89166191) return 5;
-    if (lat < 85.75541621) return 4;
-    if (lat < 86.53536998) return 3;
-    if (lat < 87.00000000) return 2;
-    return 1;
-}
-
-/* The CPR latitude/longitude indices j and m are routinely negative, and C's
- * fmod() keeps the sign of the dividend -- dump1090 uses its own modulo that
- * wraps into [0,b) for exactly this reason. With fmod() a j of -55 yields a
- * latitude ~360 degrees off (and cpr_nl() then rejects the pair, or worse,
- * doesn't). */
-static double cpr_mod(double a, double b)
-{
-    double r = fmod(a, b);
-    return r < 0.0 ? r + b : r;
-}
-
-static bool cpr_decode(aircraft_t *a)
-{
-    if (!a->cpr_even.valid || !a->cpr_odd.valid) return false;
-    int64_t dt = a->cpr_even.ts_us - a->cpr_odd.ts_us;
-    if (dt < 0) dt = -dt;
-    if (dt > 10000000LL) return false;
-
-    double rlat0 = a->cpr_even.raw_lat / 131072.0;
-    double rlat1 = a->cpr_odd.raw_lat  / 131072.0;
-    double rlon0 = a->cpr_even.raw_lon / 131072.0;
-    double rlon1 = a->cpr_odd.raw_lon  / 131072.0;
-
-    double dlat0 = 360.0 / 60.0;
-    double dlat1 = 360.0 / 59.0;
-    double j     = floor(59.0 * rlat0 - 60.0 * rlat1 + 0.5);
-
-    double lat0 = dlat0 * (cpr_mod(j, 60.0) + rlat0);
-    double lat1 = dlat1 * (cpr_mod(j, 59.0) + rlat1);
-    if (lat0 >= 270.0) lat0 -= 360.0;
-    if (lat1 >= 270.0) lat1 -= 360.0;
-
-    if (cpr_nl(lat0) != cpr_nl(lat1)) return false;
-
-    double lat, rlon, dlon;
-    int nl;
-    if (a->cpr_even.ts_us >= a->cpr_odd.ts_us) {
-        lat  = lat0; nl = cpr_nl(lat0); rlon = rlon0;
-    } else {
-        lat  = lat1; nl = cpr_nl(lat1); if (nl > 0) nl--; rlon = rlon1;
-    }
-    dlon = 360.0 / (nl > 0 ? nl : 1);
-
-    double m   = floor(rlon0 * (cpr_nl(lat) - 1) -
-                       rlon1 *  cpr_nl(lat)       + 0.5);
-    double lon = dlon * (cpr_mod(m, (nl > 0 ? nl : 1)) + rlon);
-    if (lon >= 180.0) lon -= 360.0;
-
-    a->lat = (float)lat;
-    a->lon = (float)lon;
-    a->pos_valid = true;
-    return true;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
  * LOG / AIRCRAFT HELPERS
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -674,15 +553,86 @@ esp_err_t adsb_pos_clear(void)
 }
 
 /* Equirectangular is plenty at ADS-B ranges: under 0.5% error at 400 km. */
+static float flat_dist_km(float lat0, float lon0, float lat1, float lon1, float *brg)
+{
+    float dy = (lat1 - lat0) * 111.32f;
+    float dx = (lon1 - lon0) * 111.32f * cosf(lat0 * (float)M_PI / 180.0f);
+    if (brg) {
+        float b = atan2f(dx, dy) * 180.0f / (float)M_PI;
+        *brg = b < 0 ? b + 360.0f : b;
+    }
+    return sqrtf(dx * dx + dy * dy);
+}
+
 static void update_range(aircraft_t *a)
 {
     a->rng_valid = a->pos_valid && s_pos.valid;
     if (!a->rng_valid) return;
-    float dy = (a->lat - s_pos.lat) * 111.32f;
-    float dx = (a->lon - s_pos.lon) * 111.32f * cosf(s_pos.lat * (float)M_PI / 180.0f);
-    a->dist_km = sqrtf(dx * dx + dy * dy);
-    float brg  = atan2f(dx, dy) * 180.0f / (float)M_PI;
-    a->brg_deg = brg < 0 ? brg + 360.0f : brg;
+    a->dist_km = flat_dist_km(s_pos.lat, s_pos.lon, a->lat, a->lon, &a->brg_deg);
+}
+
+/* ── position from a CPR frame ────────────────────────────────────────────
+ * Global first (an even/odd pair of the same kind within 10 s), else a single
+ * frame relative to the aircraft's own last fix while that is under 10 min
+ * old -- readsb's rule: 100 NM in 10 min is 600 kt, and a wrong cell would
+ * need 260 NM, so the bound cannot be met by a mistake. Surface pairs are
+ * ambiguous to a 90-degree quadrant and want a reference: the antenna, else
+ * the aircraft's own last fix (it was airborne before it landed). No
+ * receiver-relative single-frame decode: it needs a trusted maximum range to
+ * stay unambiguous, and the pair arrives within a second anyway. */
+#define POS_REF_MAX_AGE_US  (10 * 60 * 1000000LL)
+#define POS_PAIR_MAX_DT_US  (10 * 1000000LL)
+#define POS_REF_MAX_KM      185.0f      /* 100 NM */
+
+static bool decode_position(aircraft_t *a, const struct mode_s_msg *mm, int64_t now,
+                            double *lat, double *lon)
+{
+    bool surface = mm->cpr_surface;
+    const cpr_frame_t *e = &a->cpr_even, *o = &a->cpr_odd;
+    int64_t dt = e->ts_us - o->ts_us;
+    if (dt < 0) dt = -dt;
+
+    if (e->valid && o->valid && e->surface == o->surface && dt <= POS_PAIR_MAX_DT_US) {
+        bool odd_latest = o->ts_us >= e->ts_us;
+        int r;
+        if (!surface)
+            r = cpr_decode_airborne(e->raw_lat, e->raw_lon, o->raw_lat, o->raw_lon, odd_latest, lat, lon);
+        else if (s_pos.valid)
+            r = cpr_decode_surface(s_pos.lat, s_pos.lon, e->raw_lat, e->raw_lon, o->raw_lat, o->raw_lon, odd_latest, lat, lon);
+        else if (a->pos_valid)
+            r = cpr_decode_surface(a->lat, a->lon, e->raw_lat, e->raw_lon, o->raw_lat, o->raw_lon, odd_latest, lat, lon);
+        else
+            r = -1;
+        if (r == 0) return true;
+    }
+
+    if (a->pos_valid && now - a->pos_us < POS_REF_MAX_AGE_US
+        && cpr_decode_relative(a->lat, a->lon, mm->raw_latitude, mm->raw_longitude,
+                               mm->fflag != 0, surface, lat, lon) == 0
+        && flat_dist_km(a->lat, a->lon, (float)*lat, (float)*lon, NULL) <= POS_REF_MAX_KM)
+        return true;
+
+    return false;
+}
+
+/* A fix that implies an impossible jump from the last one is dropped -- a
+ * corrected bit landing in the CPR field decodes to a clean-looking position
+ * somewhere else. Three rejections in a row mean the *reference* is the bad
+ * one (or the aircraft really did teleport, e.g. a reused address), so the
+ * fourth is taken and becomes the new reference. */
+static bool position_plausible(aircraft_t *a, double lat, double lon, int64_t now)
+{
+    if (!a->pos_valid || now - a->pos_us >= POS_REF_MAX_AGE_US) return true;
+    float dt_s   = (float)(now - a->pos_us) / 1e6f;
+    float max_km = 2.0f + dt_s * 0.5f;          /* ~970 kt plus slack */
+    if (max_km > POS_REF_MAX_KM) max_km = POS_REF_MAX_KM;
+    if (flat_dist_km(a->lat, a->lon, (float)lat, (float)lon, NULL) <= max_km) {
+        a->pos_rejects = 0;
+        return true;
+    }
+    if (++a->pos_rejects < 3) return false;
+    a->pos_rejects = 0;
+    return true;
 }
 
 /* Once a second, in adsb_rx_task: expires contacts and closes the rate
@@ -777,18 +727,21 @@ size_t aircraft_export_ndjson(char *buf, size_t bufsize)
         aircraft_t *a = &s_aircraft[i];
         if (!a->active || now - a->last_seen_us > 60000000LL) continue;
 
-        char latbuf[16] = "null", lonbuf[16] = "null";
+        char latbuf[16] = "null", lonbuf[16] = "null", altbuf[16];
+        if (a->on_ground) snprintf(altbuf, sizeof(altbuf), "\"ground\"");
+        else              snprintf(altbuf, sizeof(altbuf), "%d", a->altitude);
         if (a->pos_valid) {
             snprintf(latbuf, sizeof(latbuf), "%.5f", a->lat);
             snprintf(lonbuf, sizeof(lonbuf), "%.5f", a->lon);
         }
 
         n = json_append(buf, bufsize, n,
-                "%s{\"hex\":\"%06lx\",\"flight\":\"%s\",\"alt_baro\":%d,"
+                "%s{\"hex\":\"%06lx\",\"flight\":\"%s\",\"%s\":%s,"
                 "\"gs\":%d,\"track\":%d,\"vert_rate\":%d,\"lat\":%s,\"lon\":%s,"
                 "\"category\":\"%s\",\"messages\":%d,\"seen\":%.1f}",
                 first ? "" : ",", (unsigned long)a->icao, a->callsign,
-                a->altitude, a->velocity, a->heading, a->vert_rate,
+                a->alt_geom ? "alt_geom" : "alt_baro", altbuf,
+                a->velocity, a->heading, a->vert_rate,
                 latbuf, lonbuf, plane_cat_label(a->category), a->msg_count,
                 (double)(now - a->last_seen_us) / 1e6);
         first = false;
@@ -867,13 +820,16 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
         a->emergency = mm->emergency;
     }
 
-    if (mm->altitude)         a->altitude  = mm->altitude;
+    if (mm->altitude) {
+        a->altitude = mm->altitude;
+        a->alt_geom = mm->alt_geom;
+    }
     if (mm->heading_is_valid) a->heading   = mm->heading;
-    if (mm->velocity)         a->velocity  = mm->velocity;
-    if (mm->ew_velocity)
+    if (mm->gs_valid) {
+        a->velocity    = mm->velocity;
         a->ew_velocity = mm->ew_dir ? -mm->ew_velocity : mm->ew_velocity;
-    if (mm->ns_velocity)
         a->ns_velocity = mm->ns_dir ? -mm->ns_velocity : mm->ns_velocity;
+    }
     /* mm->vert_rate is the raw 9-bit field as dump1090 leaves it: 0 means "no
      * information", otherwise it's 64 ft/min steps biased by one. The table's
      * climb/descent thresholds are in ft/min, so convert here or every
@@ -884,15 +840,18 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
     }
 
     /* CPR position */
-    if (mm->msgtype == 17 && mm->metype >= 9 && mm->metype <= 18
-        && mm->raw_latitude != 0) {
+    if (mm->cpr_valid) {
         int64_t ts = esp_timer_get_time();
-        if (mm->fflag == 0)
-            a->cpr_even = (cpr_frame_t){ mm->raw_latitude, mm->raw_longitude, ts, true };
-        else
-            a->cpr_odd  = (cpr_frame_t){ mm->raw_latitude, mm->raw_longitude, ts, true };
-        bool was_valid = a->pos_valid;
-        if (cpr_decode(a)) {
+        cpr_frame_t *f = mm->fflag ? &a->cpr_odd : &a->cpr_even;
+        *f = (cpr_frame_t){ mm->raw_latitude, mm->raw_longitude, ts, mm->cpr_surface != 0, true };
+        a->on_ground = mm->cpr_surface != 0;
+        bool   was_valid = a->pos_valid;
+        double lat, lon;
+        if (decode_position(a, mm, ts, &lat, &lon) && position_plausible(a, lat, lon, ts)) {
+            a->lat       = (float)lat;
+            a->lon       = (float)lon;
+            a->pos_valid = true;
+            a->pos_us    = ts;
             update_range(a);
             /* A CPR pair straddling a zone boundary decodes to somewhere
              * absurd; no real 1090 MHz reception reaches this far. */
@@ -909,9 +868,12 @@ static void on_msg(mode_s_t *self, struct mode_s_msg *mm)
     }
 
     if (mm->msgtype == 17) {
-        if (mm->metype >= 9 && mm->metype <= 18 && mm->altitude)
-            air_log(0, "ALT      %06lX  %d ft", (unsigned long)icao, a->altitude);
-        else if (mm->metype >= 19 && mm->metype <= 22 && mm->velocity)
+        if (mm->altitude)
+            air_log(0, "ALT      %06lX  %d ft%s", (unsigned long)icao, a->altitude,
+                    a->alt_geom ? " geom" : "");
+        else if (mm->cpr_surface && mm->gs_valid)
+            air_log(0, "GND      %06lX  %d kt  hdg=%d", (unsigned long)icao, a->velocity, a->heading);
+        else if (mm->metype == 19 && mm->gs_valid)
             air_log(0, "VEL      %06lX  %d kt  hdg=%d  vs=%d",
                     (unsigned long)icao, a->velocity, a->heading, a->vert_rate);
     }

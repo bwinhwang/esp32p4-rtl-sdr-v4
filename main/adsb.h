@@ -26,6 +26,7 @@ typedef struct {
     int     raw_lat;
     int     raw_lon;
     int64_t ts_us;
+    bool    surface;    /* TC5-8 encoding; pairs only with its own kind */
     bool    valid;
 } cpr_frame_t;
 
@@ -33,11 +34,15 @@ typedef struct {
     uint32_t    icao;
     char        callsign[9];
     int         altitude;
+    bool        alt_geom;       /* altitude is geometric (TC20-22), not barometric */
+    bool        on_ground;      /* last position message was a surface one */
     int         velocity;
     int         heading;
     float       lat;
     float       lon;
     bool        pos_valid;
+    int64_t     pos_us;         /* when lat/lon were last accepted */
+    uint8_t     pos_rejects;    /* consecutive fixes dropped as implausible */
     float       dist_km;        /* from the antenna position; valid with rng_valid */
     float       brg_deg;        /* 0..360, true north */
     bool        rng_valid;      /* pos_valid AND an antenna position is set */

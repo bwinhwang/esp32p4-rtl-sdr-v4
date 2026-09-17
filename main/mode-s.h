@@ -67,7 +67,11 @@ struct mode_s_msg
     int vert_rate_source; // Vertical rate source.
     int vert_rate_sign;   // Vertical rate sign.
     int vert_rate;        // Vertical rate.
-    int velocity;         // Computed from EW and NS velocity.
+    int velocity;         // Ground speed, kt: from EW/NS (TC19) or movement (TC5-8).
+    int gs_valid;         // velocity carries a value, including a real 0
+    int cpr_valid;        // raw_latitude/raw_longitude carry a position
+    int cpr_surface;      // ...in the surface encoding (TC5-8, on the ground)
+    int alt_geom;         // altitude is geometric (TC20-22), not barometric
     int emergency_valid;  // TC28 subtype 1 seen; `identity` is its squawk.
     int emergency;        // 0 none, 1 general, 2 lifeguard, 3 min fuel,
                           // 4 no comms, 5 unlawful interference, 6 downed.
