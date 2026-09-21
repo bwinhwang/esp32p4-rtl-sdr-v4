@@ -257,11 +257,13 @@ before `wifi_mgr` (where the init used to live) is guaranteed to have run. The f
 touch it: AVR/Beast carry raw frames, JSON the aircraft's own lat/lon; `decode_position()`
 reads it only as the quadrant reference for surface pairs, never to place an airborne frame.
 
-**TUI column budget** (`tui.c`): 120 columns = 85-column left block (table above, map below)
-+ `│` + space + 33-column event log running the full height. Every table row is exactly
-`TABLE_W` wide because every field is fixed width and clamped (`dist` 9999, `msgs` 99999, `vs`
-±9999); a new column changes `TABLE_W`, the header format and `ROW_FMT` together or the divider
-shifts. Height follows the terminal (`tui_set_rows()`; SSH reports it, serial assumes 40 unless
+**TUI column budget** (`tui.c`): 120 columns. The table has the full width on top (107 used,
+every field fixed width and clamped: `dist` 9999, `msgs` 99999, `vs` ±9999; a new column
+changes the header format, `ROW_FMT` and the coloured `fb_printf` in `draw_row()` together or
+the columns drift), then a rule, then the 85-column map (`MAP_W`) + `│` + space + 33-column
+event log beside it, `EVENT LOG` on the map title line. `SEL ft`/`QNH` read `opt_f_t` fields
+through `OPT_FRESH`, so they blank 60 s after the interrogator stops asking, like the JSON
+export. Height follows the terminal (`tui_set_rows()`; SSH reports it, serial assumes 40 unless
 `tui <rows>`), map first: the table is sized to its contents and the map takes the rest, never
 under `MAP_MIN_ROWS` (21) -- a crowded table loses rows before the map shrinks. The map's scale
 is rows: the zoom range spans the centre row to the top row, columns follow at `MAP_ASPECT`.

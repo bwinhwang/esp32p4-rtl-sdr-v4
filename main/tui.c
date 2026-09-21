@@ -18,9 +18,8 @@
 #define TUI_REFRESH_MS  500
 
 #define TUI_COLS        120
-#define TABLE_W         85      /* every table row is exactly this wide, and the map under it */
-#define LOG_W           (TUI_COLS - TABLE_W - 2)    /* the column to the right of "│ " */
-#define MAP_W           TABLE_W
+#define MAP_W           85      /* the map, with the event log beside it */
+#define LOG_W           (TUI_COLS - MAP_W - 2)      /* the column to the right of "│ " */
 /* The map's scale comes from its row count: the top and bottom rows are the
  * zoom range north and south of the antenna, and the width shows whatever
  * falls in it east and west. Rows are odd so the antenna has a centre row.
@@ -347,7 +346,7 @@ static void sort_idx(const aircraft_t *ac, int *idx, int n)
     }
 }
 
-static const char ROW_FMT[] = "  %06lX  %-8s  %-3s  %4s  %6s  %4s  %3s  %5s  %4s  %3s  %3u  %5d  %4d ";
+static const char ROW_FMT[] = "  %06lX  %-8s  %-3s  %-4s  %4s  %6s  %4s  %3s  %5s  %6s  %6s  %4s  %3s  %3u  %5d  %4d ";
 
 static void draw_row(const aircraft_t *a, int64_t now)
 {
@@ -357,6 +356,7 @@ static void draw_row(const aircraft_t *a, int64_t now)
 
     char sqk[6] = "----", alt[8] = "--", spd[6] = "--", hdg[5] = "---";
     char vs[12] = "--",   dist[6] = "--", brg[5] = "---";
+    char sel[8] = "--",   qnh[8] = "--",   emit[4] = "--";
     if (a->squawk)    snprintf(sqk, sizeof(sqk), "%04d", a->squawk);
     if (a->on_ground) snprintf(alt, sizeof(alt), "GND");
     else if (a->altitude) snprintf(alt, sizeof(alt), "%d", a->altitude);
@@ -366,6 +366,12 @@ static void draw_row(const aircraft_t *a, int64_t now)
     }
     int vr = a->vert_rate > 9999 ? 9999 : a->vert_rate < -9999 ? -9999 : a->vert_rate;
     if (vr > 200 || vr < -200) snprintf(vs, sizeof(vs), "%+d", vr);
+    /* Selected altitude: the MCP/FCU one, the FMS one only when that is all
+     * we have. Both come from registers an interrogator may stop asking for,
+     * so they expire with OPT_FRESH like the JSON export. */
+    if (OPT_FRESH(a->nav_alt_mcp, now))      snprintf(sel, sizeof(sel), "%.0f", a->nav_alt_mcp.v);
+    else if (OPT_FRESH(a->nav_alt_fms, now)) snprintf(sel, sizeof(sel), "%.0f", a->nav_alt_fms.v);
+    if (OPT_FRESH(a->nav_qnh, now))          snprintf(qnh, sizeof(qnh), "%.1f", a->nav_qnh.v);
     if (a->rng_valid) {
         snprintf(dist, sizeof(dist), "%.0f",   a->dist_km > 9999.0f ? 9999.0f : a->dist_km);
         snprintf(brg,  sizeof(brg),  "%03.0f", a->brg_deg);
@@ -373,11 +379,12 @@ static void draw_row(const aircraft_t *a, int64_t now)
     int         msgs = a->msg_count > 99999 ? 99999 : a->msg_count;
     const char *cs   = a->callsign[0] ? a->callsign : "--------";
     const char *cat  = plane_cat_label(a->category);
+    if (a->emitter) plane_emitter_label(a->emitter, emit);
 
     if (stale || emerg) {
         fb_puts(emerg ? AC_RED BOLD : PH_DIM);
-        fb_printf(ROW_FMT, (unsigned long)a->icao, cs, cat, sqk, alt, spd, hdg, vs,
-                  dist, brg, (unsigned)a->sig, msgs, seen);
+        fb_printf(ROW_FMT, (unsigned long)a->icao, cs, cat, emit, sqk, alt, spd, hdg, vs,
+                  sel, qnh, dist, brg, (unsigned)a->sig, msgs, seen);
         fb_puts(RESET);
         return;
     }
@@ -391,19 +398,21 @@ static void draw_row(const aircraft_t *a, int64_t now)
     fb_printf("  " AC_CYAN "%06lX"
               "  %s%-8s"
               "  %s%-3s"
-              "  " PH_MID "%4s"
+              "  " PH_MID "%-4s  %4s"
               "  %s%6s"
               "  " PH_MID "%4s  %3s"
               "  %s%5s"
-              "  " PH_MID "%4s  %3s  %3u"
+              "  " PH_MID "%6s  %6s"
+              "  %4s  %3s  %3u"
               "  " PH_DIM "%5d  %4d " RESET,
               (unsigned long)a->icao,
               a->callsign[0] ? PH_HI : PH_DIM, cs,
               cat_col, cat,
-              sqk,
+              emit, sqk,
               alt_col, alt,
               spd, hdg,
               vs_col, vs,
+              sel, qnh,
               dist, brg, (unsigned)a->sig,
               msgs, seen);
 }
@@ -492,45 +501,43 @@ static void tui_draw(int64_t now)
     if (!s_pos_ok)      snprintf(note + nl, sizeof(note) - nl, " (no antenna position: `pos <lat> <lon>`)");
     else if (!s_map_ok) snprintf(note + nl, sizeof(note) - nl, " (map baked elsewhere: rerun tools/mkmap.py)");
 
-    /* The log column runs beside everything -- table, rule, map title and
-     * map -- newest first from the top, so it is as tall as the terminal
-     * and the latest event is always level with the table header. */
+    /* The table has the full width; the log column runs beside the map
+     * only, its header on the map title line, newest first from the top. */
     static const char *LOG_COLOUR[] = { PH_DIM, PH_HI, AC_AMBER, AC_CYAN, AC_RED };
     const log_entry_t *e[ADSB_LOG_LINES];
-    int rows = table_rows + 2 + map_rows;
-    int ne   = adsb_log_recent(e, rows < ADSB_LOG_LINES ? rows : ADSB_LOG_LINES);
+    int ne = adsb_log_recent(e, map_rows < ADSB_LOG_LINES ? map_rows : ADSB_LOG_LINES);
 
     fb_puts("\033[H");
     draw_title(&st, n, n < table_rows ? n : table_rows, now);
     rule(TUI_COLS);
     fb_puts(EL "\n");
 
-    fb_printf(PH_MID "  %-6s  %-8s  %-3s  %4s  %6s  %4s  %3s  %5s  %4s  %3s  %3s  %5s  %4s " RESET,
-              "ICAO", "CALLSIGN", "CAT", "SQK", "ALT ft", "SPD", "HDG", "V/S",
+    fb_printf(PH_MID "  %-6s  %-8s  %-3s  %-4s  %4s  %6s  %4s  %3s  %5s  %6s  %6s  %4s  %3s  %3s  %5s  %4s " RESET EL "\n",
+              "ICAO", "CALLSIGN", "CAT", "EMIT", "SQK", "ALT ft", "SPD", "HDG", "V/S", "SEL ft", "QNH",
               "DIST", "BRG", "SIG", "MSGS", "SEEN");
+
+    for (int r = 0; r < table_rows; r++) {
+        if (r < n) draw_row(&ac[idx[r]], now);
+        fb_puts(EL "\n");
+    }
+    rule(TUI_COLS);
+    fb_puts(EL "\n");
+
+    char hdr[64];
+    int  len = snprintf(hdr, sizeof(hdr), "  MAP  %d km", RANGES_KM[s_range]);
+    float pe = s_pan_e, pn = s_pan_n;
+    if (pe != 0 || pn != 0) {
+        len += snprintf(hdr + len, sizeof(hdr) - len, "   centre");
+        if (pn != 0) len += snprintf(hdr + len, sizeof(hdr) - len, " %.0f km %c", fabsf(pn), pn > 0 ? 'N' : 'S');
+        if (pe != 0) len += snprintf(hdr + len, sizeof(hdr) - len, " %.0f km %c", fabsf(pe), pe > 0 ? 'E' : 'W');
+    }
+    fb_printf(PH_MID "%s" PH_DIM "%-*.*s" RESET, hdr, MAP_W - len, MAP_W - len, note);
     fb_puts(PH_GRID VL RESET PH_DIM " EVENT LOG" RESET EL "\n");
 
-    for (int r = 0; r < rows; r++) {
-        if (r < table_rows) {
-            if (r < n) draw_row(&ac[idx[r]], now);
-            else       fb_rep(' ', TABLE_W);
-        } else if (r == table_rows) {
-            rule(TABLE_W);
-        } else if (r == table_rows + 1) {
-            char hdr[64];
-            int  len = snprintf(hdr, sizeof(hdr), "  MAP  %d km", RANGES_KM[s_range]);
-            float pe = s_pan_e, pn = s_pan_n;
-            if (pe != 0 || pn != 0) {
-                len += snprintf(hdr + len, sizeof(hdr) - len, "   centre");
-                if (pn != 0) len += snprintf(hdr + len, sizeof(hdr) - len, " %.0f km %c", fabsf(pn), pn > 0 ? 'N' : 'S');
-                if (pe != 0) len += snprintf(hdr + len, sizeof(hdr) - len, " %.0f km %c", fabsf(pe), pe > 0 ? 'E' : 'W');
-            }
-            fb_printf(PH_MID "%s" PH_DIM "%-*.*s" RESET, hdr, TABLE_W - len, TABLE_W - len, note);
-        } else {
-            emit_map_row(r - table_rows - 2);
-        }
+    for (int y = 0; y < map_rows; y++) {
+        emit_map_row(y);
         fb_puts(PH_GRID VL RESET " ");
-        if (r < ne) fb_printf("%s%.*s" RESET, LOG_COLOUR[e[r]->color < 5 ? e[r]->color : 0], LOG_W, e[r]->text);
+        if (y < ne) fb_printf("%s%.*s" RESET, LOG_COLOUR[e[y]->color < 5 ? e[y]->color : 0], LOG_W, e[y]->text);
         fb_puts(EL "\n");
     }
 

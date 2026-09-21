@@ -105,12 +105,17 @@ interval. Note `+`/`-` mean volume in the aircraft display and interval here.
 **`tui`** (`tui.c`) is the sky and nothing else — no CPU, heap, network or feed fields; those are
 `top` and `net`. 120 columns: a title line (uptime, contacts and how many fit, frames/s, total,
 DEC % = frames passing CRC over the last second, FIX % = the share that needed a single-bit
-repair, MAX = farthest position decoded since boot, volume), then an 85-column block with the
-table above and the map below it, a 33-column event log running the full height beside them,
-then the key legend. The table has ICAO, callsign, category,
-squawk (7500/7600/7700, a TC28 emergency state or an ACAS resolution advisory turn the row red
+repair, MAX = farthest position decoded since boot, volume), then the table across the full
+width, a rule, then the 85-column map with a 33-column event log beside it, then the key
+legend. The table has ICAO, callsign, category (the
+receiver's own COM/GA/MIL guess), the TC1-4 emitter category as `A3` (A1 light .. A5 heavy,
+A7 rotorcraft, B gliders/balloons/UAVs, C surface vehicles; `--` until an identification
+frame arrives), squawk (7500/7600/7700, a TC28 emergency state or an ACAS resolution advisory turn the row red
 and are logged), altitude (`GND` while the last position report was a surface one or a
-surveillance reply flagged the ground), speed, heading, vertical rate,
+surveillance reply flagged the ground), speed, heading, vertical rate, the selected altitude
+(MCP/FCU, or the FMS one when that is all there is) and QNH from TC29 / BDS 4,0 (`--` until
+seen and again 60 s after the last report, since a register the interrogator stops asking for
+goes quiet while the contact stays alive),
 distance and bearing from the antenna position (`pos`; `--` until one is set), the last frame's signal level, message count
 and seconds since the last frame; a row dims past 15 s and is dropped at 60. Sorted by distance
 (no position last, then freshest), `s` cycles distance / altitude / messages / freshness. The
@@ -135,7 +140,7 @@ terminal, map first: the table is sized to its contents in steps of five so the 
 on every contact, and the map takes everything else but never under 21 rows, so a crowded table
 loses rows ("(n shown)" on the title) before the map shrinks; past 39 rows the table gets the
 surplus, and on a very short terminal the table keeps five rows. The event log column is as
-tall as both, newest first from the top, lines cut at 33 columns. SSH reports the PTY
+tall as the map, newest first from the top, lines cut at 33 columns. SSH reports the PTY
 height; serial assumes 40, `tui <rows>` overrides. Repaints in place like `top`.
 
 **The `t` hotkey defers to the demod loop.** `inject_fake_aircraft()` writes `s_aircraft[]`, which
