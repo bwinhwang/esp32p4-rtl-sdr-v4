@@ -25,12 +25,16 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_attr.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "lwip/sockets.h"
+#include "lwip/priv/tcpip_priv.h"   /* tcpip_api_call()                    */
+#include "lwip/priv/tcp_priv.h"     /* tcp_active_pcbs & co, for the census */
 
 #include "adsb.h"        /* ADSB_SNAPSHOT_MAX only */
 #include "feed_json.h"
+#include "shell.h"       /* sys_log() */
 
 /* Defined in class_driver.c, where s_aircraft[] lives; not put in a shared
  * header to avoid a dependency edge from this feed module into the TUI's
@@ -72,20 +76,42 @@ extern size_t aircraft_export_ndjson(char *buf, size_t bufsize);
 #define KEEP_INTVL_S       5
 #define KEEP_CNT           3
 
+/* How often feed_task() takes a TCP census (see feed_json_tcp_census()), in
+ * ticks: ~6 s. A wedge has to show up in two in a row before it is logged, so
+ * a burst of handshakes that fills the backlog for one tick stays quiet. */
+#define CENSUS_TICKS       8
+
 static const char *TAG = "json";
 
 static int  s_listen = -1;
 static struct { int fd; uint16_t stall; } s_cli[MAX_CLIENTS];
 static volatile int s_nclients;
+static volatile uint32_t s_resets;
 static EXT_RAM_BSS_ATTR char s_snapshot[SNAPSHOT_MAX];   /* task-context only, see class_driver.c */
 
-int feed_json_clients(void) { return s_nclients; }
+int      feed_json_clients(void) { return s_nclients; }
+uint32_t feed_json_resets(void)  { return s_resets; }
 
 /* `why` distinguishes "the peer hung up" from "we gave up on it", same as
  * feed_beast.c -- without it a client that reconnects on its own and one this
- * board is dropping look identical in the log. */
-static void client_close(int i, const char *why)
+ * board is dropping look identical in the log.
+ *
+ * `reset` is for the "we gave up on it" cases. A peer that stopped ACKing --
+ * the usual one is a phone that re-associated to the SoftAP under a fresh
+ * random MAC and a fresh DHCP lease, orphaning the old connection -- leaves up
+ * to a send buffer (5760 B of internal RAM) unacknowledged. A plain close()
+ * queues a FIN behind that and the pcb sits in FIN_WAIT_1 retransmitting it
+ * through CONFIG_LWIP_TCP_MAXRTX's whole backoff. SO_LINGER {1, 0} makes
+ * lwip_close() tcp_abort() instead (api_msg.c: linger == 0 with unsent or
+ * unacked data): one RST, pcb and buffers freed at once. It needs
+ * CONFIG_LWIP_SO_LINGER, which sdkconfig.defaults turns on for this. */
+static void client_close(int i, const char *why, bool reset)
 {
+    if (reset) {
+        struct linger lg = { .l_onoff = 1, .l_linger = 0 };
+        setsockopt(s_cli[i].fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+        s_resets++;
+    }
     close(s_cli[i].fd);
     s_cli[i].fd    = -1;
     s_cli[i].stall = 0;
@@ -211,7 +237,7 @@ static void broadcast(const char *buf, size_t n)
 
         int r = send_frame(i, buf, n);
         if (r < 0) {
-            client_close(i, "send error");
+            client_close(i, "send error", true);
         } else if (r > 0) {
             s_cli[i].stall = 0;
         } else if (++s_cli[i].stall > STALL_LIMIT) {
@@ -222,7 +248,7 @@ static void broadcast(const char *buf, size_t n)
              * once all four are gone accept_new() takes the handshake and
              * closes immediately -- which looks to the client exactly like
              * "connected, then dropped", forever. */
-            client_close(i, "too slow");
+            client_close(i, "too slow", true);
         }
         /* A stall short-wrote part of a line, so the peer's next complete
          * line is the tail of this one glued to the whole of the next
@@ -239,20 +265,111 @@ static void poll_closed(void)
         /* An idle feed would otherwise not notice a FIN until the next tick. */
         int r = recv(s_cli[i].fd, scratch, sizeof(scratch), MSG_DONTWAIT);
         if (r == 0)
-            client_close(i, "peer closed");
+            client_close(i, "peer closed", false);
         else if (r < 0 && errno != EWOULDBLOCK && errno != EAGAIN)
-            client_close(i, "recv error");
+            client_close(i, "recv error", false);
+    }
+}
+
+/* ── TCP census ──────────────────────────────────────────────────────────
+ *
+ * There are two ways lwIP turns a client of this port away that nothing in
+ * this file can see, because both happen before accept(): tcp_listen_input()
+ * returns without a word -- no RST, no SYN-ACK -- when the listener's backlog
+ * is full (accepts_pending >= backlog) or when tcp_alloc() finds no pcb
+ * (CONFIG_LWIP_MAX_ACTIVE_TCP reached and nothing in TIME_WAIT / LAST_ACK /
+ * CLOSING / FIN_WAIT_x left to kill; ESTABLISHED and SYN_RCVD of equal
+ * priority are never evicted). The peer sees a connect() that times out while
+ * the board still answers ping and hands out DHCP leases -- exactly the
+ * "SoftAP up, :8888 dead" state the app hit on 2026-09-25 and nobody could
+ * explain, because the evidence was gone by the time anyone looked.
+ *
+ * The pcb lists belong to the tcpip thread (CONFIG_LWIP_TCPIP_CORE_LOCKING is
+ * off), so the walk runs there through tcpip_api_call(). */
+struct census_call {
+    struct tcpip_api_call_data call;   /* must be first */
+    feed_json_tcp_t           *out;
+};
+
+static err_t census_fn(struct tcpip_api_call_data *c)
+{
+    feed_json_tcp_t *t = ((struct census_call *)c)->out;
+
+    for (struct tcp_pcb *p = tcp_active_pcbs; p; p = p->next) {
+        switch (p->state) {
+        case ESTABLISHED: t->established++; break;
+        case SYN_RCVD:    t->syn_rcvd++;    break;
+        case FIN_WAIT_1: case FIN_WAIT_2: case CLOSING:
+        case CLOSE_WAIT: case LAST_ACK:
+                          t->closing++;     break;
+        default:          t->other++;       break;
+        }
+    }
+    for (struct tcp_pcb *p = tcp_tw_pcbs; p; p = p->next) t->time_wait++;
+
+    t->pending = -1;
+    for (struct tcp_pcb_listen *l = tcp_listen_pcbs.listen_pcbs; l; l = l->next)
+        if (l->local_port == FEED_PORT) {
+            t->pending = l->accepts_pending;
+            t->backlog = l->backlog;
+        }
+    return ERR_OK;
+}
+
+void feed_json_tcp_census(feed_json_tcp_t *t)
+{
+    memset(t, 0, sizeof(*t));
+    struct census_call c = { .out = t };
+    tcpip_api_call(census_fn, &c.call);
+    t->pcb_limit     = CONFIG_LWIP_MAX_ACTIVE_TCP;
+    t->internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+}
+
+/* Which of the two silent refusals the census says is in force, or NULL. The
+ * pcb test counts only what tcp_alloc() cannot reclaim. */
+static const char *census_wedged(const feed_json_tcp_t *t)
+{
+    if (t->pending >= 0 && t->pending >= t->backlog) return "backlog full";
+    if (t->established + t->syn_rcvd + t->other >= t->pcb_limit) return "no pcb";
+    return NULL;
+}
+
+/* sys_log(), not ESP_LOGW: sys_log() lands in the event ring, so `log tail`
+ * still has it after the fact, over SSH or serial, without a reboot. */
+static void census_check(void)
+{
+    static int     s_bad;         /* consecutive wedged samples */
+    static int64_t s_since_us;
+
+    feed_json_tcp_t t;
+    feed_json_tcp_census(&t);
+    const char *why = census_wedged(&t);
+
+    if (why) {
+        if (++s_bad == 1) s_since_us = esp_timer_get_time();
+        if (s_bad == 2)
+            sys_log(4, "JSON     :%d refusing SYNs (%s): est %u syn %u fin %u tw %u "
+                       "pcb %u/%u, backlog %d/%u, internal %u B",
+                    FEED_PORT, why, t.established, t.syn_rcvd, t.closing, t.time_wait,
+                    t.established + t.syn_rcvd + t.closing + t.other + t.time_wait,
+                    t.pcb_limit, t.pending, t.backlog, (unsigned)t.internal_free);
+    } else {
+        if (s_bad >= 2)
+            sys_log(1, "JSON     :%d accepting again after %d s", FEED_PORT,
+                    (int)((esp_timer_get_time() - s_since_us) / 1000000));
+        s_bad = 0;
     }
 }
 
 static void feed_task(void *arg)
 {
     (void)arg;
-    while (1) {
+    for (uint32_t tick = 0; ; tick++) {
         if (s_listen < 0) listen_open();
         if (s_listen >= 0) accept_new();
 
         poll_closed();
+        if (tick % CENSUS_TICKS == 0) census_check();
 
         if (s_nclients) {
             size_t n = aircraft_export_ndjson(s_snapshot, sizeof(s_snapshot));

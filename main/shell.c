@@ -304,7 +304,17 @@ static int cmd_net(int argc, char **argv)
            feed_avr_clients(), (unsigned)feed_avr_sent(), (unsigned)feed_avr_dropped());
     printf("       beast %d client(s) sent %u drop %u\n",
            feed_beast_clients(), (unsigned)feed_beast_sent(), (unsigned)feed_beast_dropped());
-    printf("       json %d client(s)\n", feed_json_clients());
+    printf("       json %d client(s) reset %u\n",
+           feed_json_clients(), (unsigned)feed_json_resets());
+
+    /* Whether a new :8888 connection would be answered at all -- lwIP drops
+     * the SYN silently when either the backlog or the pcbs run out. */
+    feed_json_tcp_t t;
+    feed_json_tcp_census(&t);
+    printf("tcp    est %u syn %u fin %u tw %u  pcb %u/%u  :8888 backlog %d/%u  internal %u B\n",
+           t.established, t.syn_rcvd, t.closing, t.time_wait,
+           t.established + t.syn_rcvd + t.closing + t.other + t.time_wait, t.pcb_limit,
+           t.pending, t.backlog, (unsigned)t.internal_free);
     return ESP_OK;
 }
 

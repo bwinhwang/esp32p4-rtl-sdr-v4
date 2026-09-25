@@ -86,6 +86,12 @@ CONFIG_LWIP_MAX_SOCKETS=24
 # CONFIG_LWIP_MAX_LISTENING_TCP (16, against 5 used) and are not counted here.
 CONFIG_LWIP_MAX_ACTIVE_TCP=24
 
+# feed_json.c drops a client that has stopped ACKing with SO_LINGER {1, 0}, so
+# lwip_close() sends a RST and frees the pcb and its unacknowledged send buffer
+# at once, instead of retransmitting a FIN behind that data through the whole
+# MAXRTX backoff. lwIP ignores SO_LINGER without this.
+CONFIG_LWIP_SO_LINGER=y
+
 # ── WiFi via the ESP32-C6 co-processor ──────────────────────────────────────
 # The P4 has no radio; esp_wifi_remote remotes the ordinary esp_wifi_* API to
 # the C6 over 4-bit SDIO. Pins are read off the schematic and happen to be
